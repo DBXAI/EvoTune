@@ -29,3 +29,9 @@ pyyaml>=6.0.0
 openai-agents
 torch
 transformers
+psutil>=5.8.0
+psycopg2-binary>=2.9.0
+tqdm>=4.64.0
+smac>=2.0.0
+ConfigSpace>=0.7.0
+scipy>=1.7.0 

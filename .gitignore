@@ -7,3 +7,20 @@ diagnostic_results/**
 src/agent/plan/model_res/**
 config/base_config.py
 src/agent/plan/RCRank/bert-base-uncased/**
+src/memory_results
+test_sql_gen/data/**
+test_sql_gen/logs/**
+test_sql_gen/rubbish/**
+test_sql_gen/slow_queries/**
+logs/**
+src/agent/plan/slow_sql_data_gen.csv
+# test_sql_gen/data/hint/**
+# test_sql_gen/data/hint_normal/**
+# test_sql_gen/data/hint+index/**
+# test_sql_gen/data/hint+knob/**
+# test_sql_gen/data/hint+query/**
+# test_sql_gen/data/hint+query+index/**
+# test_sql_gen/data/index/**
+# test_sql_gen/data/index_normal/**
+# test_sql_gen/data/index+knob/**
+# test_sql_gen/data/knob/**

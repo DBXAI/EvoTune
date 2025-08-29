@@ -24,9 +24,11 @@ from model.modules.TSModel.ts_model import CustomConvAutoencoder
 from RCRank.utils.plan_encoding import PlanEncoder
 
 class RCRankPredictor:
-    def __init__(self, model_path="model_res/GateComDiffPretrainModel tpc_h confidence eta0.07/best_model.pt", 
-                train_data_path="../../../data/tpc_h.csv", device='cpu', opt_threshold=0.1):
+    def __init__(self, model_path="/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt", 
+                train_data_path="/root/DREAM/src/agent/plan/slow_sql_data_gen.csv", device='cpu', opt_threshold=0.1, num_classes=4):
+        #init传入的参数要修改
         self.device = device
+        self.num_classes = num_classes
         
         # Get the absolute path to bert-base-uncased
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -94,21 +96,18 @@ class RCRankPredictor:
         print(f"Computing statistics from training data: {train_data_path}")
         df = pd.read_csv(train_data_path)
         
-        # 处理JSON字符串
-        df["log_all"] = df["log_all"].apply(json.loads)
-        df["timeseries"] = df["timeseries"].apply(json.loads)
+        # 删除error不为空的行
+        df = df[df['error'].isna()].copy()
         
-        # 收集数据
+        # 解析JSON数据
+        df["internal_metrics"] = df["internal_metrics"].apply(json.loads)
+        df["external_metrics"] = df["external_metrics"].apply(json.loads)
         logs = []
         timeseries = []
-        opt_labels = []
-        
         for _, row in df.iterrows():
-            logs.append(torch.tensor(row["log_all"]))
-            timeseries.append(torch.tensor(row["timeseries"]))
-            opt_labels.append(torch.tensor(eval(row["opt_label_rate"])))
-        
-        # 计算统计信息
+            logs.append(torch.tensor(row["internal_metrics"]))
+            timeseries.append(torch.tensor(row["external_metrics"]))
+
         logs = torch.stack(logs, dim=0)
         self.logs_train_mean = logs.mean(dim=0)
         self.logs_train_std = logs.std(dim=0)
@@ -116,11 +115,6 @@ class RCRankPredictor:
         timeseries = torch.stack(timeseries, dim=0)
         self.timeseries_train_mean = timeseries.mean(dim=[0, 2])
         self.timeseries_train_std = timeseries.std(dim=[0, 2])
-
-        opt_labels = torch.stack(opt_labels, dim=0)
-        self.opt_labels_train_mean = opt_labels.mean(dim=0)
-        self.opt_labels_train_std = opt_labels.std(dim=0)
-        
         print("Statistics computation completed")
 
     def predict(self, query, plan, timeseries, log):
@@ -132,9 +126,8 @@ class RCRankPredictor:
             timeseries: 时间序列数据
             log: 日志数据
         Returns:
+            pred_label: 预测的多标签
             pred_label_binary: 二值化的预测标签
-            pred_opt: 预测的优化分数
-            pred_rank: 预测的排序
         """
         with torch.no_grad():
             # 处理SQL查询
@@ -163,32 +156,14 @@ class RCRankPredictor:
             # 标准化
             log = (log - self.logs_train_mean) / (self.logs_train_std + 1e-6)
             log = log.to(self.device)
-
-            # print("Input shapes:")
-            # print("- SQL shape:", sql["input_ids"].shape)
-            # print("- Plan shape:", plan["x"].shape)
-            # print("- Timeseries shape:", timeseries.shape)
-            # print("- Log shape:", log.shape)
             
             # 模型预测
-            pred_label, pred_opt = self.model(sql, plan, timeseries, log)
+            pred_label_opt, _ = self.model(sql, plan, timeseries, log)
             
-            # 反标准化预测的优化分数
-            pred_opt = pred_opt * (self.opt_labels_train_std + 1e-6) + self.opt_labels_train_mean
+            # 二值化预测标签
+            pred_label = torch.where(pred_label_opt > 0.5, 1, 0)
             
-            # 二值化处理
-            if self.pred_type == "multilabel":
-                # 使用0.5作为阈值进行二值化
-                pred_label_binary = torch.where(pred_label > 0.5, 1, 0)
-            else:
-                pred_label_binary = torch.where(pred_opt > self.opt_threshold, 1, 0)
-            
-            # 计算排序
-            sorted_time_index = torch.argsort(pred_opt, dim=1, descending=True)
-            p_rank = torch.empty_like(sorted_time_index[0])
-            p_rank[sorted_time_index[0]] = torch.arange(len(pred_opt[0]))
-            
-            return pred_label, pred_label_binary, pred_opt, p_rank
+            return pred_label_opt, pred_label
 
 def load_sample_data(data_path):
     """
@@ -199,9 +174,12 @@ def load_sample_data(data_path):
     # 读取CSV文件的第一行
     df = pd.read_csv(data_path)
     
+    # 删除error不为空的行
+    df = df[df['error'].isna()].copy()
+    
     # JSON字符串转换为Python对象
-    df["log_all"] = df["log_all"].apply(json.loads)
-    df["timeseries"] = df["timeseries"].apply(json.loads)
+    df["internal_metrics"] = df["internal_metrics"].apply(json.loads)
+    df["external_metrics"] = df["external_metrics"].apply(json.loads)
     
     # 初始化编码器
     encoding = Encoding(None, {'NA': 0})
@@ -211,39 +189,33 @@ def load_sample_data(data_path):
     df = pe.df
     
     # 获取第一行数据
-    row = df.iloc[3]
+    row = df.iloc[0]
     
     # 构造处理后的样本数据
     sample = {
         "query": row["query"],
         "plan": row["json_plan_tensor"],
-        "log": row["log_all"],
-        "timeseries": row["timeseries"],
+        "log": row["internal_metrics"],
+        "timeseries": row["external_metrics"],
         "multilabel": torch.tensor(eval(row["multilabel"])),
-        "opt_label": torch.tensor(eval(row["opt_label_rate"])),
-        "duration": row["duration"],
-        "indexes": row["index_x"] if "index_x" in row else 0
+        "duration": row["duration"]
     }
     
     return sample
 
-def online_predict():
+def online_predict(data_path):
     # 初始化预测器
     predictor = RCRankPredictor(
-        model_path="model_res/GateComDiffPretrainModel tpc_h confidence eta0.07/best_model.pt",
-        train_data_path="../../../data/tpc_h.csv",
+        model_path="model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
+        train_data_path=data_path,
         device='cpu',
         opt_threshold=0.5
     )
     
-    
-    
-    # # 加载示例数据
-    # data_path = "../../../data/tpc_h.csv"   
-    # sample = load_sample_data(data_path)
+    sample = load_sample_data(data_path)
     
     # 获取预测结果
-    pred_label, pred_label_binary, pred_opt, pred_rank = predictor.predict(
+    pred_label, pred_label_binary = predictor.predict(
         query=sample["query"],
         plan=sample["plan"],
         timeseries=sample["timeseries"],
@@ -254,17 +226,10 @@ def online_predict():
     print("Input Query:", sample["query"])
     print("\nPredicted labels:", pred_label.cpu().numpy())
     print("Binary Predicted labels:", pred_label_binary.cpu().numpy())
-    print("Predicted scores:", pred_opt.cpu().numpy())
-    print("Predicted rank:", pred_rank.cpu().numpy())
     print("\nTrue labels:", sample["multilabel"].numpy())
-    print("True optimization scores:", sample["opt_label"].numpy())
-    
-    # 计算真实排序
-    true_opt = sample["opt_label"].unsqueeze(0)  # 添加batch维度
-    label_sorted_time_index = torch.argsort(true_opt, dim=1, descending=True)
-    t_rank = torch.empty_like(label_sorted_time_index[0])
-    t_rank[label_sorted_time_index[0]] = torch.arange(len(true_opt[0]))
-    print("True rank:", t_rank.numpy())
+
     
 if __name__ == "__main__":
-    main()
+    # 加载示例数据
+    data_path = "./slow_sql_data_gen.csv"
+    online_predict(data_path)

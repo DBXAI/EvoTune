@@ -1,15 +1,23 @@
 from typing import Any, Dict, List
 from mcp.server.fastmcp import FastMCP
 import sqlparse
-from sqlparse.sql import IdentifierList, Identifier
-from sqlparse.tokens import Keyword
-from sqlparse.sql import Where, Comparison
+from sqlparse.sql import IdentifierList, Identifier, Where, Comparison, Parenthesis, TokenList, Function, Parenthesis
+from sqlparse.tokens import Keyword, DML, Whitespace, Wildcard, Comparison as TComparison, Literal, Name
+
 from sqlalchemy import create_engine, inspect, text
 import re
-from dataclasses import dataclass
+import json
+# from dataclasses import dataclass
 from collections import defaultdict
-import numpy as np
-from datetime import datetime
+import sys
+import os
+
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+
+from src.database.pg_env import PostgresDB
+from config.base_config import KNOB_CONFIG
+import jpype as jp
 
 # 初始化 FastMCP 服务器
 mcp = FastMCP("db_diagnosis")
@@ -29,33 +37,692 @@ def clean_sql(sql: str) -> str:
     sql = re.sub(r'\s+', ' ', sql)
     return sql
 
-def extract_tables(parsed) -> list:
-    """从解析后的 SQL 语句中提取表名（考虑 FROM / JOIN / 子查询 等）"""
+def extract_tables(parsed, postgres_config) -> list:
     tables = set()
 
-    from_seen = False
-    for token in parsed.tokens:
-        # 递归处理嵌套结构
-        if token.is_group:
-            tables.update(extract_tables(token))
+    def _extract(token_list):
+        from_seen = False
+        for token in token_list.tokens:
+            if token.is_group:
+                _extract(token)
 
-        if from_seen:
-            if isinstance(token, IdentifierList):
-                for identifier in token.get_identifiers():
-                    tables.add(identifier.get_real_name())
-                from_seen = False
-            elif isinstance(token, Identifier):
-                tables.add(token.get_real_name())
-                from_seen = False
-            elif token.ttype is Keyword:
-                # 终止符，比如 WHERE，说明表名部分结束了
-                from_seen = False
-        if token.ttype is Keyword and token.value.upper() in ("FROM", "JOIN"):
-            from_seen = True
+            if token.ttype is Keyword and token.value.upper() in ("FROM", "JOIN"):
+                from_seen = True
+                continue
 
-    return list(tables)
+            if from_seen:
+                if isinstance(token, IdentifierList):
+                    for identifier in token.get_identifiers():
+                        name = identifier.get_real_name()
+                        if name:
+                            tables.add(name)
+                    from_seen = False
+                elif isinstance(token, Identifier):
+                    name = token.get_real_name()
+                    if name:
+                        tables.add(name)
+                    from_seen = False
+                elif token.ttype is Whitespace:
+                    continue
+                else:
+                    from_seen = False
+
+    _extract(parsed)
+
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+    existing_tables = postgres_db.get_tables()
+
+    return [t for t in tables if t in existing_tables]
+
+def extract_columns(parsed, postgres_config) -> list:
+    columns = set()
+
+    def _extract_columns(token_list):
+        for token in token_list.tokens:
+            # 处理 SELECT 子句
+            if token.ttype is DML and token.value.upper() == 'SELECT':
+                idx, next_token = token_list.token_next(token_list.token_index(token))
+                if isinstance(next_token, IdentifierList):
+                    for identifier in next_token.get_identifiers():
+                        _extract_identifier(identifier)
+                else:
+                    _extract_identifier(next_token)
+
+            # 递归处理子查询/嵌套结构
+            elif token.is_group:
+                _extract_columns(token)
+
+    def _extract_identifier(identifier):
+        if isinstance(identifier, Identifier):
+            real_name = identifier.get_real_name()
+            if real_name:
+                columns.add(real_name)
+            # 尝试解析函数调用中的列名，比如 "SUM(o.o_totalprice) AS total"
+            if identifier.tokens:
+                for subtoken in identifier.tokens:
+                    if isinstance(subtoken, Function):
+                        _extract_function(subtoken)
+        elif isinstance(identifier, Function):
+            _extract_function(identifier)
+        elif hasattr(identifier, 'ttype') and identifier.ttype == Wildcard:
+            columns.add("*")
+        elif hasattr(identifier, 'value'):
+            # 最后兜底策略：直接通过正则提取字段名
+            potential_cols = re.findall(r'\b\w+\.\w+\b', identifier.value)
+            for col in potential_cols:
+                columns.add(col.split('.')[-1])
+
+    def _extract_function(func_token):
+        # 尝试提取函数体里的字段名
+        inside = func_token.value
+        # 捕获字段名 o.o_totalprice 或 o_orderdate
+        matches = re.findall(r'\b\w+\.\w+\b', inside)
+        for match in matches:
+            columns.add(match.split('.')[-1])
+
+    _extract_columns(parsed)
+
+    # 连接数据库以检查列是否存在
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+    existing_columns = postgres_db.get_columns()
+
+    return [t for t in columns if t in existing_columns and t != "*"]
+
+def base_information_collect(query_info, postgres_config) -> Dict[str, Any]:
+    """收集关于数据库和查询的基本信息"""
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    db_info = {
+        'db_type': postgres_db.db_type,
+        'workload_type': postgres_db.workload_type,
+        'size': postgres_db.get_size(),
+        'schema': postgres_db.fetch_schema_info(),
+    }
+
+    base_info = {
+        "query_info": query_info,
+        "database_info": db_info,
+    }
+
+    return base_info
+
+def is_redundant_comparison(token):
+    if not isinstance(token, Comparison):
+        return None
+    parts = [t for t in token.tokens if not t.is_whitespace]
+    if len(parts) != 3:
+        return None
+    left, op, right = parts
+    if op.ttype != TComparison:
+        return None
+    if left.ttype in Literal and right.ttype in Literal and left.value == right.value:
+        return str(token)
+    if left.ttype == Name and right.ttype == Name and left.value == right.value:
+        return str(token)
+    return None
+
+def find_redundant_where_conditions_recursive(token_list):
+    """递归查找所有 WHERE 中的冗余条件"""
+    redundant = []
+    for token in token_list.tokens:
+        # 找到 WHERE 子句
+        if isinstance(token, Where):
+            for subtoken in token.tokens:
+                expr = is_redundant_comparison(subtoken)
+                if expr:
+                    redundant.append(expr)
+                if subtoken.ttype == Keyword and subtoken.value.upper() in ('TRUE', 'FALSE'):
+                    redundant.append(subtoken.value.upper())
+        # 如果是一个嵌套结构（子查询、括号等），继续递归
+        if isinstance(token, TokenList):
+            redundant.extend(find_redundant_where_conditions_recursive(token))
+    return redundant
+
+def count_nested_selects(parsed):
+    """递归计算 SELECT 的嵌套层数"""
+    def _count(token_list, level=0):
+        max_level = level
+        for token in token_list.tokens:
+            if token.ttype == DML and token.value.upper() == "SELECT":
+                level += 1
+                max_level = max(max_level, level)
+            elif isinstance(token, TokenList):
+                max_level = max(max_level, _count(token, level))
+        return max_level
+    return _count(parsed)
+
+def extract_subqueries(token_list):
+    """递归提取所有子查询文本"""
+    subqueries = []
+
+    for token in token_list.tokens:
+        # 检测 SELECT 子查询：以 (SELECT 开头的 Parenthesis
+        if isinstance(token, Parenthesis):
+            inside = token.value.strip("() ").strip()
+            if inside.upper().startswith("SELECT"):
+                subqueries.append(inside)
+        # 如果还有嵌套结构，递归处理
+        if isinstance(token, TokenList):
+            subqueries.extend(extract_subqueries(token))
+    
+    return subqueries
+
+def find_duplicate_subqueries(sql):
+    """找出重复的子查询（完全相同）"""
+    parsed = sqlparse.parse(sql)[0]
+    subqueries = extract_subqueries(parsed)
+    seen = {}
+    duplicates = []
+
+    for sq in subqueries:
+        normalized = sqlparse.format(sq, keyword_case='upper', strip_comments=True).strip()
+        if normalized in seen:
+            duplicates.append(normalized)
+        else:
+            seen[normalized] = True
+    return duplicates
+
+def find_related_views(sql, postgres_config):
+    from src.database.pg_env import PostgresDB
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    views = postgres_db.get_views()
+
+    parsed = sqlparse.parse(sql)[0]
+    target_tables = extract_tables(parsed)
+    target_columns = extract_columns(parsed)
+    
+    related_views = []
+
+    for viewname, definition in views:
+        definition_parsed = sqlparse.parse(definition)[0]
+        view_tables = extract_tables(definition_parsed)
+        view_columns = extract_columns(definition_parsed)
+        if any(tbl in view_tables for tbl in target_tables):
+            if any(col in view_columns for col in target_columns):
+                definition = clean_sql(definition)
+                related_views.append({"viewname": viewname, "definition": definition})
+    
+    return related_views
+
+# info collect
+@mcp.tool()
+async def indexes_info_collect(postgres_config) -> Dict[str, Any]:
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    sql = "SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY tablename, indexname;"
+
+    exist_indexs = postgres_db.fetch_results(sql, json=True)
+
+    return exist_indexs
 
 @mcp.tool()
+async def query_info_collect(query, postgres_config):
+    token_list = sqlparse.parse(query)[0]
+    query_info = {}
+
+    redundant_exprs = find_redundant_where_conditions_recursive(token_list)
+    query_info["redundant_exprs"] = redundant_exprs
+
+    nested_select_level = count_nested_selects(token_list)
+    query_info["nested_select_level"] = nested_select_level
+
+    duplicate_subqueries = find_duplicate_subqueries(query)
+    query_info["duplicate_subqueries"] = duplicate_subqueries
+
+    related_views = find_related_views(query, postgres_config)
+    query_info["related_views"] = related_views
+
+    return query_info
+
+@mcp.tool()
+async def system_knobs_info_collect(postgres_config) -> Dict[str, Any]:
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    system_knobs_info = {}
+
+    system_knobs = tuple(KNOB_CONFIG["system_knobs"].keys())
+    sql = f"SELECT name, setting FROM pg_settings WHERE name IN {system_knobs};"
+    system_knobs_info = postgres_db.fetch_results(sql, json=True)
+    
+    return system_knobs_info
+
+@mcp.tool()
+async def query_knobs_info_collect(postgres_config):
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    query_knobs_info = {}
+
+    query_knobs = tuple(KNOB_CONFIG["query_knobs"].keys())
+    sql = f"SELECT name, setting FROM pg_settings WHERE name IN {query_knobs};"
+    query_knobs_info = postgres_db.fetch_results(sql, json=True)
+    
+    return query_knobs_info
+
+@mcp.tool()
+async def plan_info_collect(query, postgres_config) -> Dict[str, Any]:
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    parsed = sqlparse.parse(query)[0]
+    target_tables = extract_tables(parsed, postgres_config)
+
+    # 获取上次analyze更新的时间
+    time_since_last_analyze = {}
+    for table in target_tables:
+        analyze_sql = f"""
+            SELECT 
+            relname AS table_name, 
+            now() - GREATEST(last_analyze, last_autoanalyze) AS time_since_last_analyze
+            FROM pg_stat_user_tables 
+            WHERE relname = '{table}';
+        """
+        result = postgres_db.fetch_results(analyze_sql)
+        if result:
+            table_name, time_since = result[0]
+            time_since_last_analyze[table_name] = time_since
+
+    # 获取表的统计信息
+    table_stats_info = {}
+    table_stats_sql = """
+        SELECT
+        relname AS table_name,
+        reltuples::BIGINT AS estimated_rows,
+        relpages AS estimated_pages,
+        pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
+    FROM
+        pg_class c
+    JOIN
+        pg_namespace n ON n.oid = c.relnamespace
+    WHERE
+        relkind = 'r'
+        AND n.nspname = 'public';
+    """
+    result = postgres_db.fetch_results(table_stats_sql)
+    for row in result:
+        table_name, estimated_rows, estimated_pages, total_size = row
+        table_stats_info[table_name] = {
+            "estimated_rows": estimated_rows,
+            "estimated_pages": estimated_pages,
+            "total_size": total_size
+        }
+
+    # 获得相关列的统计信息
+    column_stats_info = {}
+    target_columns = extract_columns(parsed, postgres_config)
+    for column in target_columns:
+        column_stats_sql = f"""
+            SELECT
+                tablename,
+                attname,
+                null_frac,
+                n_distinct,
+                most_common_vals,
+                most_common_freqs,
+                histogram_bounds
+            FROM
+                pg_stats
+            WHERE
+                attname = '{column}';
+        """
+        result = postgres_db.fetch_results(column_stats_sql)
+        if result:
+            tablename, attname, null_frac, n_distinct, mc_vals, mc_freqs, histogram = result[0]
+            column_stats_info[column] = {
+                "tablename": tablename,
+                "attname": attname,
+                "null_frac": null_frac,
+                "n_distinct": n_distinct,
+                "most_common_vals": mc_vals,
+                "most_common_freqs": mc_freqs,
+                "histogram_bounds": histogram
+            }
+    
+    plan_info = {
+        "time_since_last_analyze": time_since_last_analyze,
+        "table_stats_info": table_stats_info,
+        "column_stats_info": column_stats_info
+    }
+
+    return plan_info
+
+# action space define
+@mcp.tool()
+async def indexes_action_space(query):
+    parsed = sqlparse.parse(query)[0]
+    tables = extract_tables(parsed)
+    columns = extract_columns(parsed)
+
+    indexes_action_spaces_prompt = f"""
+    Please consider creating the most appropriate indexes
+    on the most relevant tables {tables} and columns {columns}
+    involved in this slow SQL query to improve its performance.
+    """
+
+    return indexes_action_spaces_prompt
+
+@mcp.tool()
+async def system_knobs_action_space(postgres_config):
+
+    #这里还可以缩小到一个只调整和query相关的knobs的空间
+
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    knob_info = {}
+
+    for knob in KNOB_CONFIG["system_knobs"].keys():
+        sql = f"""
+        SELECT unit, vartype, min_val, max_val, boot_val, short_desc
+        FROM pg_settings
+        WHERE name = '{knob}';
+        """
+        result = postgres_db.fetch_results(sql)
+        if result:
+            unit, vartype, min_val, max_val, boot_val, short_desc = result[0]
+            knob_info[knob] = {
+                "unit": unit,
+                "vartype": vartype,
+                "min_val": min_val,
+                "max_val": max_val,
+                "default_val": boot_val,
+                "short_desc": short_desc
+            }
+
+    knobs_action_space_prompt = f"""
+    Please adjust the following knobs to optimize the performance of the slow query.  
+    Each system knob is listed with its configurable range and metadata. Only consider system knobs provided below.
+
+    System Knob Configuration Space:
+    {knob_info}
+    """
+
+    return knobs_action_space_prompt
+
+@mcp.tool()
+async def rewrite_action_space(sql, postgres_config):
+    """
+    读取user_selected_rules.txt，判断哪些规则可以应用于当前SQL，返回可用规则名列表。
+    sql: 需要分析的SQL语句
+    其余参数为数据库连接信息
+    """
+    import os
+    base_dir = os.path.abspath(os.curdir)
+    rules_path = os.path.join(base_dir, 'user_selected_rules.txt')
+    if not os.path.exists(rules_path):
+        return f"规则文件不存在，请检查路径：{rules_path}"
+    with open(rules_path, "r") as f:
+        rulelist = [line.strip() for line in f if line.strip()]
+
+    # 启动JVM（如果未启动）
+    query_rewrite_dir = os.path.join(base_dir, 'agent/action') # 修改
+    local_lib_dir = os.path.join(base_dir, 'agent/action/libs') # 修改
+    classpath_file = os.path.join(query_rewrite_dir, 'classpath.txt')
+    with open(classpath_file, 'r') as f:
+        classpath = f.readline().strip().split(':')
+    classpath.extend([
+        os.path.join(local_lib_dir, jar)
+        for jar in os.listdir(local_lib_dir)
+        if jar.endswith('.jar')
+    ])
+    if not jp.isJVMStarted():
+        jp.startJVM("-Xss4M", jvmpath=jp.getDefaultJVMPath(), classpath=classpath)
+
+    from java.sql import DriverManager
+    from org.apache.calcite.adapter.jdbc import JdbcSchema
+    from org.apache.calcite.jdbc import CalciteConnection
+    from org.apache.calcite.sql.parser import SqlParser
+    from org.apache.calcite.sql.validate import SqlConformanceEnum
+    from org.apache.calcite.sql.parser.babel import SqlBabelParserImpl
+    from org.apache.calcite.tools import Frameworks
+    from org.apache.calcite.sql2rel import SqlToRelConverter
+    from org.apache.calcite.sql.dialect import PostgresqlSqlDialect
+    from org.apache.calcite.util import SourceStringReader
+    from org.apache.calcite.plan.hep import HepMatchOrder, HepPlanner, HepProgramBuilder
+
+    # 连接数据库，构建schema
+    conn = DriverManager.getConnection('jdbc:calcite:fun=standard,postgresql')
+    calcite_conn = conn.unwrap(CalciteConnection)
+    root_schema = calcite_conn.getRootSchema()
+
+    dbtype = postgres_config['db_type']
+    dbname = postgres_config['dbname']
+    user = postgres_config['user']
+    passwd = postgres_config['password']
+    host = postgres_config['host']
+    port = postgres_config['port']
+
+    if dbtype == 'mysql':
+        data_source = JdbcSchema.dataSource(f"jdbc:mysql://127.0.0.1:{port}/{dbname}?useSSL=false", 'com.mysql.jdbc.Driver', user, passwd)
+    else:
+        data_source = JdbcSchema.dataSource(f"jdbc:postgresql://{host}:{port}/{dbname}", 'org.postgresql.Driver', user, passwd)
+    schema = root_schema.add(dbname, JdbcSchema.create(root_schema, dbname, data_source, None, None))
+    parserConfig = SqlParser.configBuilder().setConformance(SqlConformanceEnum.BABEL).setParserFactory(SqlBabelParserImpl.FACTORY).setCaseSensitive(False).build()
+    converterConfig = SqlToRelConverter.config().withExpand(True)
+    config = Frameworks.newConfigBuilder().defaultSchema(schema).parserConfig(parserConfig).sqlToRelConverterConfig(converterConfig).build()
+    planner = Frameworks.getPlanner(config)
+    dialect = PostgresqlSqlDialect.DEFAULT
+
+    # 解析SQL，生成rel_node
+    planner.close()
+    planner.reset()
+    sql_node = planner.parse(SourceStringReader(sql))
+    sql_node = planner.validate(sql_node)
+    rel_root = planner.rel(sql_node)
+    rel_node = rel_root.project()
+
+    # 遍历规则，判断哪些可用
+    available_rules = []
+    for rule_str in rulelist:
+        try:
+            rule = eval(rule_str)
+            if rule.getOperand().matches(rel_node):
+                available_rules.append(rule_str)
+        except Exception as e:
+            print("rule match error:", e)
+            continue
+
+    rewrite_action_space_prompt = f"""
+    Below is a list of optimization rules based on Apache Calcite. 
+    For each rule, the conditions and transformations are described. 
+    When given a SQL query, your task is to analyze the query, 
+    determine which of these rules might apply, and rewrite the query if beneficial.
+
+    Rules_Space:
+    {available_rules}
+
+    Please notice that the {dbtype} database has it's own rewrtie modules, you should consider to outperform the default rewrite modules of the {dbtype} database.
+    """
+
+    return rewrite_action_space_prompt
+
+@mcp.tool()
+async def query_knobs_action_space(postgres_config):
+
+    postgres_db = PostgresDB(
+        user=postgres_config['user'], 
+        password=postgres_config['password'], 
+        host=postgres_config['host'], 
+        port=postgres_config['port'], 
+        dbname=postgres_config['dbname'], 
+        workload_type=postgres_config['workload_type'],
+        postgres_path=postgres_config['postgres_path'],
+        postgres_data=postgres_config['postgres_data'], 
+        log_path=postgres_config['log_path']
+    )
+
+    knob_info = {}
+
+    for knob in KNOB_CONFIG["query_knobs"].keys():
+        sql = f"""
+        SELECT unit, vartype, min_val, max_val, boot_val, short_desc
+        FROM pg_settings
+        WHERE name = '{knob}';
+        """
+        result = postgres_db.fetch_results(sql)
+        if result:
+            unit, vartype, min_val, max_val, boot_val, short_desc = result[0]
+            knob_info[knob] = {
+                "unit": unit,
+                "vartype": vartype,
+                "min_val": min_val,
+                "max_val": max_val,
+                "default_val": boot_val,
+                "short_desc": short_desc
+            }
+
+    query_knobs_action_space_prompt = f"""
+    Please adjust the following knobs to optimize the performance of the slow query.  
+    Each query knob is listed with its configurable range and metadata. Only consider query knobs provided below.
+
+    Query Knob Configuration Space:
+    {knob_info}
+    """
+
+    return query_knobs_action_space_prompt
+
+@mcp.tool()
+async def plan_action_space(query):
+    query = query.lower()
+
+    hint_actions = []
+
+    # hint_actions += ["/*+ Set(GUC-param value) */"]
+
+    # 1. Query Knob
+    for knob in KNOB_CONFIG["query_knobs"].keys():
+        hint_actions += [
+            f"/*+ Set({knob} on) */",
+            f"/*+ Set({knob} off) */"
+        ]
+
+    # 2. Table Scan Method
+    if "from" in query:
+        hint_actions += [
+            "/*+ Rows(table table[ table...] correction) */",
+            "/*+ Parallel(table <# of workers> [soft|hard]) */"
+            "/*+ SeqScan(table) */",
+            "/*+ IndexScan(table[ index...]) */",
+            "/*+ BitmapScan(table[ index...]) */",
+            "/*+ IndexOnlyScan(table[ index...]) */"
+        ]
+
+    # 3. Join Method
+    if "join" in query:
+        hint_actions += [
+            "/*+ NestLoop(table table[ table...]) */",
+            "/*+ HashJoin(table table[ table...]) */",
+            "/*+ MergeJoin(table table[ table...]) */",
+            "/*+ Leading(table table[ table...]) */",
+            "/*+ Memoize(table table[ table...]) */",
+            "/*+ NoMemoize(table table[ table...]) */"
+        ]
+
+    hint_actions = list(set(hint_actions))
+
+    # set类hint必须被使用，其他hint可以不使用
+    set_hints = [hint for hint in hint_actions if hint.startswith('/*+ Set(')]
+    other_hints = [hint for hint in hint_actions if not hint.startswith('/*+ Set(')]
+
+    plan_action_space_prompt = f"""
+    Please consider the following hints to optimize the performance of the slow query.
+    You must use at least one of the following Set hints:
+    {set_hints}
+    You may optionally use any of the following hints:
+    {other_hints}
+    """
+
+    return plan_action_space_prompt
+
+# action generate (no use)
 async def update_statistics(query: str) -> Dict[str, Any]:
     """更新统计信息，通过执行ANALYZE命令更新查询中涉及的表的统计信息
 
@@ -75,7 +742,7 @@ async def update_statistics(query: str) -> Dict[str, Any]:
     tables = extract_tables(parsed)
     
     # 连接数据库
-    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch')
+    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch10G')
     
     result = {
         "action": "update_statistics",
@@ -137,7 +804,6 @@ async def update_statistics(query: str) -> Dict[str, Any]:
 
     return result
 
-@mcp.tool()
 async def join_order_optimization(query: str) -> Dict[str, Any]:
     """优化查询的连接顺序，通过测试不同的连接策略找出最优执行计划
 
@@ -157,7 +823,7 @@ async def join_order_optimization(query: str) -> Dict[str, Any]:
     tables = extract_tables(parsed)
     
     # 连接数据库
-    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch')
+    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch10G')
     
     result = {
         "action": "join_order_optimization",
@@ -293,7 +959,6 @@ async def join_order_optimization(query: str) -> Dict[str, Any]:
 
     return result
 
-@mcp.tool()
 async def optimize_index(query: str) -> Dict[str, Any]:
     """优化数据库索引
 
@@ -313,7 +978,7 @@ async def optimize_index(query: str) -> Dict[str, Any]:
     tables = extract_tables(parsed)
 
     # 连接数据库（这里使用示例连接字符串，实际使用时需要替换）
-    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch')
+    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch10G')
     inspector = inspect(engine)
     
     result = {
@@ -375,7 +1040,6 @@ async def optimize_index(query: str) -> Dict[str, Any]:
     
     return result
 
-@mcp.tool()
 async def optimize_repeatedly_subqueries(query: str) -> Dict[str, Any]:
     """优化重复执行的子查询
 
@@ -453,143 +1117,148 @@ async def optimize_repeatedly_subqueries(query: str) -> Dict[str, Any]:
     
     return result
 
-@mcp.tool()
-async def tune_query_configuration(query: str) -> Dict[str, Any]:
-    """调优数据库配置参数
+async def optimize_query_knob(query: str) -> Dict[str, Any]:
+    """收集并返回数据库指定knob的当前值和范围信息
 
     Args:
-        query: SQL查询语句
+        query: SQL查询语句（本实现中不做处理，仅为接口兼容）
 
     Returns:
-        Dict[str, Any]: 包含调优参数和优化建议的字典
+        Dict[str, Any]: 包含knob当前值、范围、类型等信息的字典
     """
-    # 清理SQL语句
-    query = clean_sql(query)
-    
-    # 解析SQL语句
-    parsed = sqlparse.parse(query)[0]
-    
-    # 配置参数列表
-    config_params = [ "enable_sort", "enable_memoize", "enable_hashjoin", "enable_nestloop", "enable_mergejoin", "enable_gathermerge", "enable_hashagg", "enable_material", "enable_parallel_hash", "random_page_cost", "seq_page_cost", "hash_mem_multiplier" ]
-    
-    # 分析查询特征
-    query_features = {
-        "has_sort": bool(re.search(r'ORDER\s+BY', query, re.IGNORECASE)),
-        "has_group": bool(re.search(r'GROUP\s+BY', query, re.IGNORECASE)),
-        "has_join": bool(re.search(r'JOIN', query, re.IGNORECASE)),
-        "has_subquery": bool(re.search(r'\(SELECT', query, re.IGNORECASE)),
-        "table_count": len(extract_tables(parsed)),
-        "has_aggregate": bool(re.search(r'(COUNT|SUM|AVG|MAX|MIN)\s*\(', query, re.IGNORECASE))
-    }
-    
-    # 连接数据库获取当前参数
-    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch')
-    current_params = {}
+    import re
+    from sqlalchemy import create_engine, text
 
+    # 定义需要调优的knob及其范围和类型
+    knob_config = {
+        "work_mem": {"lower": 1, "upper": 1024, "type": "int/continuous"},
+        "maintenance_work_mem": {"lower": 16, "upper": 1024, "type": "int/continuous"},
+        # "shared_buffers": {"lower": 16, "upper": 2048, "type": "int/continuous"},
+        "effective_cache_size": {"lower": 512, "upper": 32768, "type": "int/continuous"},
+        "max_parallel_workers": {"lower": 0, "upper": 96, "type": "int/continuous"},
+        "max_parallel_workers_per_gather": {"lower": 0, "upper": 8, "type": "int/continuous"},
+        "parallel_tuple_cost": {"lower": 0.01, "upper": 1.0, "type": "float/continuous"},
+        "parallel_setup_cost": {"lower": 100, "upper": 10000, "type": "float/continuous"},
+        "random_page_cost": {"lower": 1.0, "upper": 10.0, "type": "float/continuous"},
+        "seq_page_cost": {"lower": 0.1, "upper": 4.0, "type": "float/continuous"},
+        "cpu_tuple_cost": {"lower": 0.001, "upper": 0.1, "type": "float/continuous"},
+        "cpu_operator_cost": {"lower": 0.0001, "upper": 0.01, "type": "float/continuous"},
+        "enable_seqscan": {"type": "categorical", "value": [0, 1]},
+        "enable_indexscan": {"type": "categorical", "value": [0, 1]},
+        "enable_indexonlyscan": {"type": "categorical", "value": [0, 1]},
+        "enable_bitmapscan": {"type": "categorical", "value": [0, 1]},
+        "enable_hashjoin": {"type": "categorical", "value": [0, 1]},
+        "enable_mergejoin": {"type": "categorical", "value": [0, 1]},
+        "enable_nestloop": {"type": "categorical", "value": [0, 1]},
+        "enable_hashagg": {"type": "categorical", "value": [0, 1]},
+        "geqo": {"type": "categorical", "value": [0, 1]},
+        "geqo_threshold": {"lower": 2, "upper": 100, "type": "int/continuous"},
+        "join_collapse_limit": {"lower": 1, "upper": 64, "type": "int/continuous"},
+        "from_collapse_limit": {"lower": 1, "upper": 64, "type": "int/continuous"},
+        "default_statistics_target": {"lower": 10, "upper": 1000, "type": "int/continuous"},
+        "log_min_duration_statement": {"lower": -1, "upper": 60000, "type": "int/continuous"},
+    }
+
+    # 连接数据库，收集当前knob值
+    engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch10G')
+    knob_values = {}
     with engine.connect() as conn:
-        for param in config_params:
-            result = conn.execute(text(f"SHOW {param}")).fetchone()
-            if result:
-                current_params[param] = result[0]
-    
-    # 基于查询特征调整参数
-    optimized_params = current_params.copy()
-    optimization_reasons = []
-    
-    # 1. 处理排序操作
-    if query_features["has_sort"]:
-        optimized_params["enable_sort"] = True
-        optimization_reasons.append("启用排序优化以处理ORDER BY子句")
-    
-    # 2. 处理连接操作
-    if query_features["has_join"]:
-        if query_features["table_count"] > 3:
-            # 大规模连接优先使用哈希连接
-            optimized_params["enable_hashjoin"] = True
-            optimized_params["enable_nestloop"] = False
-            optimized_params["enable_mergejoin"] = False
-            optimization_reasons.append("多表连接场景，优先使用哈希连接")
-        else:
-            # 小规模连接保持所有连接方式可用
-            optimized_params["enable_hashjoin"] = True
-            optimized_params["enable_nestloop"] = True
-            optimized_params["enable_mergejoin"] = True
-            optimization_reasons.append("小规模连接场景，保持所有连接方式可用")
-    
-    # 3. 处理聚合操作
-    if query_features["has_group"] or query_features["has_aggregate"]:
-        optimized_params["enable_hashagg"] = True
-        optimized_params["hash_mem_multiplier"] = 2.0
-        optimization_reasons.append("存在聚合操作，增加哈希内存配置")
-    
-    # 4. 处理子查询
-    if query_features["has_subquery"]:
-        optimized_params["enable_material"] = True
-        optimized_params["enable_memoize"] = True
-        optimization_reasons.append("存在子查询，启用结果物化和查询计划缓存")
-    
-    # 5. 并行处理优化
-    if query_features["table_count"] > 2 or query_features["has_aggregate"]:
-        optimized_params["enable_parallel_hash"] = True
-        optimized_params["enable_gathermerge"] = True
-        optimization_reasons.append("复杂查询场景，启用并行处理优化")
-    
-    # 生成优化后的查询
-    optimized_query = "SET " + "; SET ".join([
-        f"{param} = {str(value).lower()}" 
-        for param, value in optimized_params.items() 
-        if str(value) != str(current_params.get(param, ''))
-    ]) + "; " + query
-    
+        for knob, meta in knob_config.items():
+            try:
+                result = conn.execute(text(f"SHOW {knob}")).fetchone()
+                if result is not None:
+                    knob_values[knob] = str(result[0])
+                else:
+                    knob_values[knob] = None
+            except Exception as e:
+                knob_values[knob] = None
+
+    # 组装返回结果
+    knob_info = {}
+    for knob, meta in knob_config.items():
+        knob_info[knob] = {
+            "current": knob_values.get(knob),
+            **meta
+        }
+
     return {
-        "action": "tune_config",
-        "original_query": query,
-        "query_features": query_features,
-        "current_parameters": current_params,
-        "optimized_parameters": optimized_params,
-        "optimization_reasons": optimization_reasons,
-        "apply_query": clean_sql(optimized_query),
+        "action": "collect_knob_info",
+        "knobs": knob_info,
+        "instructions": "please use the knob_info to optimize the query, and do not use other knobs"
     }
 
-@mcp.tool()
-async def change_distributed_key(query: str) -> str:
-    """改变分布式键
-
-    Args:
-        query: SQL查询语句
-    """
-    print("call tool change_distributed_key")
-    
-    return {
-        "action": "change_distributed_key",
-        "distributed_key": "new_key"
-    }
-
-@mcp.tool()
 async def rewrite_query(query: str) -> Dict[str, Any]:
-    """重写SQL查询以提高性能
+    """重写SQL查询以提高性能，根据规则自动判断是否需要改写
 
     Args:
         query: 原始SQL查询
 
     Returns:
-        Dict[str, Any]: 包含查询重写结果的字典
+        Dict[str, Any]: 包含查询重写结果、触发的规则等信息
     """
-    # 分析模块：解析SQL语句并提取关键信息
-    # analysis_result = analyze_query_structure(query)
+    import re
+    import sqlparse
     
-    # 深度思考模块：基于分析结果生成优化策略
-    # optimization_result = generate_query_optimization(query, analysis_result)
-    
-    # 可信验证模块：验证优化结果
-    # verification_result = verify_optimization_result(query, optimization_result["optimized_query"])
-    
+    # 1. 解析SQL，提取关键信息
+    cleaned_query = clean_sql(query)
+    parsed = sqlparse.parse(cleaned_query)[0]
+    query_info = {
+        "has_select_star": bool(re.search(r'SELECT\s+\*', cleaned_query, re.IGNORECASE)),
+        "has_order_by": bool(re.search(r'ORDER\s+BY', cleaned_query, re.IGNORECASE)),
+        "has_limit": bool(re.search(r'LIMIT', cleaned_query, re.IGNORECASE)),
+        "has_subquery": bool(re.search(r'\(SELECT', cleaned_query, re.IGNORECASE)),
+        "has_group_by": bool(re.search(r'GROUP\s+BY', cleaned_query, re.IGNORECASE)),
+        "has_distinct": bool(re.search(r'DISTINCT', cleaned_query, re.IGNORECASE)),
+        "tables": extract_tables(parsed),
+    }
+
+    # 2. 规则定义与检测
+    rewrite_rules = []
+    optimized_query = cleaned_query
+    triggered_rules = []
+
+    # 规则1：SELECT * 改为 SELECT 列名
+    if query_info["has_select_star"]:
+        # 尝试将SELECT *替换为SELECT 具体列名
+        for table in query_info["tables"]:
+            optimized_query = re.sub(r'SELECT\s+\*', f'SELECT /* 建议替换为具体列名，如 {table}.col1, {table}.col2 */', optimized_query, flags=re.IGNORECASE)
+        triggered_rules.append("避免使用SELECT *，建议显式指定列名")
+        rewrite_rules.append({"rule": "no_select_star", "desc": "避免SELECT *，提升查询效率和可维护性"})
+
+    # 规则2：ORDER BY无LIMIT时建议加LIMIT防止全表排序
+    if query_info["has_order_by"] and not query_info["has_limit"]:
+        optimized_query += " LIMIT 100"
+        triggered_rules.append("ORDER BY未加LIMIT，建议加LIMIT防止全表排序")
+        rewrite_rules.append({"rule": "order_by_without_limit", "desc": "ORDER BY建议加LIMIT，避免大结果集排序"})
+
+    # 规则3：子查询可尝试用JOIN重写（这里只做标记，实际需复杂分析）
+    if query_info["has_subquery"]:
+        triggered_rules.append("存在子查询，部分场景可尝试用JOIN重写提升性能")
+        rewrite_rules.append({"rule": "subquery_to_join", "desc": "子查询可尝试用JOIN重写，提升性能"})
+        # 不自动改写，仅给出建议
+
+    # 规则4：GROUP BY无索引建议加索引（这里只做标记）
+    if query_info["has_group_by"]:
+        triggered_rules.append("GROUP BY字段建议加索引")
+        rewrite_rules.append({"rule": "group_by_index", "desc": "GROUP BY字段建议加索引，提升分组效率"})
+
+    # 规则5：DISTINCT建议评估是否必要
+    if query_info["has_distinct"]:
+        triggered_rules.append("DISTINCT操作建议评估是否必要，避免不必要的去重开销")
+        rewrite_rules.append({"rule": "distinct_check", "desc": "DISTINCT建议评估是否必要，避免性能损耗"})
+
+    # 3. 返回结果
     return {
         "action": "rewrite_query",
         "original_query": query,
-        "optimized_query": f"/* Optimized */ {query}",
+        "optimized_query": optimized_query if triggered_rules else query,
+        "triggered_rules": triggered_rules,
+        "rewrite_rules": rewrite_rules,
+        "query_info": query_info
     }
 
 if __name__ == "__main__":
     # 初始化并运行服务器
     mcp.run(transport='stdio') 
+
+
