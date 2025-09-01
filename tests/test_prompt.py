@@ -9,6 +9,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
 from agents._config import set_default_openai_api
 from contextlib import AsyncExitStack
+# from pydantic import BaseModel
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent.parent)
@@ -61,6 +62,11 @@ POSTGRES_CONFIG = {
 os.environ['OPENAI_API_KEY'] = "sk-6B29GYJUvOdinhDgD4Be997d5b2a4e399dA5B7F2A275F3B6"
 os.environ['OPENAI_BASE_URL'] = "https://api.gpt.ge/v1/"
 set_default_openai_api("chat_completions")
+
+# class ActionResult(BaseModel):
+#     Explanation: str
+#     Fix_Action: str
+#     Query_Rewrite: str
 
 class TestPromptManager:
     """SQL测试和修复管理器，参照action_manager.py的结构"""
@@ -122,11 +128,12 @@ class TestPromptManager:
         self._conn = psycopg2.connect(**PG_CONN_INFO)
         
         # # 初始化主Agent
-        # self.agent = Agent(
-        #     name="SQLFixAgent",
-        #     model="claude-3-5-sonnet-20241022",
-        #     instructions=self._get_agent_instructions(),
-        # )
+        self.agent = Agent(
+            name="SQLFixAgent",
+            model="claude-3-5-sonnet-20241022",
+            instructions=self._get_agent_instructions(),
+            # output_type=ActionResult
+        )
 
         # "gpt-4o-mini"
         # "gpt-4.1"
@@ -134,18 +141,19 @@ class TestPromptManager:
         # "claude-3-7-sonnet-20250219"
         # "claude-sonnet-4-20250514"
 
-        claude_api_key = "sk-6B29GYJUvOdinhDgD4Be997d5b2a4e399dA5B7F2A275F3B6"
-        claude_client = AsyncOpenAI(base_url="https://api.gpt.ge/v1", api_key=claude_api_key)
+        # claude_api_key = "sk-6B29GYJUvOdinhDgD4Be997d5b2a4e399dA5B7F2A275F3B6"
+        # claude_client = AsyncOpenAI(base_url="https://api.gpt.ge/v1", api_key=claude_api_key)
 
-        self.agent = Agent(
-            name="SQLTestAgent",
-            instructions=self._get_agent_instructions(),
-            model=OpenAIChatCompletionsModel( 
-                model="claude-3-7-sonnet-20250219",
-                openai_client=claude_client,
-            )
-        )
-        
+        # self.agent = Agent(
+        #     name="SQLFixAgent",
+        #     instructions=self._get_agent_instructions(),
+        #     model=OpenAIChatCompletionsModel( 
+        #         model="claude-3-7-sonnet-20250219",
+        #         openai_client=claude_client,
+        #     ),
+        #     output_type=ActionResult
+        # )
+
         return self.agent
             
     def _get_agent_instructions(self) -> str:
@@ -154,8 +162,8 @@ class TestPromptManager:
             Your role is to:
             1. Understand detailed database and query execution context.
             2. Identify how the root cause leads to performance degradation.
-            3. Output exactly two labeled sections: **Explanation** and **SQL Fix**.
-            4. Always make the SQL fix executable directly in the target database.
+            3. Output exactly three labeled sections: Explanation, Fix_Action and Query_Rewrite.
+            4. Always make the Fix_Action executable directly in the target database.
             5. Never include extra text, comments, or sections beyond the required format.
             6. Always apply the given MCP APIs when producing fixes, if applicable.
             7. Assume the provided execution plan, metrics, and environment info are accurate.
@@ -252,11 +260,11 @@ class TestPromptManager:
                 
     @staticmethod
     def parse_action_result(diagnosis: str):
-        """从diagnosis文本中提取Explanation、FIX_ACTION和Query_Rewrite部分"""
+        """从diagnosis文本中提取Explanation、Fix_Action和Query_Rewrite部分"""
 
         # 提取Explanation (匹配 Explanation: 或 **Explanation** 或 Explanation)
         explanation_match = re.search(
-            r'(?:\*\*?\s*)?Explanation(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:FIX_ACTION|SQL\s*Fix|Query_Rewrite|$))',
+            r'(?:\*\*?\s*)?Explanation(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:Fix_Action|SQL\s*Fix|Query_Rewrite|$))',
             diagnosis,
             re.IGNORECASE
         )
@@ -264,7 +272,7 @@ class TestPromptManager:
 
         # 提取FIX_ACTION (匹配 FIX_ACTION: 或 **SQL Fix** 或 SQL Fix)
         fix_match = re.search(
-            r'(?:\*\*?\s*)?(?:FIX_ACTION|SQL\s*Fix)(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:Query_Rewrite|Explanation|$))',
+            r'(?:\*\*?\s*)?(?:Fix_Action|SQL\s*Fix)(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:Query_Rewrite|Explanation|$))',
             diagnosis,
             re.IGNORECASE
         )
@@ -480,7 +488,7 @@ class TestPromptManager:
         - If the root cause is "suboptimal plan optimizer", you MUST perform actions within Plan Optimizer Space using PostgreSQL comment-style hints (/*+ Set(knob_name value) Set(knob_name value) ... */).
         - If the root cause is "missing indexes", you MUST perform actions within Index Space using CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS.
         - If the root cause is "poorly written queries", you MUST perform actions within Query Rewrite Space using rewrite SQL.
-        - **If multiple root causes are identified, you MUST consider all FIX_ACTION outputs jointly and determine the optimal solution that addresses the combined root causes, while strictly limiting actions to the relevant action spaces of the identified root causes. Do not perform any actions outside of these specified root causes.**
+        - **If multiple root causes are identified, you MUST consider all Fix_Action outputs jointly and determine the optimal solution that addresses the combined root causes, while strictly limiting actions to the relevant action spaces of the identified root causes. Do not perform any actions outside of these specified root causes.**
 
         1. Knob Space:  
         - Knob Space is strictly limited to the following knobs: 
@@ -556,18 +564,16 @@ class TestPromptManager:
         Explanation:
         <concise technical reason why the root cause is causing the slowdown now>
 
-        FIX_ACTION:
+        Fix_Action:
         <your fix SQL or optimization action here>
 
         Query_Rewrite:
         <yes or no>
 
         ## Output Requirements
-        - You must output plain text only. Do not use Markdown, bold (** **), italic (* *), bullet points, or any other formatting.
-        - The section headers "Explanation:", "FIX_ACTION:", and "Query_Rewrite:" must appear exactly as shown, without any additional symbols or styling.
         - "Explanation" must be a short, precise, technical summary — no generic statements.
         - If the fix rewrites the SQL, "Query_Rewrite" must be "yes", else "no".
-        - If rewriting, provide the optimized SQL under FIX_ACTION.
+        - If rewriting, provide the optimized SQL under Fix_Action.
         - If adding indexes or changing knobs, provide the exact SQL or command.
         - Do not output any extra sections, comments, or steps.
         """

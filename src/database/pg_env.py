@@ -1,12 +1,13 @@
 import psycopg
 from psycopg.rows import dict_row
-from typing import Dict, Any
+from typing import Dict, Any, List
 from plumbum import local
 from collections import defaultdict
 import json
 import time
 from .resource_monitor import ResourceMonitor
 from decimal import Decimal
+import re
 
 class PostgresDB:
     def __init__(self, user, password, host, port, dbname, workload_type, postgres_path = None, postgres_data = None, log_path = None):
@@ -32,6 +33,11 @@ class PostgresDB:
                 user=self.user,
                 password=self.password
         )
+
+    def close(self):
+        if self.connection:
+            self.connection.close()
+            self.connection = None
     
     def connect(self):
         """建立并返回一个数据库连接"""
@@ -65,28 +71,65 @@ class PostgresDB:
         conn = self.connect()
         with conn.cursor() as cursor:
             try:
-                cursor.execute(f"SET statement_timeout = {timeout * 1000}") # 设置超时
-                cursor.execute(sql)
-                if not cursor.description:
+                statements = self.extract_sql_statements(sql)
+                if not statements:
+                    statements = [sql]
+                
+                select_results = None
+                
+                for i, stmt in enumerate(statements):
+                    if self.is_select_statement(stmt):
+                        # print(f"执行SELECT语句 {i+1}: {stmt[:100]}...")
+                        cursor.execute(f"SET statement_timeout = {timeout * 1000}")
+                        cursor.execute(stmt)
+                        
+                        select_results = cursor.fetchall()
+                        if len(cursor.description) == 1:
+                            select_results = [row[0] for row in select_results]
+
+                        # print("result:", select_results)
+                        # print(f"SELECT语句返回 {len(select_results)} 行结果")
+                        
+                    else:
+                        # print(f"执行非SELECT语句 {i+1}: {stmt[:50]}...")
+                        # 执行非SELECT语句（如CREATE VIEW, DROP VIEW）
+                        cursor.execute(stmt)
+                        conn.commit()
+                
+                if select_results is not None:
+                    if as_json:
+                        columns = [col.name for col in cursor.description]
+                        results = [dict(zip(columns, row)) for row in select_results]
+                        return json.dumps(results, indent=4, ensure_ascii=False, default=self.decimal_default)
+                    if select_results and isinstance(select_results[0], (dict, list)):
+                        return json.dumps(select_results, ensure_ascii=False)
+                    return select_results
+                else:
+                    # print("未找到SELECT语句，返回空结果")
                     return []
-                results = cursor.fetchall()
-                if as_json:
-                    columns = [col.name for col in cursor.description]
-                    results = [dict(zip(columns, row)) for row in results]
-                    return json.dumps(results, indent=4, ensure_ascii=False, default=self.decimal_default)
-                if len(cursor.description) == 1:
-                    results = [row[0] for row in results]
-                    # 处理plan_json
-                    if results and isinstance(results[0], (dict, list)):
-                        return json.dumps(results, ensure_ascii=False)
-                return results
+                
             except psycopg.errors.QueryCanceled as e:
                 print(f"查询超时 (>{timeout}秒): {str(e)}") 
                 return []
             except Exception as e:
                 print(f"查询执行失败: {str(e)}")
                 return []
-        
+    
+    def extract_sql_statements(self, sql_text: str) -> List[str]:
+        """
+        从SQL文本中提取所有SQL语句。
+        """
+        return [stmt.strip() for stmt in sql_text.split(';') if stmt.strip()]
+    
+    def is_select_statement(self, sql: str) -> bool:
+        """
+        判断SQL语句是否为SELECT语句（包括WITH子句）或EXPLAIN语句。
+        """
+        # 去除开头的空白字符
+        sql = sql.strip()
+        # 检查是否以WITH、SELECT或EXPLAIN开头
+        return bool(re.match(r'^\s*(?:WITH\s+.*?\s+)?(?:SELECT|EXPLAIN)\s+', sql, re.IGNORECASE | re.DOTALL))
+
     def get_size(self):
         sql = f"""
         SELECT pg_size_pretty(pg_database_size('{self.dbname}'));
@@ -261,40 +304,49 @@ class PostgresDB:
 
     def get_plan(self, sql):
         """
-        获取SQL的执行计划。对于包含DDL语句的复杂SQL，提取主要的查询语句来获取计划。
+        获取SQL的执行计划。支持包含 CREATE VIEW / DROP VIEW 的复杂SQL。
+        执行流程：
+        1. 先执行 CREATE 相关语句（不加 EXPLAIN）
+        2. 找到第一个 SELECT，生成计划并返回
+        3. 执行 DROP 语句清理
         """
-        # 清理SQL，去除注释和多余空白
         sql = sql.strip()
-        
-        # 如果SQL包含多个语句，尝试提取主要的查询语句
+
+        # SQL 可能包含多个语句
         if ';' in sql:
             statements = [stmt.strip() for stmt in sql.split(';') if stmt.strip()]
-            # 查找第一个SELECT语句作为主要查询
-            main_query = None
-            for stmt in statements:
-                if stmt.upper().startswith('SELECT'):
-                    main_query = stmt
-                    break
-            
-            if main_query:
-                try:
-                    plan_sql = f"EXPLAIN (FORMAT JSON) {main_query}"
-                    return self.fetch_results(plan_sql)
-                except Exception as e:
-                    print(f"获取主要查询计划失败: {e}")
-                    return None
-            else:
-                # 如果没有找到SELECT语句，尝试获取最后一个非DDL语句的计划
-                for stmt in reversed(statements):
-                    if not any(stmt.upper().startswith(keyword) for keyword in 
-                              ['CREATE', 'DROP', 'ALTER', 'INSERT', 'UPDATE', 'DELETE']):
+            plan_result = None
+
+            try:
+                # 1. 执行 CREATE VIEW / TEMP TABLE 等
+                for stmt in statements:
+                    if stmt.upper().startswith(("CREATE", "ALTER")):
+                        try:
+                            self.execute(stmt)  # 普通执行，不加 EXPLAIN
+                        except Exception as e:
+                            print(f"执行 {stmt} 失败: {e}")
+
+                # 2. 找到第一个 SELECT 并 EXPLAIN
+                for stmt in statements:
+                    if stmt.upper().startswith("SELECT"):
                         try:
                             plan_sql = f"EXPLAIN (FORMAT JSON) {stmt}"
-                            return self.fetch_results(plan_sql)
+                            plan_result = self.fetch_results(plan_sql)
+                            break
                         except Exception as e:
-                            print(f"获取语句计划失败: {e}")
-                            continue
-                return None
+                            print(f"获取 SELECT 执行计划失败: {e}")
+
+            finally:
+                # 3. 清理 DROP VIEW / DROP TABLE
+                for stmt in statements:
+                    if stmt.upper().startswith("DROP"):
+                        try:
+                            self.execute(stmt)
+                        except Exception as e:
+                            print(f"执行 {stmt} 失败: {e}")
+
+            return plan_result
+
         else:
             # 单个语句，直接获取计划
             try:
@@ -466,50 +518,87 @@ class PostgresDB:
     def compare_sql_results(self, sql1, sql2):
         """
         判断两个SQL语句的输出结果是否完全一致（包括内容和重复行）。
-        返回True表示完全一致，False表示不一致。
+        支持 SQL 中包含 CREATE VIEW + SELECT + DROP VIEW。
+        如果两个SQL都有CREATE VIEW，会分别执行后比较结果。
         """
+        def clean_sql(sql):
+            # 去除注释
+            lines = sql.split('\n')
+            cleaned_lines = []
+            for line in lines:
+                if '--' in line:
+                    line = line.split('--')[0]
+                cleaned_lines.append(line.strip())
+            sql = ' '.join(cleaned_lines)
+            sql = ' '.join(sql.split())
+            return sql.strip().rstrip(';')
+
         try:
-            # 清理SQL，去除注释、多余空白和结尾分号
-            def clean_sql(sql):
-                # 去除注释
-                lines = sql.split('\n')
-                cleaned_lines = []
-                for line in lines:
-                    # 去除行内注释
-                    if '--' in line:
-                        line = line.split('--')[0]
-                    cleaned_lines.append(line.strip())
-                
-                # 合并并清理
-                sql = ' '.join(cleaned_lines)
-                # 去除多余空白
-                sql = ' '.join(sql.split())
-                # 去除结尾分号
-                sql = sql.rstrip(';')
-                return sql
-            
             sql1 = clean_sql(sql1)
             sql2 = clean_sql(sql2)
-            
-            conn = self.connect()
-            
-            # 构建EXCEPT查询，确保SQL语法正确
-            except1 = f"SELECT * FROM ({sql1}) AS t1 EXCEPT ALL SELECT * FROM ({sql2}) AS t2"
-            except2 = f"SELECT * FROM ({sql2}) AS t2 EXCEPT ALL SELECT * FROM ({sql1}) AS t1"
-            
-            with conn.cursor() as cursor:
-                cursor.execute(except1)
-                diff1 = cursor.fetchall()
-                cursor.execute(except2)
-                diff2 = cursor.fetchall()
-            
-            return len(diff1) == 0 and len(diff2) == 0
-            
+
+            result1 = self.fetch_results(sql1, timeout=300)
+            result2 = self.fetch_results(sql2, timeout=300)
+
+            # print(f"result1: {result1}")
+            # print(f"result2: {result2}")
+
+            # 比较结果（顺序无关，重复保留 → 用multiset）
+            from collections import Counter
+            return Counter(result1) == Counter(result2)
+
         except Exception as e:
             print(f"比较SQL结果时出错: {e}")
-            print(f"SQL1: {sql1}")
-            print(f"SQL2: {sql2}")
-            # 如果比较失败，返回False表示结果不一致
             return False
+
+
+    # def compare_sql_results(self, sql1, sql2):
+    #     """
+    #     判断两个SQL语句的输出结果是否完全一致（包括内容和重复行）。
+    #     返回True表示完全一致，False表示不一致。
+    #     """
+    #     try:
+    #         # 清理SQL，去除注释、多余空白和结尾分号
+    #         def clean_sql(sql):
+    #             # 去除注释
+    #             lines = sql.split('\n')
+    #             cleaned_lines = []
+    #             for line in lines:
+    #                 # 去除行内注释
+    #                 if '--' in line:
+    #                     line = line.split('--')[0]
+    #                 cleaned_lines.append(line.strip())
+                
+    #             # 合并并清理
+    #             sql = ' '.join(cleaned_lines)
+    #             # 去除多余空白
+    #             sql = ' '.join(sql.split())
+    #             # 去除结尾分号
+    #             sql = sql.rstrip(';')
+    #             return sql
+            
+    #         sql1 = clean_sql(sql1)
+    #         sql2 = clean_sql(sql2)
+            
+    #         conn = self.connect()
+            
+    #         # 构建EXCEPT查询，确保SQL语法正确
+    #         except1 = f"SELECT * FROM ({sql1}) AS t1 EXCEPT ALL SELECT * FROM ({sql2}) AS t2"
+    #         except2 = f"SELECT * FROM ({sql2}) AS t2 EXCEPT ALL SELECT * FROM ({sql1}) AS t1"
+            
+    #         with conn.cursor() as cursor:
+    #             cursor.execute(except1)
+    #             diff1 = cursor.fetchall()
+    #             cursor.execute(except2)
+    #             diff2 = cursor.fetchall()
+            
+    #         return len(diff1) == 0 and len(diff2) == 0
+            
+    #     except Exception as e:
+    #         print(f"比较SQL结果时出错: {e}")
+    #         print(f"SQL1: {sql1}")
+    #         print(f"SQL2: {sql2}")
+    #         # 如果比较失败，返回False表示结果不一致
+    #         return False
 
 

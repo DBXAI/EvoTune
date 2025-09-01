@@ -78,12 +78,16 @@ async def main():
         'KNOB_CONFIG': KNOB_CONFIG,
         'API_SETTINGS': API_SETTINGS
     }
-    agent = DBAgent(configs=configs)
-    await agent.run(
-        slow_query_path=args.data_path,
-        order=args.order,
-        max_iterations=args.max_iterations
-    )
+    async with DBAgent(configs=configs) as agent:
+        await agent.run(
+            slow_query_path=args.data_path,
+            order=args.order,
+            max_iterations=args.max_iterations
+        )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except asyncio.CancelledError:
+        # anyio/MCP 在正常关闭 stdio 时会抛取消，属于正常关机路径
+        pass
