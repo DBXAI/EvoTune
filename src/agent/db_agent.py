@@ -113,17 +113,22 @@ class DBAgent:
         # 按行分割
         lines = fix_action.strip().splitlines()
         sql_start = None
+        
         for idx, line in enumerate(lines):
             l = line.lstrip().upper()
-            if l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or l.startswith("UPDATE") or l.startswith("DELETE"):
+            # 检查是否是SQL语句开始（包括WITH子句）
+            if (l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or 
+                l.startswith("UPDATE") or l.startswith("DELETE")):
                 sql_start = idx
                 break
+        
         if sql_start is not None:
             fix_part = "\n".join([line for line in lines[:sql_start] if line.strip()])
             sql_part = "\n".join(lines[sql_start:]).strip()
             return fix_part, sql_part
         else:
-            return fix_action.strip(), ""    
+            # 如果没有找到SQL语句，整个内容作为修复动作
+            return fix_action.strip(), ""
         
     def extract_fix_action(self, action_result: str):
         explanation, fix_action, is_rewrite = self.parse_action_result(action_result)
@@ -208,6 +213,7 @@ class DBAgent:
                 old_time = query_info.execution_time
 
                 if evaluation_result.get("status") == -1:
+                    print(evaluation_result.get("msg"))
                     logger.info(f"SQL {query_id} 修复失败，执行下一条SQL语句")
                     continue
                 elif evaluation_result.get("status") == 1:
@@ -228,6 +234,7 @@ class DBAgent:
                     new_fix_action, new_rewrite_sql = self.extract_fix_action(new_action_result)
                     new_evaluation_result = await self.action_manager.evaluate_action(new_fix_action, new_rewrite_sql, query_info)
                     if new_evaluation_result.get("status") == -1:
+                        print(new_evaluation_result.get("msg"))
                         logger.info(f"SQL {query_id} 修复失败，执行下一条SQL语句")
                         continue
                     elif new_evaluation_result.get("status") == 1:

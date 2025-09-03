@@ -239,7 +239,7 @@ class ActionManager:
 
             ## Action Space  
             - If the root cause is "inappropriate query knobs", you MUST perform actions within Knob Space using SET knob = value.
-            - If the root cause is "suboptimal plan optimizer", you MUST perform actions within Plan Optimizer Space using PostgreSQL comment-style hints (/*+ Set(knob_name value) Set(knob_name value) ... */).
+            - If the root cause is "suboptimal plan optimizer", you MUST perform actions within Plan Optimizer Space using PostgreSQL comment-style hints ONLY. Output ONLY the hint block like: /*+ Set(knob_name value) Set(knob_name value) ... */. Do NOT include the SQL query.
             - If the root cause is "missing indexes", you MUST perform actions within Index Space using CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS.
             - If the root cause is "poorly written queries", you MUST perform actions within Query Rewrite Space using rewrite SQL.
             - **If multiple root causes are identified, you MUST consider all FIX_ACTION outputs jointly and determine the optimal solution that addresses the combined root causes, while strictly limiting actions to the relevant action spaces of the identified root causes. Do not perform any actions outside of these specified root causes.**
@@ -295,6 +295,7 @@ class ActionManager:
             enable_partitionwise_join: type: boolean, min: 0, max: 1, default: 0
             enable_seqscan: type: boolean, min: 0, max: 1, default: 1
             enable_sort: type: boolean, min: 0, max: 1, default: 1
+            - **IMPORTANT**: When using Plan Optimizer Space, output ONLY the hint block. Do NOT include the original SQL. Example: /*+ Set(enable_hashjoin on) Set(enable_sort on) */
 
             3. Index Space: 
             - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx.
@@ -424,7 +425,10 @@ class ActionManager:
         2. 检测修复操作前后结果是否一致：不一致，返回让大模型重新生成
         3. 检测修复操作是否带来性能提升
         """
-        # 1. 检查修复SQL能否执行
+        # 在执行前对 fix_action / rewrite_sql 进行预处理，得到最终 fix_action 与初始 fix_sql
+        fix_action, fix_sql = await self.derive_fix_action_and_sql(fix_action, rewrite_sql, query_info.query)
+
+        # 1. 检查修复SQL能否执行（如有 DDL/SET 等修复，需先执行）
         if fix_action != "":
             success, _, _, err = self.db.execute(fix_action)
         else:
@@ -437,39 +441,22 @@ class ActionManager:
             result = await Runner.run(starting_agent=self.fixAgent, input=prompt)
             new_fix_action = result.final_output
             print(f"new_fix_action: {new_fix_action}")
+            new_fix_action, new_fix_sql = self.derive_fix_action_and_sql(new_fix_action, rewrite_sql, query_info.query)
             success, _, _, err = self.db.execute(new_fix_action)
             fix_action = new_fix_action
+            fix_sql = new_fix_sql
             retry_count += 1
         if not success:
             return {"status": -1, "msg": f"SQL修复失败: {fix_action}, 错误: {err}", "action": fix_action, "new_time": -1}
 
-        if rewrite_sql != "":
-            # 2. 原始慢SQL的执行结果
-            retry_count = 0
-            max_retry = 5
-            origin_sql = query_info.query
-            match = self.db.compare_sql_results(origin_sql, rewrite_sql)
-            print(f"match: {match}")
-            while not match and retry_count < max_retry:
-                prompt = self._build_rewrite_prompt(origin_sql, rewrite_sql)
-                result = await Runner.run(starting_agent=self.fixAgent, input=prompt)
-                new_rewrite_sql = result.final_output
-                print(f"new_rewrite_sql: {new_rewrite_sql}")
-                success, _, _, err = self.db.execute(new_rewrite_sql, timeout=300)
-                rewrite_sql = new_rewrite_sql
-                retry_count += 1
-                match = self.db.compare_sql_results(origin_sql, rewrite_sql)
-            if not match:
-                return {"status": -1, "msg": "修复后结果仍不一致", "action": rewrite_sql, "new_time": -1}
-            if not success:
-                return {"status": -1, "msg": f"修复后SQL执行失败: {err}", "action": rewrite_sql, "new_time": -1}
-
-        if rewrite_sql != "":
-            success, _, new_time, err = self.db.execute(rewrite_sql, timeout=300)
-        else:
-            success, _, new_time, err = self.db.execute(query_info.query, timeout=300)
-
         old_time = query_info.execution_time
+
+        # 执行性能测试
+        success, _, new_time, err = self.db.execute(fix_sql, timeout=300)
+        if not success:
+            if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):
+                return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": new_time}
+            return {"status": -1, "msg": f"性能测试SQL执行失败: {err}", "action": fix_action, "new_time": -1}
 
         if fix_action != "":
             index_names = self.extract_index_names(fix_action)
@@ -478,9 +465,95 @@ class ActionManager:
 
         # 4. 性能对比与后续处理
         if (old_time - new_time) / old_time > 0.1:
-            return {"status": 1, "msg": f"修复成功，性能提升，耗时由{old_time:.4f}s降至{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": rewrite_sql, "new_time": new_time}
+            return {"status": 1, "msg": f"修复成功，性能提升，耗时由{old_time:.4f}s降至{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": new_time}
         else:
-            return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": rewrite_sql, "new_time": new_time}
+            return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": new_time}
+
+    async def derive_fix_action_and_sql(self, fix_action, rewrite_sql, origin_sql):
+        """
+        处理hint相关逻辑
+        """
+        # 提取首个 hint 注释块
+        match = re.search(r"/\*\+[\s\S]*?\*/", fix_action)
+        if match:
+            hint = match.group(0).strip()
+            # 从 fix_action 中移除该 hint
+            clean_fix_action = (fix_action[:match.start()] + fix_action[match.end():]).strip()
+            if rewrite_sql != "":
+                await self.check_sql_rewrite(origin_sql, rewrite_sql)
+                target_sql = rewrite_sql
+            else:
+                target_sql = origin_sql
+            fix_sql = self._inject_hint_into_sql(hint, target_sql)
+            return clean_fix_action, fix_sql
+        else:
+            # 无 hint
+            clean_fix_action = fix_action
+            if rewrite_sql != "":
+                await self.check_sql_rewrite(origin_sql, rewrite_sql)
+                fix_sql = rewrite_sql
+            else:
+                fix_sql = origin_sql
+            return clean_fix_action, fix_sql
+
+    def _inject_hint_into_sql(self, hint, sql):
+        """将 hint 注入到 SQL 中的每个顶层 SELECT（含 WITH 后主 SELECT）或 EXPLAIN 语句前。
+        
+        使用正则表达式匹配，在顶层 SELECT 或 EXPLAIN 前插入 hint。
+        """
+        # 使用简单的单词边界匹配，然后通过位置判断是否在括号内
+        pattern = r'\b(WITH|SELECT|EXPLAIN)\b'
+        
+        def replace_match(match):
+            # 检查是否在括号内
+            start_pos = match.start()
+            keyword = match.group(1).upper()
+            
+            # 计算到当前位置的左括号和右括号数量
+            left_count = sql[:start_pos].count('(')
+            right_count = sql[:start_pos].count(')')
+            
+            # 如果在括号内，不注入hint
+            if left_count > right_count:
+                return match.group(0)
+            
+            # 特殊处理：如果是 SELECT 且在视图定义中（前面有 "as" 关键字），不注入
+            if keyword == 'SELECT':
+                # 简单检查：如果前面有 "as" 关键字，不注入 hint
+                before_text = sql[:start_pos].lower().strip()
+                if before_text.endswith('as'):
+                    return match.group(0)
+            
+            # 特殊处理：如果是 WITH，不注入 hint（只在主 SELECT 前注入）
+            if keyword == 'WITH':
+                return match.group(0)
+            
+            # 如果前面已经有 hint，不重复添加
+            if start_pos > 0:
+                prefix = sql[:start_pos].strip()
+                if prefix.endswith(hint.strip()):
+                    return match.group(0)
+            
+            return hint + ' ' + match.group(0)
+        
+        # 替换所有匹配项
+        result = re.sub(pattern, replace_match, sql, flags=re.IGNORECASE)
+        return result
+
+    async def check_sql_rewrite(self, origin_sql, rewrite_sql):
+        retry_count = 0
+        max_retry = 5
+        match = self.db.compare_sql_results(origin_sql, rewrite_sql)
+        print(f"match: {match}")
+        while not match and retry_count < max_retry:
+            prompt = self._build_rewrite_prompt(origin_sql, rewrite_sql)
+            result = await Runner.run(starting_agent=self.fixAgent, input=prompt)
+            new_rewrite_sql = result.final_output
+            print(f"new_rewrite_sql: {new_rewrite_sql}")
+            rewrite_sql = new_rewrite_sql
+            retry_count += 1
+            match = self.db.compare_sql_results(origin_sql, rewrite_sql)
+            print(f"match: {match}")
 
     async def action_step(self, root_cause, query_info, historical_cases, inspirations):
         """
