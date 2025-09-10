@@ -64,7 +64,7 @@ def parse_args():
 
 async def main():
     # cd /root/DREAM/src
-    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --max_iterations 100
+    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --max_iterations 1
     logger = logging.getLogger(__name__)
     
     args = parse_args()
@@ -86,6 +86,7 @@ async def main():
         )
 
 if __name__ == "__main__":
+    # asyncio.run(main())
     try:
         asyncio.run(main())
     except asyncio.CancelledError:

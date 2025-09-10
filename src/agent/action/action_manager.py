@@ -201,8 +201,8 @@ class ActionManager:
 
         query_info = base_info.get('query_info')
         db_info = base_info.get('database_info', {})
-        historical_cases = ""
-        inspirations = ""
+        # historical_cases = ""
+        # inspirations = ""
         
         return f"""
             As an SQL optimization expert, your task is to diagnose and fix the following slow SQL query.
@@ -447,7 +447,7 @@ class ActionManager:
             fix_sql = new_fix_sql
             retry_count += 1
         if not success:
-            return {"status": -1, "msg": f"SQL修复失败: {fix_action}, 错误: {err}", "action": fix_action, "new_time": -1}
+            return {"status": -1, "msg": f"SQL修复失败: {fix_action}, 错误: {err}", "action": fix_action, "new_time": 300}
 
         old_time = query_info.execution_time
 
@@ -456,7 +456,7 @@ class ActionManager:
         if not success:
             if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):
                 return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": new_time}
-            return {"status": -1, "msg": f"性能测试SQL执行失败: {err}", "action": fix_action, "new_time": -1}
+            return {"status": -1, "msg": f"性能测试SQL执行失败: {err}", "action": fix_action, "new_time": 300}
 
         if fix_action != "":
             index_names = self.extract_index_names(fix_action)
@@ -636,6 +636,7 @@ class ActionManager:
 
     async def action_generate(self, root_cause, base_info, action_space, historical_cases, inspirations):
         prompt = self._build_prompt(root_cause, base_info, action_space, historical_cases, inspirations)
+        # print(f"prompt: {prompt}")
         print(f"prompt已生成")
         result = await Runner.run(starting_agent=self.agent, input=prompt)
         return result.final_output

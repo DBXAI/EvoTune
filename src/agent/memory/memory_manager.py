@@ -98,31 +98,35 @@ class MemoryManager:
     
     def save_to_memory(self):
         with open(self.db_path, 'w') as f:
-            json.dump({cid: case.to_dict() for cid, case in self.cases.items()}, f)
+            # 只保存case_info中的信息
+            data_to_save = {}
+            for cid, case in self.cases.items():
+                data_to_save[cid] = case.case_info
+            json.dump(data_to_save, f)
 
     def save_case(self, query_info, fix_action, root_causes, old_time, new_time, label):
-        # 计算embedding
-        sql_embedding = self.build_sql_embedding(query_info)
-        action_embedding = self.build_action_embedding(str(fix_action))
-        score = old_time - new_time
+        # 计算 approve_time
+        approve_time = old_time - new_time
 
-        # 组装case
+        # 组装case_info，只存储必要信息
         case_info = {
-            "query_info": query_info,
+            "query_info": query_info.__dict__,
             "fix_action": fix_action,
             "root_causes": root_causes,
             "old_time": old_time,
             "new_time": new_time,
             "label": label,
-            "result_metrics": {"performance": new_time, "approve_time": score}
+            "approve_time": approve_time
         }
+        
+        # 创建临时MemoryCase用于计算和存储
         case = MemoryCase(
-            id=len(self.cases) + 1,
+            id=str(len(self.cases) + 1),
             case_info=case_info,
-            metrics=case_info.get("result_metrics", {}),
-            sql_embedding=sql_embedding,
-            action_embedding=action_embedding,
-            performance_bin=int(score * self.feature_bins),
+            metrics={},  # 将在load时重新计算
+            sql_embedding=None,  # 将在load时重新计算
+            action_embedding=None,  # 将在load时重新计算
+            performance_bin=0,  # 将在load时重新计算
         )
         self.add_case(case)
 
@@ -141,7 +145,7 @@ class MemoryManager:
             # 随机采样
             return random.choice(list(self.cases.values()))
 
-    def get_top_cases(self, n: int = 5, metric: str = "performance") -> List[MemoryCase]:
+    def get_top_cases(self, n: int = 5, metric: str = "approve_time") -> List[MemoryCase]:
         sorted_cases = sorted(self.cases.values(), key=lambda c: c.metrics.get(metric, 0.0), reverse=True)
         return sorted_cases[:n]
 
@@ -149,8 +153,38 @@ class MemoryManager:
         if os.path.exists(self.db_path):
             with open(self.db_path, 'r') as f:
                 data = json.load(f)
-                for cid, cdict in data.items():
-                    self.cases[cid] = MemoryCase.from_dict(cdict)
+                for cid, case_info in data.items():
+                    # 从case_info重新构建MemoryCase
+                    case = self._build_memory_case_from_info(cid, case_info)
+                    self.cases[cid] = case
+
+    def _build_memory_case_from_info(self, case_id: str, case_info: dict) -> MemoryCase:
+        """从case_info重新构建完整的MemoryCase"""
+        # 计算embedding
+        raw_info = case_info["query_info"]
+        query_info = QueryInfo(**raw_info)
+        sql_embedding = self.build_sql_embedding(query_info)
+        action_embedding = self.build_action_embedding(str(case_info["fix_action"]))
+        
+        # 计算metrics
+        approve_time = case_info.get("approve_time", 0.0)
+        new_time = case_info.get("new_time", 0.0)
+        metrics = {
+            "performance": new_time,
+            "approve_time": approve_time
+        }
+        
+        # 计算performance_bin
+        performance_bin = int(approve_time * self.feature_bins)
+        
+        return MemoryCase(
+            id=case_id,
+            case_info=case_info,
+            metrics=metrics,
+            sql_embedding=sql_embedding,
+            action_embedding=action_embedding,
+            performance_bin=performance_bin,
+        )
 
     def _calculate_feature_coords(self, case: MemoryCase) -> List[int]:
         # 以SQL embedding、action embedding、score为特征分箱
@@ -160,8 +194,8 @@ class MemoryManager:
         # 降维：取均值
         sql_val = sum(sql_emb) / len(sql_emb)
         action_val = sum(action_emb) / len(action_emb)
-        # score
-        score = case.metrics.get("performance", 0.0)
+        # score - 使用approve_time
+        score = case.metrics.get("approve_time", 0.0)
         # 分箱
         sql_bin = int(sql_val * self.feature_bins) % self.feature_bins
         action_bin = int(action_val * self.feature_bins) % self.feature_bins
@@ -174,15 +208,15 @@ class MemoryManager:
         return "-".join(str(c) for c in coords)
 
     def _is_better(self, case1: MemoryCase, case2: MemoryCase) -> bool:
-        # 以performance为主
-        return case1.metrics.get("performance", 0.0) > case2.metrics.get("performance", 0.0)
+        # 以approve_time为主（性能提升越大越好）
+        return case1.metrics.get("approve_time", 0.0) > case2.metrics.get("approve_time", 0.0)
 
     def _update_archive(self, case: MemoryCase):
         if len(self.archive) < self.archive_size:
             self.archive.add(case.id)
             return
         archive_cases = [self.cases[aid] for aid in self.archive]
-        worst_case = min(archive_cases, key=lambda c: c.metrics.get("performance", 0.0))
+        worst_case = min(archive_cases, key=lambda c: c.metrics.get("approve_time", 0.0))
         if self._is_better(case, worst_case):
             self.archive.remove(worst_case.id)
             self.archive.add(case.id)
@@ -195,7 +229,7 @@ class MemoryManager:
     def _enforce_archive_limit(self):
         # 保证archive和cases数量不超过上限
         if len(self.cases) > self.archive_size * 5:
-            sorted_cases = sorted(self.cases.values(), key=lambda c: c.metrics.get("performance", 0.0))
+            sorted_cases = sorted(self.cases.values(), key=lambda c: c.metrics.get("approve_time", 0.0))
             to_remove = sorted_cases[:len(self.cases) - self.archive_size * 5]
             for case in to_remove:
                 if case.id in self.archive:
@@ -232,7 +266,7 @@ class MemoryManager:
             island_cases = [self.cases[pid] for pid in island if pid in self.cases]
             if not island_cases:
                 continue
-            island_cases.sort(key=lambda c: c.metrics.get("performance", 0.0), reverse=True)
+            island_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
             num_to_migrate = max(1, int(len(island_cases) * self.migration_rate))
             migrants = island_cases[:num_to_migrate]
             # 环状相邻island
@@ -254,10 +288,11 @@ class MemoryManager:
         self.last_migration_generation = max(self.island_generations.values())
         logger.info(f"Migration completed at generation {self.last_migration_generation}")
 
-    def retrieve_cases(self, query_info: QueryInfo, n: int = 5, exploration_ratio=0.4) -> Tuple[Optional[MemoryCase], List[MemoryCase]]:
+    def retrieve_cases(self, query_info: QueryInfo, n: int = 2, exploration_ratio=0.1) -> Tuple[Optional[dict], List[dict]]:
         """
         采样本SQL的修复历史（parent），以及相似SQL的修复历史（inspirations）。
         inspirations优先顺序：最优、提升最大、随机。
+        返回case_info而不是完整的MemoryCase。
         """
         query_text = query_info.query.lower().strip()
         
@@ -278,32 +313,33 @@ class MemoryManager:
             rand_val = random.random()
             if rand_val < exploration_ratio:
                 # 随机采样本SQL的修复历史
-                history_cases.append(random.choice(same_sql_cases))
+                history_cases.append(random.choice(same_sql_cases).case_info)
             else:
                 # 采样本SQL最优的修复历史
-                history_cases.append(max(same_sql_cases, key=lambda c: c.metrics.get("performance", 0.0)))
+                best_case = max(same_sql_cases, key=lambda c: c.metrics.get("approve_time", 0.0))
+                history_cases.append(best_case.case_info)
         
         # 2. 相似SQL修复历史
         inspirations = []
         similar_cases = self.retrieve_embedding(query_info, n)
 
         if similar_cases:
-            # 最优的相似SQL修复历史
-            inspirations.append(similar_cases[0])
+            # 最相似的SQL修复历史
+            inspirations.append(similar_cases[0].case_info)
 
             # 提升最大的历史（approve_time最大）
             best_approve = max(similar_cases, key=lambda c: c.metrics.get("approve_time", 0.0))
-            inspirations.append(best_approve)
+            inspirations.append(best_approve.case_info)
 
         # 2.3 随机补足
         remaining = n - len(inspirations)
         if remaining > 0:
-            random_pool = [c for c in self.cases.values() if c.id not in [x.id for x in inspirations]]
+            random_pool = [c for c in self.cases.values() if c.id not in [x.get("id", "") for x in inspirations]]
             if random_pool:
                 random_insp = random.sample(random_pool, min(remaining, len(random_pool)))
-                inspirations.extend(random_insp)
+                inspirations.extend([case.case_info for case in random_insp])
 
-        return history_cases, inspirations[:n]
+        return history_cases[0] if history_cases else None, inspirations[:n]
 
     def retrieve_embedding(self, query_info, top_n=5, metric='cosine'):
         """
@@ -352,9 +388,9 @@ class MemoryManager:
         import pandas as pd
         encoding = Encoding(None, {'NA': 0})
 
-        query = query_info.query if hasattr(query_info, 'query') else ""
-
+        query = query_info.query
         query_plan = query_info.plan_json
+        
         df = pd.DataFrame([{
             'plan_json': json.dumps({'Plan': query_plan}) if isinstance(query_plan, dict) else query_plan
         }])

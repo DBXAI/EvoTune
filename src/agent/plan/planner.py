@@ -78,6 +78,32 @@ class Planner:
 
     def llm_predict(self, query_info, root_causes):
         """Use LLM to diagnose the root cause of slow SQL."""
+        
+        # 获取历史案例和灵感，就像action_manager.py中的step函数一样
+        historical_cases, inspirations = self.memory_manager.retrieve_cases(query_info)
+        
+        # 构建历史案例信息
+        historical_info = ""
+        if historical_cases:
+            historical_info = f"""
+        3. Historical Cases (Same SQL):
+        • Previous Root Cause: {historical_cases.get('root_causes')}
+        • Previous Actions: {historical_cases.get('fix_action')}
+        • Performance Improvement: {historical_cases.get('approve_time')}
+        """
+        
+        # 构建灵感案例信息
+        inspirations_info = ""
+        if inspirations:
+            inspirations_info = "\n        4. Similar Cases (Inspirations):"
+            for i, inspiration in enumerate(inspirations, 1):  # 限制显示前3个案例
+                inspirations_info += f"""
+        • Case {i}:
+          - Query_info: {inspiration.get('query_info', {})}
+          - Root Cause: {inspiration.get('root_causes')}
+          - Actions: {inspiration.get('fix_action')}
+          - Performance Improvement: {inspiration.get('approve_time')}
+        """
 
         prompt = f"""
         As a database performance diagnosis expert, your task is to identify the **most likely root cause** of the following slow SQL query.
@@ -97,17 +123,20 @@ class Planner:
         • Net Sent: {query_info.external_metrics[6]}
 
         2. Already Eliminated Causes:
-        The following causes have been confirmed **not** to be the root cause: {root_causes}
+        The following causes have been confirmed **not** to be the root cause: {root_causes}{historical_info}{inspirations_info}
 
         ## Constraints
         - You must select **only** from the following allowed labels:
         missing indexes, inappropriate query knobs, suboptimal plan optimizer, poorly written queries
+        - Consider the historical cases and similar cases when making your diagnosis. Avoid root causes with little or no past benefit and prioritize those with substantial gains.
         - Output must be **exactly one or more** of the above labels, separated by commas if multiple.
         - Do **not** output explanations, reasoning, or any other text.
 
         ## Output Format
         <root cause label(s) here — exactly as listed above>
         """
+
+        print("prompt: ", prompt)
 
         result = Runner.run_sync(starting_agent=Agent(
             name="RootCauseLLM",

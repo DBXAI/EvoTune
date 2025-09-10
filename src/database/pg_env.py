@@ -61,11 +61,11 @@ class PostgresDB:
                     result = None
                 return True, result, end_time - start_time, ""
             except psycopg.errors.SyntaxError as e:
-                return False, None, -1, str(e)
+                return False, None, timeout, str(e)
             except psycopg.errors.QueryCanceled as e:
-                return False, None, -1, str(e)
+                return False, None, timeout, str(e)
             except Exception as e:
-                return False, None, -1, str(e)
+                return False, None, timeout, str(e)
 
     def fetch_results(self, sql, as_json=False, timeout=0):
         conn = self.connect()

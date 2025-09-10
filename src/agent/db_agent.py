@@ -200,6 +200,54 @@ class DBAgent:
                 analysis_result = self.planner.model_predict(query_info)
                 root_causes = analysis_result.get('root_causes', None)
                 logger.info(f"小模型诊断根因: {root_causes}")
+
+                # if query_id == "01":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "02":
+                #     root_causes = "suboptimal plan optimizer"
+                # elif query_id == "03":
+                #     root_causes = ["inappropriate query knobs", "missing indexes"]
+                # elif query_id == "04":
+                #     root_causes = ["inappropriate query knobs", "missing indexes"]
+                # elif query_id == "05":
+                #     root_causes = ["inappropriate query knobs", "suboptimal plan optimizer", "missing indexes"]
+                # elif query_id == "06":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "07":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "08":
+                #     root_causes = ["inappropriate query knobs", "missing indexes"]
+                # elif query_id == "09":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "10":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "11":
+                #     root_causes = ["inappropriate query knobs", "missing indexes"]
+                # elif query_id == "12":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "13":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "14":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "15":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "16":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "17":
+                #     root_causes = ["inappropriate query knobs", "missing indexes"]
+                # elif query_id == "18":
+                #     root_causes = ["inappropriate query knobs", "missing indexes", "poorly written queries"]
+                # elif query_id == "19":
+                #     root_causes = "inappropriate query knobs"
+                # elif query_id == "20":
+                #     root_causes = "missing indexes"
+                # elif query_id == "21":
+                #     root_causes = ["inappropriate query knobs", "missing indexes"]
+                # elif query_id == "22":
+                #     root_causes = "missing indexes"
+                    
+                # logger.info(f"指定SQL {query_id} 根因: {root_causes}")
+
                 # 调用action_manager.step处理
                 action_result = await self.action_manager.step(query_info, root_causes)
                 # 提取fix action
@@ -265,6 +313,7 @@ class DBAgent:
                 final_root_causes = new_root_causes if new_root_causes is not None else root_causes #这里有点奇怪，是不是没有提升需要将根因设置成unknown
                 logger.info(f"SQL {query_id} 原先执行时间: {old_time}s")
                 logger.info(f"SQL {query_id} 本轮执行时间: {new_time if new_time is not None else old_time}s")
+                logger.info(f"SQL {query_id} 本轮修复SQL: {rewrite_sql}")
                 logger.info(f"SQL {query_id} 本轮修复actions: {fix_action}")
                 logger.info(f"SQL {query_id} 本轮修复根因: {final_root_causes}")
 
