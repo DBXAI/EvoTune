@@ -7,7 +7,7 @@ diagnostic_results/**
 src/agent/plan/model_res/**
 config/base_config.py
 src/agent/plan/RCRank/bert-base-uncased/**
-src/memory_results
+src/memory_results*
 test_sql_gen/data/**
 test_sql_gen/logs/**
 test_sql_gen/rubbish/**

@@ -10,6 +10,7 @@ class QueryInfo:
     external_metrics: List[List[float]]
     internal_metrics: List[float]
     execution_time: float
+    is_rewrite: bool
 
 @dataclass
 class AnomalyInfo:

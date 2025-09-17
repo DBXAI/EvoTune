@@ -25,6 +25,7 @@ from model.modules.QueryFormer.utils import Encoding
 from RCRank.utils.plan_encoding import PlanEncoder
 from agents import Agent, Runner
 from config.base_config import PLANNER_CONFIG
+from agent.prompt import build_root_cause_diagnosis_prompt, get_root_cause_llm_instructions
 
 class Planner:
     def __init__(self, memory_manager: MemoryManager):
@@ -78,77 +79,38 @@ class Planner:
 
     def llm_predict(self, query_info, root_causes):
         """Use LLM to diagnose the root cause of slow SQL."""
-        
-        # 获取历史案例和灵感，就像action_manager.py中的step函数一样
-        historical_cases, inspirations = self.memory_manager.retrieve_cases(query_info)
-        
-        # 构建历史案例信息
-        historical_info = ""
-        if historical_cases:
-            historical_info = f"""
-        3. Historical Cases (Same SQL):
-        • Previous Root Cause: {historical_cases.get('root_causes')}
-        • Previous Actions: {historical_cases.get('fix_action')}
-        • Performance Improvement: {historical_cases.get('approve_time')}
-        """
-        
-        # 构建灵感案例信息
-        inspirations_info = ""
-        if inspirations:
-            inspirations_info = "\n        4. Similar Cases (Inspirations):"
-            for i, inspiration in enumerate(inspirations, 1):  # 限制显示前3个案例
-                inspirations_info += f"""
-        • Case {i}:
-          - Query_info: {inspiration.get('query_info', {})}
-          - Root Cause: {inspiration.get('root_causes')}
-          - Actions: {inspiration.get('fix_action')}
-          - Performance Improvement: {inspiration.get('approve_time')}
-        """
+        # 使用新的 ε-greedy 检索结构：{"positive", "negative"}
+        retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
+        positives = retrieval.get('positive', [])
+        negatives = retrieval.get('negative', [])
 
-        prompt = f"""
-        As a database performance diagnosis expert, your task is to identify the **most likely root cause** of the following slow SQL query.
-
-        ## Context
-        1. Query Information:
-        • SQL: {query_info.query}
-        • Execution Plan: {query_info.plan_json}
-        • Execution Runtime: {query_info.execution_time} s
-        • Internal Metrics: Tuples Returned:{query_info.internal_metrics[0]}, Blocks Hit:{query_info.internal_metrics[1]}, Blocks Read:{query_info.internal_metrics[2]}, Tuples Fetched:{query_info.internal_metrics[3]}, Index Tuples Fetched:{query_info.internal_metrics[4]}, Sequential Tuples Read:{query_info.internal_metrics[5]}, Sequential Scans:{query_info.internal_metrics[6]}, Index Scans:{query_info.internal_metrics[7]}, Heap Blocks Hit:{query_info.internal_metrics[8]}, Heap Blocks Read:{query_info.internal_metrics[9]}, Index Blocks Hit:{query_info.internal_metrics[10]}, Index Blocks Read:{query_info.internal_metrics[11]}
-        • CPU: {query_info.external_metrics[0]}
-        • Read I/O: {query_info.external_metrics[1]}
-        • Write I/O: {query_info.external_metrics[2]}
-        • Virtual Memory: {query_info.external_metrics[3]}
-        • Physical Memory: {query_info.external_metrics[4]}
-        • Net Received: {query_info.external_metrics[5]}
-        • Net Sent: {query_info.external_metrics[6]}
-
-        2. Already Eliminated Causes:
-        The following causes have been confirmed **not** to be the root cause: {root_causes}{historical_info}{inspirations_info}
-
-        ## Constraints
-        - You must select **only** from the following allowed labels:
-        missing indexes, inappropriate query knobs, suboptimal plan optimizer, poorly written queries
-        - Consider the historical cases and similar cases when making your diagnosis. Avoid root causes with little or no past benefit and prioritize those with substantial gains.
-        - Output must be **exactly one or more** of the above labels, separated by commas if multiple.
-        - Do **not** output explanations, reasoning, or any other text.
-
-        ## Output Format
-        <root cause label(s) here — exactly as listed above>
-        """
-
+        prompt = build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negatives)
         print("prompt: ", prompt)
 
         result = Runner.run_sync(starting_agent=Agent(
             name="RootCauseLLM",
             model="gpt-4.1",
-            instructions="""
-            You are a database slow SQL root cause diagnosis expert.
-            Only output the allowed root cause labels, nothing else.
-            """
+            instructions=get_root_cause_llm_instructions()
         ), input=prompt)
         
-        new_root_causes = result.final_output.strip()
-        return {"root_causes": new_root_causes}
+        new_root_causes_str = result.final_output.strip()
+        
+        # 解析大模型输出，转换为列表格式
+        allowed_labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
+        
+        # 按逗号分割并清理
+        root_causes = []
+        # 分割并清理每个标签
+        for label in new_root_causes_str.split(','):
+            cleaned_label = label.strip().lower()
+            if cleaned_label in allowed_labels and cleaned_label not in root_causes:
+                root_causes.append(cleaned_label)
+        
+        # 如果没有找到有效标签，返回默认值
+        if len(root_causes) == 0:
+            root_causes = ["normal"]
+        
+        return {"root_causes": root_causes}
 
 
     def _build_prediction_input(self, query_info: QueryInfo) -> Tuple[str, Dict, List, List]:
@@ -199,15 +161,8 @@ class Planner:
                 root_causes.append(root_cause)
                 root_causes_confidence.append(pred_label_opt[0][class_idx])
         
-        if len(root_causes) == 1:
-            return {"root_causes": root_causes[0]}
-            # root_cause = {
-            #     "root_cause": root_causes[0],
-            #     "confidence": root_causes_confidence[0]
-            # }
-        else:
-            return {"root_causes": root_causes}
-            # root_cause = {
-            #     "root_cause": root_causes,
-            #     "confidence": root_causes_confidence
-            # }
+        return {"root_causes": root_causes}
+        # root_cause = {
+        #     "root_cause": root_causes,
+        #     "confidence": root_causes_confidence
+        # }

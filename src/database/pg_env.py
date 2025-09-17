@@ -154,6 +154,15 @@ class PostgresDB:
         """
         return self.fetch_results(sql)
 
+    def get_indexes(self):
+        """获取数据库中所有索引的详细信息"""
+        sql = """
+        SELECT indexname FROM pg_indexes 
+        WHERE schemaname = 'public'
+        AND indexname NOT LIKE 'pg_%';
+        """
+        return self.fetch_results(sql)
+
     def fetch_schema_info(self):
         sql = """
         WITH
