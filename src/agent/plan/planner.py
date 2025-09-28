@@ -28,20 +28,10 @@ from config.base_config import PLANNER_CONFIG
 from agent.prompt import build_root_cause_diagnosis_prompt, get_root_cause_llm_instructions
 
 class Planner:
-    def __init__(self, memory_manager: MemoryManager):
+    def __init__(self, memory_manager: MemoryManager, predictor: RCRankPredictor):
         self.memory_manager = memory_manager
-        self.device = PLANNER_CONFIG['device']
-        model_path = PLANNER_CONFIG['model_path']
-        train_data_path = PLANNER_CONFIG['train_data_path']
-
-        # Initialize RCRankPredictor
-        self.predictor = RCRankPredictor(
-            model_path=model_path,
-            train_data_path=train_data_path,
-            device=self.device,
-            opt_threshold=PLANNER_CONFIG['opt_threshold'],
-            num_classes=PLANNER_CONFIG['num_classes']
-        )
+        self.predictor = predictor
+        self.device = predictor.device
         
         # Initialize encoding components
         self.encoding = Encoding(None, {'NA': 0})
@@ -75,43 +65,87 @@ class Planner:
         )
         
         # 解析预测结果
-        return self._extract_top_root_cause(pred_label, pred_label_opt)
+        result = self._extract_top_root_cause(pred_label, pred_label_opt)
+        # 附加小模型的原始概率向量，供上层决策与LLM提示
+        result["pred_label_opt"] = pred_label_opt.cpu().numpy()
+        return result
 
-    def llm_predict(self, query_info, root_causes):
-        """Use LLM to diagnose the root cause of slow SQL."""
+    def diagnosis_agent(self, prompt) -> str:
+        return Runner.run_sync(starting_agent=Agent(
+        name="RootCauseLLM",
+        model="gpt-4.1",
+        instructions=get_root_cause_llm_instructions()
+        ), input=prompt).final_output.strip()
+
+    def llm_predict(self, query_info, root_causes, state_confidence, tuning_history=None):
+        """Use LLM to diagnose the root cause of slow SQL with confidence-aware guidance.
+
+        state_confidence: 历史运行态置信度映射 {label: confidence in [0,1]}
+        tuning_history: 每个根因的成功/失败计数列表
+        """
         # 使用新的 ε-greedy 检索结构：{"positive", "negative"}
         retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
         positives = retrieval.get('positive', [])
         negatives = retrieval.get('negative', [])
 
-        prompt = build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negatives)
+        # 合并置信度指导到统一的严格JSON输出prompt
+        prompt = build_root_cause_diagnosis_prompt(
+            query_info,
+            root_causes,
+            positives,
+            negatives,
+            state_confidence=state_confidence,
+            tuning_history=tuning_history
+        )
         print("prompt: ", prompt)
 
-        result = Runner.run_sync(starting_agent=Agent(
-            name="RootCauseLLM",
-            model="gpt-4.1",
-            instructions=get_root_cause_llm_instructions()
-        ), input=prompt)
-        
-        new_root_causes_str = result.final_output.strip()
-        
-        # 解析大模型输出，转换为列表格式
-        allowed_labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
-        
-        # 按逗号分割并清理
-        root_causes = []
-        # 分割并清理每个标签
-        for label in new_root_causes_str.split(','):
-            cleaned_label = label.strip().lower()
-            if cleaned_label in allowed_labels and cleaned_label not in root_causes:
-                root_causes.append(cleaned_label)
-        
-        # 如果没有找到有效标签，返回默认值
-        if len(root_causes) == 0:
-            root_causes = ["normal"]
-        
-        return {"root_causes": root_causes}
+        output = self.diagnosis_agent(prompt)
+        print("output: ", output)
+        parsed = self.parse_and_validate(output)
+        labels, conf_map = (parsed if parsed is not None else (None, None))
+        # 若解析失败或不一致，要求大模型重新输出一次
+        retry = 0
+        while labels is None and retry < 5:
+            output = self.diagnosis_agent(prompt)
+            parsed = self.parse_and_validate(output)
+            labels, conf_map = (parsed if parsed is not None else (None, None))
+            retry += 1
 
+        if labels is None:
+            labels = ["normal"]
+            conf_map = {"normal": 1.0}
+
+        return {"root_causes": labels, "confidence": conf_map}
+
+
+    def parse_and_validate(self, json_text: str):
+        try:
+            data = json.loads(json_text)
+            # 读取 LLM 报告的预测根因与全量置信度
+            reported_pred = [str(x).lower().strip() for x in data.get("predicted_root_causes", [])]
+            items = data.get("root_causes", [])
+
+            # 根据置信度>0.5 计算应当的预测集合
+            derived_pred = []
+            conf_map = {}
+            for it in items:
+                label = str(it.get("label", "")).lower().strip()
+                conf = float(it.get("confidence", 0.0))
+                if conf > 0.5:
+                    derived_pred.append(label)
+                conf_map[label] = conf
+
+            # 一致性校验：必须完全相等（集合意义）
+            if set(reported_pred) != set(derived_pred):
+                return None
+            
+            if len(derived_pred) == 0:
+                derived_pred = ["normal"]
+                conf_map = {"normal": 1.0}
+
+            return derived_pred, conf_map
+        except Exception:
+            return None
 
     def _build_prediction_input(self, query_info: QueryInfo) -> Tuple[str, Dict, List, List]:
         """构建RCRankPredictor所需的输入数据"""

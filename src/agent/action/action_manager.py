@@ -211,6 +211,7 @@ class ActionManager:
         for index_name in index_names:
             try:  
                 with self.db.connection.cursor() as cur:
+                    cur.execute(f"SET statement_timeout = 0")
                     cur.execute(f"DROP INDEX IF EXISTS {index_name}")
                 self.db.connection.commit()
                 print(f"已撤销索引: {index_name}")
@@ -222,6 +223,7 @@ class ActionManager:
         for knob_name in knob_names:
             try:
                 with self.db.connection.cursor() as cur:
+                    cur.execute(f"SET statement_timeout = 0")
                     cur.execute(f"RESET {knob_name};")
                 self.db.connection.commit()
                 print(f"{knob_name} 已恢复默认值")
@@ -257,21 +259,22 @@ class ActionManager:
             fix_sql = new_fix_sql
             retry_count += 1
         if not success:
-            return {"status": -1, "msg": f"SQL修复失败: {fix_action}, 错误: {err}", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": 300}
+            return {"status": -1, "msg": f"SQL修复失败: {fix_action}, 错误: {err}", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": 20}
 
         old_time = query_info.execution_time
 
         # 执行性能测试
-        success, _, new_time, err = self.db.execute(fix_sql, timeout=300)
-        if not success:
-            if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):
-                return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": new_time}
-            return {"status": -1, "msg": f"性能测试SQL执行失败: {err}", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": 300}
+        success, _, new_time, err = self.db.execute(fix_sql, timeout=20)
 
         if fix_action != "":
             index_names = self.extract_index_names(fix_action)
             knob_names = self.extract_knob_names(fix_action)
             self.rollback_action(index_names, knob_names)
+
+        if not success:
+            if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):
+                return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": new_time}
+            return {"status": -1, "msg": f"性能测试SQL执行失败: {err}", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": 20}
 
         # 4. 性能对比与后续处理
         if (old_time - new_time) / old_time > 0.1:

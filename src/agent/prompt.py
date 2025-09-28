@@ -133,19 +133,44 @@ def build_rewrite_prompt(origin_sql, rewrite_sql):
     — Output Format —
     <paste only the revised SQL here, exactly as SQL, nothing else>"""
 
-def build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negatives):
-    """Build prompt for LLM-based root cause diagnosis."""
+def build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negatives, state_confidence, tuning_history=None, timeout=20):
+    """Build prompt for LLM-based root cause diagnosis with per-label confidence map.
 
-    positives_text = fmt_cases(positives)
-    negatives_text = fmt_cases(negatives)
+    tuning_history: Optional list summarizing per-root-cause success/failure counts, e.g.,
+      [
+        {"label": "missing indexes", "success_count": 2, "fail_count": 3},
+        {"label": "inappropriate query knobs", "success_count": 1, "fail_count": 0}
+      ]
+    """
 
-    return f"""As a database performance diagnosis expert, your task is to identify the **most likely root cause** of the following slow SQL query.
+    # positives_text = fmt_cases(positives)
+    # negatives_text = fmt_cases(negatives)
+    
+    # 处理 timeout 情况
+    execution_time_text = f"{query_info.execution_time} s"
+    if query_info.execution_time == timeout:
+        execution_time_text = f"{query_info.execution_time} (timeout)"
+
+    # 格式化调优历史（成功/失败计数）
+    if tuning_history:
+        lines = []
+        for item in tuning_history:
+            label = item.get("label")
+            s_cnt = item.get("success_count", 0)
+            f_cnt = item.get("fail_count", 0)
+            lines.append(f"{label}: success_count={s_cnt}, fail_count={f_cnt};")
+        history_text = " ".join(lines)
+        history_text = "{" + history_text + "}"
+    else:
+        history_text = "No previous tuning attempts recorded."
+        
+    return f"""As a database performance diagnosis expert, your task is to identify the **most likely root cause(s) and diagnosis confidence** of the following slow SQL query.
 
     ## Context
     1. Query Information:
     • SQL: {query_info.query}
     • Execution Plan: {query_info.plan_json}
-    • Execution Runtime: {query_info.execution_time} s
+    • Execution Runtime: {execution_time_text}
     • Internal Metrics: Tuples Returned:{query_info.internal_metrics[0]}, Blocks Hit:{query_info.internal_metrics[1]}, Blocks Read:{query_info.internal_metrics[2]}, Tuples Fetched:{query_info.internal_metrics[3]}, Index Tuples Fetched:{query_info.internal_metrics[4]}, Sequential Tuples Read:{query_info.internal_metrics[5]}, Sequential Scans:{query_info.internal_metrics[6]}, Index Scans:{query_info.internal_metrics[7]}, Heap Blocks Hit:{query_info.internal_metrics[8]}, Heap Blocks Read:{query_info.internal_metrics[9]}, Index Blocks Hit:{query_info.internal_metrics[10]}, Index Blocks Read:{query_info.internal_metrics[11]}
     • CPU: {query_info.external_metrics[0]}
     • Read I/O: {query_info.external_metrics[1]}
@@ -155,22 +180,45 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negati
     • Net Received: {query_info.external_metrics[5]}
     • Net Sent: {query_info.external_metrics[6]}
 
-    2. Already Eliminated Causes:
-    The following causes have been confirmed **not** to be the root cause: {root_causes}
-    
-    3. Positive Cases (reference): {positives_text}
+    2. Plan-Aware Exploration:
+    - Analyze execution plan and runtime metrics to guide confidence adjustments:
+     * missing indexes: If the execution plan shows large sequential scans on big tables with selective filters (e.g., WHERE clauses on non-indexed columns), and CPU is high while I/O is moderate, increase confidence for 'missing indexes'.
+     * suboptimal plan optimizer: If the execution plan shows complex joins, nested loops, or inefficient aggregation strategies (e.g., hashed vs. sorted aggregation), especially when the estimated rows differ significantly from actual rows, increase confidence for 'suboptimal plan optimizer'.
+     * inappropriate query knobs: High CPU with low I/O, or repeated parallel workers not utilized efficiently, increase confidence for 'inappropriate query knobs'.
+     * poorly written queries: Large aggregations, complex expressions, unnecessary computations in SELECT/GROUP BY clauses, increase confidence for 'poorly written queries'.
 
-    4. Negative Cases (avoid): {negatives_text}
+    3. Initial Suggestion:
+    - Initial model suggested root causes: {root_causes}
+    - Initial model confidence (0-1): {state_confidence}
+    - Historical Tuning Summary (per root cause): {history_text}
 
-    ## Constraints
-    - You must select **only** from the following allowed labels:
-    missing indexes, inappropriate query knobs, suboptimal plan optimizer, poorly written queries
-    - Consider the historical cases and similar cases when making your diagnosis. Avoid root causes with little or no past benefit and prioritize those with substantial gains.
-    - Output must be **exactly one or more** of the above labels, separated by commas if multiple.
-    - Do **not** output explanations, reasoning, or any other text.
+    4. Root Cause Diagnosis Guidance:
+    Use the **Query Information** and the **Initial Suggestion** to infer the root causes and their confidence, as follows:
+    - If a label has success_count = 0 and fail_count > 0, it is likely incorrect. Gradually reduce its confidence below 0.5, while gradually increasing the confidence of other root causes supported by Query Information until they exceed 0.5. If the label remains low after repeated failures, fully shift confidence to other unexplored candidates root causes.
+    - If a label has success_count > 0 and fail_count = 0, it indicates consistent potential. CONTINUE exploring this root cause. Gradually increase its confidence as evidence accumulates.  
+    - If a label has success_count > 0 and fail_count > 0, it indicates partial benefit but decreasing returns. CONTINUE using this root cause as a reference, and increase the other root causes confidence for exploraiton. Adjust confidence downward if further attempts do not yield improvements.  
 
-    ## Output Format
-    <root cause label(s) here — exactly as listed above>"""
+    5. Confidence rules Guidance:
+    - Confidence adjustment of each root cause **MUST** be restricted to the range of [0.1,0.3].  
+    - If a root cause shows no improvement after multiple rounds, reduce its confidence below 0.5 to retire it from active diagnosis. In such cases, select a new candidate root cause for exploration, initializing its confidence slightly above 0.5. 
+    - Confidence values should reflect both historical results and current judgment based on Query Information, Ensure the model makes independent judgments about which root causes to explore next, rather than blindly following previous confidence values.  
+ 
+    ## Constraints (STRICT)
+    - You MUST output ALL allowed labels WITH a confidence in [0,1]: missing indexes, inappropriate query knobs, suboptimal plan optimizer, poorly written queries
+    - You MUST also output a separate array `predicted_root_causes` listing the final predicted root cause labels (derived from confidence and considering historical priors above).
+    - `predicted_root_causes` MUST be exactly the set of labels with confidence > 0.5. Labels with confidence ≤ 0.5 MUST NOT appear in `predicted_root_causes`.
+    - You MUST output strict JSON only in the format below. No extra text, no explanation.
+
+    ## Output JSON Example
+    {{
+      "predicted_root_causes": ["missing indexes"],
+      "root_causes": [
+        {{"label": "missing indexes", "confidence": 0.72}},
+        {{"label": "inappropriate query knobs", "confidence": 0.18}},
+        {{"label": "suboptimal plan optimizer", "confidence": 0.10}},
+        {{"label": "poorly written queries", "confidence": 0.05}}
+      ]
+    }}"""
 
 
 def build_action_space_prompt(root_causes, db=None):
@@ -290,4 +338,4 @@ def get_diagnostic_agent_instructions():
 def get_root_cause_llm_instructions():
     """Get instructions for the root cause diagnosis LLM."""
     return """You are a database slow SQL root cause diagnosis expert.
-    Only output the allowed root cause labels, nothing else."""
+    Only output the allowed root cause label(s) and their confidence in json format, nothing else."""

@@ -293,7 +293,7 @@ class PostgresDB:
     #         pid = int(f.readline().strip())
     #     return pid
 
-    def get_metrics(self, sql, interval=1, warmup=0, duration=300):
+    def get_metrics(self, sql, interval=1, warmup=0, duration=20):
         """
         监控PostgreSQL主进程的资源（CPU、内存、IO等），返回平均值。
         interval: 采样间隔（秒）
@@ -321,32 +321,32 @@ class PostgresDB:
         """
         sql = sql.strip()
 
-        # SQL 可能包含多个语句
-        if ';' in sql:
-            statements = [stmt.strip() for stmt in sql.split(';') if stmt.strip()]
+        # 使用解析器统计语句数量
+        statements = self.extract_sql_statements(sql)
+        if len(statements) > 1:
             plan_result = None
 
             try:
-                # 1. 执行 CREATE VIEW / TEMP TABLE 等
+                # 1. 执行 CREATE/ALTER/SET 等准备语句
                 for stmt in statements:
-                    if stmt.upper().startswith(("CREATE", "ALTER")):
+                    if stmt.upper().startswith(("CREATE", "ALTER", "SET")):
                         try:
-                            self.execute(stmt)  # 普通执行，不加 EXPLAIN
+                            self.execute(stmt)
                         except Exception as e:
                             print(f"执行 {stmt} 失败: {e}")
 
-                # 2. 找到第一个 SELECT 并 EXPLAIN
+                # 2. 找到第一个可 EXPLAIN 的查询语句（WITH/SELECT/INSERT/UPDATE/DELETE）
                 for stmt in statements:
-                    if stmt.upper().startswith("SELECT"):
+                    if stmt.upper().startswith("WITH") or stmt.upper().startswith("SELECT") or stmt.upper().startswith("/*+") or stmt.upper().startswith("INSERT") or stmt.upper().startswith("UPDATE") or stmt.upper().startswith("DELETE"):
                         try:
                             plan_sql = f"EXPLAIN (FORMAT JSON) {stmt}"
                             plan_result = self.fetch_results(plan_sql)
                             break
                         except Exception as e:
-                            print(f"获取 SELECT 执行计划失败: {e}")
+                            print(f"获取执行计划失败: {e}")
 
             finally:
-                # 3. 清理 DROP VIEW / DROP TABLE
+                # 3. 清理 DROP 语句
                 for stmt in statements:
                     if stmt.upper().startswith("DROP"):
                         try:
@@ -359,7 +359,8 @@ class PostgresDB:
         else:
             # 单个语句，直接获取计划
             try:
-                plan_sql = f"EXPLAIN (FORMAT JSON) {sql}"
+                single_stmt = statements[0] if statements else sql
+                plan_sql = f"EXPLAIN (FORMAT JSON) {single_stmt}"
                 return self.fetch_results(plan_sql)
             except Exception as e:
                 print(f"获取执行计划失败: {e}")
@@ -485,7 +486,7 @@ class PostgresDB:
                 diff[table] = table_diff
         return diff
     
-    def run_sql_and_collect_all(self, sql, interval=1, warmup=0, duration=300):
+    def run_sql_and_collect_all(self, sql, interval=1, warmup=0, duration=20):
         conn = self.connect()
 
         # 1. 采集SQL执行前的log
@@ -546,8 +547,8 @@ class PostgresDB:
             sql1 = clean_sql(sql1)
             sql2 = clean_sql(sql2)
 
-            result1 = self.fetch_results(sql1, timeout=300)
-            result2 = self.fetch_results(sql2, timeout=300)
+            result1 = self.fetch_results(sql1, timeout=20)
+            result2 = self.fetch_results(sql2, timeout=20)
 
             # print(f"result1: {result1}")
             # print(f"result2: {result2}")

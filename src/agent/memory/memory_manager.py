@@ -10,6 +10,11 @@ from datetime import datetime
 from utils.types import QueryInfo, CaseInfo
 import numpy as np
 from numpy.linalg import norm
+import pandas as pd
+from agent.plan.RCRank.utils.load_data import load_dataset_valid as load_dataset_tensor_valid
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -35,23 +40,301 @@ class MemoryCase:
     #     return cls(**data)
 
 class MemoryManager:
-    def __init__(self, db_path: str = "memory.db", archive_size: int = 20, root_cause_types: List[str] = None):
+    def __init__(self, db_path: str = "memory.db", archive_size: int = 20, root_cause_types: List[str] = None,
+                 finetune_threshold: int = 220, finetune_epochs: int = 50, finetune_batch_size: int = 8,
+                 finetune_device: str = "cpu", model_output_dir: str = "/root/DREAM/src/agent/plan/model_res",
+                 bce_weight: float = 0.7, contrastive_weight: float = 0.3, enable_finetune: bool = True,
+                 predictor=None):
         self.db_path = db_path
         self.archive_size = archive_size
         self.cases: Dict[str, MemoryCase] = {}
         self.archive: Set[str] = set()
         self.best_case_id: Optional[str] = None
 
+        # 增量训练配置
+        self.enable_finetune = enable_finetune  # 控制持续学习是否开启
+        self.finetune_threshold = finetune_threshold
+        self.finetune_epochs = finetune_epochs
+        self.finetune_batch_size = finetune_batch_size
+        self.finetune_device = finetune_device
+        self.model_output_dir = model_output_dir
+        
+        # 混合损失配置
+        self.bce_weight = bce_weight
+        self.contrastive_weight = contrastive_weight
+
         # root cause岛屿模型
         self.root_cause_types = root_cause_types or [
-            "missing indexes", "suboptimal plan optimizer", "poorly written queries", "inappropriate query knobs"
+            "missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"
         ]
         # 假设有15种root cause，支持多根因组合
         self.island_keys = self._generate_island_keys(self.root_cause_types)
         self.islands: Dict[frozenset, Set[str]] = {key: set() for key in self.island_keys}
 
+        # 注入共享的 RCRankPredictor（可为 None，用到时检查）
+        self._rcrank_predictor = predictor
+
         self._init_database()
         self.load()
+
+    def _cases_to_dataframe(self) -> pd.DataFrame:
+        rows = []
+        # 多标签空间取自 root_cause_types 顺序
+        label_space = self.root_cause_types
+        for cid, case in self.cases.items():
+            info = case.case_info
+            raw = info.get("query_info", {})
+            query = raw.get("query", "")
+            plan_json = raw.get("plan_json")
+            # 统一为字符串化的计划JSON，PlanEncoder会解析
+            if isinstance(plan_json, dict):
+                plan_json = json.dumps({"Plan": plan_json})
+            # timeseries/log 列名需与load_data通用分支一致
+            external_metrics = raw.get("external_metrics", [])
+            internal_metrics = raw.get("internal_metrics", [])
+            # 组成多标签（按label_space one-hot）
+            roots = info.get("root_causes") or []
+            roots = roots if isinstance(roots, list) else [roots]
+            label_vec = [1 if r in roots else 0 for r in label_space]
+            duration = info.get("new_time", 0.0)
+            rows.append({
+                "sql_file": self.db_path, # 用于表示是在线更新的
+                "query": query,
+                "plan_json": plan_json,
+                "internal_metrics": json.dumps(internal_metrics),
+                "external_metrics": json.dumps(external_metrics),
+                "multilabel": str(label_vec),
+                "duration": duration,
+                "error": None,
+                "case_label": info.get("label", "positive")  # 添加case_label列
+            })
+        return pd.DataFrame(rows)
+
+    def _export_cases_csv(self, csv_path: str) -> str:
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        df = self._cases_to_dataframe()
+        df.to_csv(csv_path, index=False)
+        return csv_path
+
+    def _run_finetune(self, csv_path: str, output_dir: str, device: str, epochs: int, batch_size: int, 
+                     bce_weight: float = 0.7, contrastive_weight: float = 0.3) -> str:
+        # 使用混合损失（BCE + 监督对比学习）对 RCRank 主模型进行微调
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1) 数据加载：与原管线一致，得到标准化后的张量字典
+        train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(csv_path, batch_size=batch_size, device=device)
+
+        # 2) 准备模型与优化器（复用/初始化 predictor）
+        if not hasattr(self, '_rcrank_predictor') or self._rcrank_predictor is None:
+            from agent.plan.online_predict import RCRankPredictor
+            self._rcrank_predictor = RCRankPredictor(device=device, train_data_path=csv_path)
+        predictor = self._rcrank_predictor
+        model = predictor.model.to(device)
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+        temperature = 0.07
+        
+        # BCE损失函数（与原始训练保持一致）
+        bce_loss_fn = nn.BCELoss(reduction="mean")
+
+        def enhanced_supcon_loss(emb, labels, case_labels, temperature=0.07):
+            """
+            增强的监督对比学习损失：
+            - 拉近：具有正确根因的样本（positive cases）
+            - 推远：具有错误根因的样本（negative cases）
+            
+            Args:
+                emb: [B, D] - 样本的embedding
+                labels: [B, K] - 多标签one-hot向量（根因标签）
+                case_labels: [B] - 案例标签（"positive"或"negative"）
+                temperature: 温度参数
+            """
+            emb = F.normalize(emb, dim=1)
+            logits = torch.div(torch.matmul(emb, emb.T), temperature)  # [B, B]
+            
+            # 掩码：排除自身
+            self_mask = torch.eye(logits.size(0), dtype=torch.bool, device=logits.device)
+            
+            # 构建正负样本掩码
+            batch_size = emb.size(0)
+            pos_mask = torch.zeros_like(logits, dtype=torch.bool)
+            neg_mask = torch.zeros_like(logits, dtype=torch.bool)
+            
+            for i in range(batch_size):
+                for j in range(batch_size):
+                    if i == j:
+                        continue
+                    
+                    # 正样本：两个都是positive cases且共享根因
+                    if (case_labels[i] == "positive" and case_labels[j] == "positive" and 
+                        (labels[i] @ labels[j]) > 0):
+                        pos_mask[i, j] = True
+                    
+                    # 负样本：一个是positive一个是negative，或者都是negative
+                    elif ((case_labels[i] == "positive" and case_labels[j] == "negative") or
+                          (case_labels[i] == "negative" and case_labels[j] == "positive") or
+                          (case_labels[i] == "negative" and case_labels[j] == "negative")):
+                        neg_mask[i, j] = True
+            
+            # 分母掩码：排除自身
+            logits_mask = ~self_mask
+            
+            # 稳定化
+            logits_max, _ = torch.max(logits.masked_fill(~logits_mask, float('-inf')), dim=1, keepdim=True)
+            logits = logits - logits_max.detach()
+            exp_logits = torch.exp(logits) * logits_mask.float()
+            
+            # 计算正样本损失（拉近正确根因）
+            pos_loss = 0.0
+            pos_count = 0
+            for i in range(batch_size):
+                if pos_mask[i].any():
+                    pos_logits = logits[i][pos_mask[i]]
+                    pos_exp_logits = exp_logits[i][pos_mask[i]]
+                    pos_loss += -torch.log(pos_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
+                    pos_count += 1
+            
+            # 计算负样本损失（推远错误根因）
+            neg_loss = 0.0
+            neg_count = 0
+            for i in range(batch_size):
+                if neg_mask[i].any():
+                    neg_logits = logits[i][neg_mask[i]]
+                    neg_exp_logits = exp_logits[i][neg_mask[i]]
+                    # 负样本损失：希望负样本的相似度尽可能小
+                    neg_loss += torch.log(neg_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
+                    neg_count += 1
+            
+            # 组合损失
+            total_loss = 0.0
+            if pos_count > 0:
+                total_loss += pos_loss / pos_count
+            if neg_count > 0:
+                total_loss += neg_loss / neg_count
+            
+            return total_loss if total_loss > 0 else torch.tensor(0.0, device=emb.device, requires_grad=True)
+
+        def hybrid_loss(emb, labels, pred_label, case_labels, bce_weight=0.7, contrastive_weight=0.3, temperature=0.07):
+            """
+            混合损失：L_total = λ₁ * L_BCE + λ₂ * L_Enhanced_Contrastive
+            """
+            # 1. BCE分类损失（只对positive cases计算，negative cases标签是错误的）
+            positive_mask = torch.tensor([label == "positive" for label in case_labels], device=pred_label.device)
+            if positive_mask.any():
+                # 只对positive cases计算BCE损失
+                positive_pred = pred_label[positive_mask]
+                positive_labels = labels[positive_mask]
+                bce_loss = bce_loss_fn(positive_pred, positive_labels)
+            else:
+                # 如果没有positive cases，BCE损失为0
+                bce_loss = torch.tensor(0.0, device=pred_label.device, requires_grad=True)
+            
+            # 2. 增强监督对比学习损失（拉近正确根因，推远错误根因）
+            contrastive_loss = enhanced_supcon_loss(emb, labels, case_labels, temperature)
+            
+            # 3. 加权组合
+            total_loss = bce_weight * bce_loss + contrastive_weight * contrastive_loss
+            
+            return total_loss, bce_loss, contrastive_loss
+
+        # 3) 训练循环
+        print("start finetune")
+        for epoch_idx in range(epochs):
+            epoch_total_loss = 0.0
+            epoch_bce_loss = 0.0
+            epoch_contrastive_loss = 0.0
+
+            print(f"finetune epoch {epoch_idx}")
+            for batch in train_dataloader:
+                # batch keys: query(list[str]), plan(dict of tensors), log[tensor], timeseries[tensor], multilabel[tensor]
+                sql_texts = batch["query"]
+                plan = batch["plan"]
+                logs = batch["log"].to(device)
+                timeseries = batch["timeseries"].to(device)
+                labels = batch["multilabel"].to(device).float()
+                
+                # 获取case_labels（positive/negative标签）
+                # 从batch中获取case_label信息
+                if "case_label" in batch:
+                    case_labels = batch["case_label"]
+                else:
+                    # 如果没有case_label列，使用默认值
+                    case_labels = ["positive"] * len(sql_texts)
+                
+                # 文本编码
+                sql = predictor.tokenizer(sql_texts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+                # 计划张量准备
+                plan = {
+                    'x': plan['x'].squeeze(1).to(device).to(torch.float32),
+                    'attn_bias': plan['attn_bias'].squeeze(1).to(device),
+                    'rel_pos': plan['rel_pos'].squeeze(1).to(device),
+                    'heights': plan['heights'].squeeze(1).to(device)
+                }
+
+                optimizer.zero_grad()
+                with torch.set_grad_enabled(True):
+                    # 始终使用混合损失
+                    emb = model.get_embedding(sql, plan, timeseries, logs)  # [B, D]
+                    pred_label, _ = model(sql, plan, timeseries, logs)  # [B, K]
+                    total_loss, bce_loss, contrastive_loss = hybrid_loss(
+                        emb, labels, pred_label, case_labels,
+                        bce_weight, contrastive_weight, temperature
+                    )
+                    epoch_bce_loss += bce_loss.item()
+                    epoch_contrastive_loss += contrastive_loss.item()
+                    
+                    total_loss.backward()
+                    optimizer.step()
+                    epoch_total_loss += total_loss.item()
+
+            # 记录训练日志
+            avg_total_loss = epoch_total_loss / max(1, len(train_dataloader))
+            avg_bce_loss = epoch_bce_loss / max(1, len(train_dataloader))
+            avg_contrastive_loss = epoch_contrastive_loss / max(1, len(train_dataloader))
+            
+            print(f"Hybrid finetune epoch {epoch_idx}: total_loss={avg_total_loss:.6f}, "
+                        f"bce_loss={avg_bce_loss:.6f}, contrastive_loss={avg_contrastive_loss:.6f}")
+
+        # 4) 保存权重
+        best_path = os.path.join(output_dir, "best_model.pt")
+        torch.save(model.state_dict(), best_path)
+        return best_path
+
+    def _reload_predictor(self, model_path: str, stats_data_path: str, device: str):
+        # 就地热重载共享实例，确保 Planner/MemoryManager 同步
+        if not hasattr(self, '_rcrank_predictor') or self._rcrank_predictor is None:
+            from agent.plan.online_predict import RCRankPredictor
+            self._rcrank_predictor = RCRankPredictor(model_path=model_path, train_data_path=stats_data_path, device=device)
+            return
+
+        predictor = self._rcrank_predictor
+        predictor.device = device
+        predictor.model_path = model_path
+        # 重新计算统计信息
+        predictor._compute_statistics(stats_data_path)
+        # 重新加载权重
+        predictor.model.load_state_dict(torch.load(model_path, map_location=device))
+        predictor.model.to(device)
+        predictor.model.eval()
+
+    def _maybe_finetune(self):
+        # 检查是否开启持续学习功能
+        if not self.enable_finetune:
+            return
+        
+        total = len(self.cases)
+        if total - self._last_finetune_count < self.finetune_threshold:
+            return
+        # 导出CSV
+        csv_path = os.path.join(self.model_output_dir, "memory_cases.csv")
+        os.makedirs(self.model_output_dir, exist_ok=True)
+        self._export_cases_csv(csv_path)
+        # 继续训练（混合损失微调）
+        best_model = self._run_finetune(csv_path, self.model_output_dir, self.finetune_device, self.finetune_epochs, self.finetune_batch_size,
+                                      self.bce_weight, self.contrastive_weight)
+        # 热重载预测器
+        self._reload_predictor(best_model, csv_path, self.finetune_device)
+        self._last_finetune_count = total
 
     def _init_database(self):
         if not os.path.exists(self.db_path):
@@ -82,6 +365,11 @@ class MemoryManager:
 
         self.save_to_memory(case)
         logger.debug(f"Added case {case.id} to island {root_causes_key}")
+        # 达到阈值则触发增量训练
+        try:
+            self._maybe_finetune()
+        except Exception as e:
+            print(f"Online finetune failed: {e}")
         return case.id
     
     def save_to_memory(self, new_case: MemoryCase = None):
@@ -143,22 +431,6 @@ class MemoryManager:
     def ids_to_cases(self, ids: List[str]) -> List[MemoryCase]:
         return [self.cases[cid] for cid in ids]
 
-    # def sample_case(self, exploration_ratio=0.4, exploitation_ratio=0.4) -> MemoryCase:
-    #     rand_val = random.random()
-    #     if rand_val < exploration_ratio:
-    #         # 探索：随机采样
-    #         return random.choice(list(self.cases.values()))
-    #     elif rand_val < exploration_ratio + exploitation_ratio and self.archive:
-    #         # 利用：从精英档案采样
-    #         return self.cases[random.choice(list(self.archive))]
-    #     else:
-    #         # 随机采样
-    #         return random.choice(list(self.cases.values()))
-
-    # def get_top_cases(self, n: int = 5, metric: str = "approve_time") -> List[MemoryCase]:
-    #     sorted_cases = sorted(self.cases.values(), key=lambda c: c.metrics.get(metric, 0.0), reverse=True)
-    #     return sorted_cases[:n]
-
     def load(self):
         if os.path.exists(self.db_path):
             with open(self.db_path, 'r') as f:
@@ -177,6 +449,11 @@ class MemoryManager:
                 positive_cases = [c for c in self.cases.values() if c.case_info.get("label") == "positive"]
                 positive_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
                 self.archive = set([c.id for c in positive_cases[: self.archive_size]])
+            self._last_finetune_count = len(self.cases)
+            # self._last_finetune_count = 0
+            # self._maybe_finetune()
+        else:
+            self._last_finetune_count = 0
 
     def _build_memory_case_from_info(self, case_id: str, case_info: dict) -> MemoryCase:
         """从case_info重新构建完整的MemoryCase"""
@@ -204,24 +481,6 @@ class MemoryManager:
             sql_embedding=sql_embedding,
             action_embedding=action_embedding,
         )
-
-    # def _calculate_feature_coords(self, case: MemoryCase) -> List[int]:
-    #     # 以SQL embedding、action embedding、score为特征分箱
-    #     # 假设embedding已为一维均值降维，score为第三维（要修改）
-    #     sql_emb = case.sql_embedding or [0.0]
-    #     action_emb = case.action_embedding or [0.0]
-    #     # 降维：取均值
-    #     sql_val = sum(sql_emb) / len(sql_emb)
-    #     action_val = sum(action_emb) / len(action_emb)
-    #     # score - 使用approve_time
-    #     score = case.metrics.get("approve_time", 0.0)
-    #     # 分箱
-    #     sql_bin = int(sql_val * self.feature_bins) % self.feature_bins
-    #     action_bin = int(action_val * self.feature_bins) % self.feature_bins
-    #     # score分箱（假设性能提升最大为10s，最小为-10s，可自定义）
-    #     score_norm = max(min((score + 10) / 20, 1.0), 0.0)  # 归一化到0-1
-    #     score_bin = int(score_norm * self.feature_bins)
-    #     return [sql_bin, action_bin, score_bin]
 
     def _feature_coords_to_key(self, coords: List[int]) -> str:
         return "-".join(str(c) for c in coords)
@@ -271,58 +530,6 @@ class MemoryManager:
             for case in to_remove_cases:
                 if case.id in self.archive:
                     self.archive.remove(case.id)
-
-    # def set_current_island(self, island_key: frozenset):
-    #     self.current_island = island_key
-    #     logger.debug(f"Switched to island {island_key}")
-
-    # def next_island(self) -> frozenset:
-    #     keys = list(self.islands.keys())
-    #     idx = keys.index(self.current_island)
-    #     self.current_island = keys[(idx + 1) % len(keys)]
-    #     logger.debug(f"Advanced to island {self.current_island}")
-    #     return self.current_island
-
-    # def increment_island_generation(self, island_key: Optional[frozenset] = None):
-    #     key = island_key if island_key is not None else self.current_island
-    #     self.island_generations[key] += 1
-    #     logger.debug(f"Island {key} generation incremented to {self.island_generations[key]}")
-
-    # def should_migrate(self) -> bool:
-    #     max_gen = max(self.island_generations.values())
-    #     return (max_gen - self.last_migration_generation) >= self.migration_interval
-
-    # def migrate_cases(self):
-    #     # 迁移高分case到相邻island（环状拓扑）
-    #     keys = list(self.islands.keys())
-    #     for i, key in enumerate(keys):
-    #         island = self.islands[key]
-    #         if not island:
-    #             continue
-    #         island_cases = [self.cases[pid] for pid in island if pid in self.cases]
-    #         if not island_cases:
-    #             continue
-    #         island_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
-    #         num_to_migrate = max(1, int(len(island_cases) * self.migration_rate))
-    #         migrants = island_cases[:num_to_migrate]
-    #         # 环状相邻island
-    #         target_islands = [keys[(i + 1) % len(keys)], keys[(i - 1) % len(keys)]]
-    #         for migrant in migrants:
-    #             for target in target_islands:
-    #                 migrant_copy = MemoryCase(
-    #                     id=f"{migrant.id}_migrant_{'_'.join(sorted(target))}",
-    #                     case_info=migrant.case_info,
-    #                     metrics=migrant.metrics.copy(),
-    #                     sql_embedding=migrant.sql_embedding,
-    #                     action_embedding=migrant.action_embedding,
-    #                     performance_bin=migrant.performance_bin,
-    #                 )
-    #                 self.cases[migrant_copy.id] = migrant_copy
-    #                 self.islands[target].add(migrant_copy.id)
-    #                 self.island_generations[target] += 1
-    #                 logger.debug(f"Migrated case {migrant.id} from island {key} to island {target}")
-    #     self.last_migration_generation = max(self.island_generations.values())
-    #     logger.info(f"Migration completed at generation {self.last_migration_generation}")
 
     def retrieve_cases(self, query_info: QueryInfo, root_causes: Any, pos_n: int = 2, neg_n: int = 2, mode: str = "exploit") -> Dict[str, Any]:
         """
@@ -437,11 +644,10 @@ class MemoryManager:
         """
         使用RCRank异常检测模型的get_embedding接口，根据QueryInfo对象生成高质量embedding。
         """
-        import torch
-        # 延迟加载RCRankPredictor，避免重复初始化
-        if not hasattr(self, '_rcrank_predictor'):
+        # 使用注入的 RCRankPredictor，若缺失则懒加载一个 CPU 版本
+        if not hasattr(self, '_rcrank_predictor') or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
-            self._rcrank_predictor = RCRankPredictor(device='cpu')  # 可根据实际情况设为cuda
+            self._rcrank_predictor = RCRankPredictor(device='cpu')
         predictor = self._rcrank_predictor
 
         from agent.plan.RCRank.utils.plan_encoding import PlanEncoder
@@ -491,7 +697,6 @@ class MemoryManager:
         """
         使用BERT对action字符串进行embedding，返回[CLS]向量。
         """
-        import torch
         from transformers import BertTokenizer, BertModel
         # 延迟加载BERT模型，避免重复初始化
         if not hasattr(self, '_bert_tokenizer'):

@@ -29,6 +29,7 @@ class RCRankPredictor:
         #init传入的参数要修改
         self.device = device
         self.num_classes = num_classes
+        self.model_path = model_path
         
         # Get the absolute path to bert-base-uncased
         current_dir = os.path.dirname(os.path.abspath(__file__))

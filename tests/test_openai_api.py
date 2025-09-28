@@ -14,8 +14,13 @@ openai.api_key = API_SETTINGS['openai']['api_key']
 openai.base_url = API_SETTINGS['openai']['base_url']
 openai.default_headers = {"x-foo": "true"}
 
+def get_root_cause_llm_instructions():
+    """Get instructions for the root cause diagnosis LLM."""
+    return """You are a database slow SQL root cause diagnosis expert.
+    Only output the allowed root cause label(s) and their confidence in json format, nothing else."""
+
 response = openai.chat.completions.create(
-    model="gpt-3.5-turbo",
+    model="gpt-4.1",
     messages=[
         {
             "role": "user",

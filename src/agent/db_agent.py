@@ -14,6 +14,7 @@ import asyncio
 import signal
 import atexit
 import time
+import numpy as np
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent.parent)
@@ -25,6 +26,8 @@ from agent.action.action_manager import ActionManager
 from agent.memory.memory_manager import MemoryManager
 from utils.types import QueryInfo, AnomalyInfo
 from src.database.pg_env import PostgresDB
+from agent.plan.online_predict import RCRankPredictor
+from config.base_config import PLANNER_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +50,17 @@ class DBAgent:
             log_path=configs['POSTGRES_CONFIG']['log_path']
         )
 
-        self.memory_manager = MemoryManager(memory_path)
-        self.planner = Planner(self.memory_manager)
+        # 初始化 RCRankPredictor 并注入到组件
+        predictor = RCRankPredictor(
+            model_path=PLANNER_CONFIG['model_path'],
+            train_data_path=PLANNER_CONFIG['train_data_path'],
+            device=PLANNER_CONFIG['device'],
+            opt_threshold=PLANNER_CONFIG['opt_threshold'],
+            num_classes=PLANNER_CONFIG['num_classes']
+        )
+
+        self.memory_manager = MemoryManager(memory_path, predictor=predictor)
+        self.planner = Planner(self.memory_manager, predictor=predictor)
         self.action_manager = ActionManager(memory_manager=self.memory_manager, db=self.db, planner=self.planner)
         self.max_attempts = max_attempts
     
@@ -186,11 +198,12 @@ class DBAgent:
 
         best_sql_actions = {}
         best_sql_times = {}
+        best_sql_texts = {}
         workload_best_time = None
         workload_best_actions = None
         
-        # 跟踪每个SQL的简化状态：来源、失败计数、archive已尝试根因、当前根因
-        # {query_id: {"source": 'model'|'llm'|'archive', "fail_count": int, "root_tried": set[str], "current_root": Any}}
+        # 跟踪每个SQL的简化状态
+        # {query_id: {"root_tried": set[str], "current_root": Any, "mode": 'exploit'|'explore', "confidence": Dict[str,float], "attempts": Dict[str,int], "successes": Dict[str,int]}}
         sql_root_cause_states = {}
 
         for round_idx in range(max_iterations):
@@ -206,51 +219,95 @@ class DBAgent:
                 query_id = query_path.split("/")[-1].replace(".sql", "")
                 query = self.clean_query(query)
 
-                # 压测获取相关数据
-                result = self.db.run_sql_and_collect_all(query, duration=300)
+                # 选择本轮用于诊断的数据来源SQL：优先使用历史最佳SQL（已包含rewrite/hint），否则使用原始SQL
+                original_sql = query
+                collected_sql = best_sql_texts.get(query_id, original_sql)
 
+                # 仅当存在历史最佳DDL/SET修复动作时，先应用动作后收集一次；否则直接收集一次
+                pre_index_names = []
+                pre_knob_names = []
+                pre_applied = False
+                if query_id in best_sql_actions and best_sql_actions[query_id]:
+                    pre_fix_action = best_sql_actions[query_id]
+                    success, _, _, _ = self.db.execute(pre_fix_action)
+                    if success:
+                        pre_index_names = self.action_manager.extract_index_names(pre_fix_action)
+                        pre_knob_names = self.action_manager.extract_knob_names(pre_fix_action)
+                        pre_applied = True
+
+                result = self.db.run_sql_and_collect_all(collected_sql, duration=20)
+
+                # 构建 QueryInfo；若 collected_sql 与 original_sql 不同，视为 rewrite
                 query_info = QueryInfo(
                     query_id=query_id,
-                    query=result["query"],
+                    query=collected_sql,
                     plan_json=result["plan_json"],
                     internal_metrics=result["internal_metrics"],
                     external_metrics=result["external_metrics"],
                     execution_time=result["duration"],
-                    is_rewrite=False
+                    is_rewrite=(collected_sql != original_sql)
                 )
 
-                # 根因选择器（本轮只决定一次）：model -> llm -> archive
+                # 若首次遇到该 SQL，先用本轮默认执行结果初始化“最佳”记录
+                if query_id not in best_sql_times:
+                    best_sql_times[query_id] = query_info.execution_time
+                    best_sql_actions[query_id] = ""
+                    best_sql_texts[query_id] = collected_sql
+
+                # 初始化状态
                 if query_id not in sql_root_cause_states:
-                    sql_root_cause_states[query_id] = {"source": 'model', "fail_count": 0, "root_tried": set(), "current_root": None, "mode": "exploit"}
-                    # {frozenset(["missing indexes", "inappropriate query knobs"])}
+                    sql_root_cause_states[query_id] = {"root_tried": set(), "current_root": None, "mode": "exploit", "confidence": {}, "attempts": {}, "successes": {}}
                     
                 state = sql_root_cause_states[query_id]
-                if state["source"] == 'model':
-                    if state["current_root"] is None:
-                        logger.info(f"SQL {query_id} 使用小模型进行诊断")
-                        state["current_root"] = self.planner.model_predict(query_info).get('root_causes', None)
-                elif state["source"] == 'llm':
-                    if state["current_root"] is None:
-                        logger.info(f"SQL {query_id} 使用大模型进行诊断")
-                        # 将 frozenset 转换为扁平的字符串列表，供 LLM 使用
-                        tried_roots = []
-                        for root_set in state["root_tried"]:
-                            tried_roots.extend(list(root_set))
-                        state["current_root"] = self.planner.llm_predict(query_info, tried_roots).get('root_causes', None)
-                elif state["source"] == 'archive':
-                    if state["current_root"] is None:
-                        logger.info(f"SQL {query_id} 使用相似根因进行诊断")
-                        exclude = {str(self.memory_manager._normalize_root_causes(k)) for k in state["root_tried"]}
-                        next_root = self.memory_manager.explore_root_from_archive(query_info, exclude_roots=exclude)
-                        if not next_root:
-                            all_roots = [list(r) for r in self.memory_manager.island_keys]  # List[List[str]]
-                            candidates = [r for r in all_roots if str(self.memory_manager._normalize_root_causes(r)) not in exclude]
-                            if candidates == []:
-                                logger.info(f"SQL {query_id} 所有根因都已经探索过，结束探索")
-                                continue
-                            else:
-                                next_root = random.choice(candidates)
-                        state["current_root"] = next_root
+                # epsilon-greedy 决策：explore 使用相似根因；exploit 使用小模型+LLM
+                state["mode"] = "explore" if random.random() < epsilon else "exploit"
+
+                if state["mode"] == "explore":
+                    logger.info(f"SQL {query_id} 进入探索模式（archive 相似根因）")
+                    exclude = {str(self.memory_manager._normalize_root_causes(k)) for k in state["root_tried"]}
+                    next_root = self.memory_manager.explore_root_from_archive(query_info, exclude_roots=exclude)
+                    if not next_root:
+                        all_roots = [list(r) for r in self.memory_manager.island_keys]  # List[List[str]]
+                        candidates = [r for r in all_roots if str(self.memory_manager._normalize_root_causes(r)) not in exclude]
+                        if candidates == []:
+                            logger.info(f"SQL {query_id} 所有根因都已经探索过，结束探索")
+                            continue
+                        else:
+                            next_root = random.choice(candidates)
+                    state["current_root"] = next_root
+                else:
+                    logger.info(f"SQL {query_id} 进入利用模式（小模型+LLM）")
+                    current_root = state.get("current_root")
+                    # 若已有 current_root，则直接复用；否则调用小模型+LLM 获取新的根因
+                    if current_root is None:                        
+                        # 小模型初判 + 置信度
+                        model_out = self.planner.model_predict(query_info)
+                        current_root = model_out.get('root_causes')
+                        pred_opt = model_out.get('pred_label_opt')
+                        labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
+                        confidence = np.array(pred_opt).reshape(-1)
+                        state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
+
+                    # 将当前根因和置信度传给LLM
+                    # 构建按根因聚合的历史成功/失败计数
+                    tuning_history = []
+                    union_keys = set(state.get("attempts").keys()) | set(state.get("successes").keys())
+                    for k in union_keys:
+                        # 归一化为 frozenset 或单元素集合
+                        label = list(k)
+                        tuning_history.append({
+                            "label": label,
+                            "success_count": int(state.get("successes").get(k, 0)),
+                            "fail_count": int(state.get("attempts").get(k, 0))
+                        })
+                    llm_result = self.planner.llm_predict(
+                        query_info,
+                        current_root,
+                        state_confidence=state.get("confidence"),
+                        tuning_history=tuning_history
+                    )
+                    state["current_root"] = llm_result.get('root_causes')
+                    state["confidence"] = llm_result.get('confidence')
                 
                 root_causes = state["current_root"]
                 if not root_causes:
@@ -338,14 +395,15 @@ class DBAgent:
                 if evaluation_result.get("status") == -1:
                     print(evaluation_result.get("msg"))
                     logger.info(f"SQL {query_id} 修复失败，执行下一条SQL语句")
-                    new_time = 300
+                    new_time = 20
                     # 保存案例并获取修正后的根因
                     case_id = self.memory_manager.save_case(query_info, fix_action, root_causes, old_time, new_time, "negative")
                     # 获取修正后的根因
                     case = self.memory_manager.get_case(case_id)
                     root_causes = case.case_info.get("root_causes")
-                    state["fail_count"] += 1
-                    state["mode"] = "exploit"
+                    # 记录该根因一次无效尝试
+                    key = self.memory_manager._normalize_root_causes(root_causes)
+                    state["attempts"][key] = state["attempts"].get(key, 0) + 1
                 elif evaluation_result.get("status") == 1:
                     logger.info(f"SQL {query_id} 修复成功")
                     new_time = evaluation_result.get("new_time")
@@ -355,21 +413,13 @@ class DBAgent:
                     case = self.memory_manager.get_case(case_id)
                     root_causes = case.case_info.get("root_causes")
                     
-                    # 成功：重置连续失败计数，保留来源与当前根因
-                    if (query_id not in best_sql_times) or (best_sql_times[query_id] - new_time) / best_sql_times[query_id] > 0.1:
-                        state['fail_count'] = 0
-                    else:
-                        state["fail_count"] += 1
-                    if random.random() < epsilon: 
-                        # ε-greedy探索：以epsilon概率探索新根因
-                        logger.info(f"ε-greedy决定探索新根因")
-                        state["source"] = 'archive'
-                        state["current_root"] = None
-                        state["mode"] = "explore"
-                    else:
-                        # ε-greedy利用：以(1-epsilon)概率继续利用当前根因
-                        logger.info(f"ε-greedy利用当前根因")
-                        state["mode"] = "exploit"
+                    # 成功：将该根因尝试计数清零并累计成功次数
+                    key = self.memory_manager._normalize_root_causes(root_causes)
+                    state["attempts"][key] = 0
+                    state["successes"][key] = state["successes"].get(key, 0) + 1
+                    # 成功后置空 current_root，下次允许小模型重新诊断（刷新根因）
+                    state["current_root"] = None
+                    # state["confidence"] = {}
                 else:
                     # 修复无效：记负样例并推进来源（下轮再尝试）
                     logger.info(f"SQL {query_id} 修复无效，记录负样例")
@@ -379,25 +429,20 @@ class DBAgent:
                     # 获取修正后的根因
                     case = self.memory_manager.get_case(case_id)
                     root_causes = case.case_info.get("root_causes")
-                    state["fail_count"] += 1
-                    state["mode"] = "exploit"
-                    
-                if state["fail_count"] >= no_improvement_threshold:
-                    state["fail_count"] = 0
-                    if state["source"] == 'model': 
-                        # model不行换大模型
-                        state["source"] = 'llm'
-                    elif state["source"] == 'llm':
-                        # 大模型不行换相似根因
-                        state["source"] = 'archive'
-                    # 记录已尝试根因（frozenset）并在下轮选新根因
+                    # 记录该根因一次无效尝试
+                    key = self.memory_manager._normalize_root_causes(root_causes)
+                    state["attempts"][key] = state["attempts"].get(key, 0) + 1
+                
+                # 依据无效尝试计数达到阈值时，标记该根因为已尝试并置空 current_root
+                key = self.memory_manager._normalize_root_causes(root_causes)
+                if state.get("attempts", {}).get(key, 0) >= no_improvement_threshold:
                     state["root_tried"].add(self.memory_manager._normalize_root_causes(root_causes))
-                    state["current_root"] = None
 
-                # 记录当前SQL执行前后的时间，记录是不是更短的执行时间
-                if (query_id not in best_sql_times) or (new_time < best_sql_times[query_id]):
+                # 仅在修复成功且更优时更新“最佳”记录
+                if new_time < best_sql_times[query_id]:
                     best_sql_times[query_id] = new_time
                     best_sql_actions[query_id] = fix_action
+                    best_sql_texts[query_id] = query_info.query
                 round_sql_times[query_id] = new_time
                 round_sql_actions[query_id] = fix_action
                 sql_root_cause_states[query_id] = state
@@ -405,22 +450,30 @@ class DBAgent:
                 logger.info(f"SQL {query_id} 原先执行时间: {old_time}s")
                 logger.info(f"SQL {query_id} 本轮执行时间: {new_time}s")
                 logger.info(f"SQL {query_id} 本轮修复SQL: {rewrite_sql}")
-                logger.info(f"SQL {query_id} 本轮修复actions: {fix_action}")
                 logger.info(f"SQL {query_id} 本轮修复根因: {root_causes}")
+                logger.info(f"SQL {query_id} 本轮修复actions: {fix_action}")
+
+                # 在新动作回滚完成后，再回滚历史动作
+                if pre_applied:
+                    self.action_manager.rollback_action(pre_index_names, pre_knob_names)
+
 
             round_end = time.time()
             logger.info(f"第 {round_idx+1} 轮调优时间: {round_end - round_start:.4f}s")
             round_total_time = sum([t for t in round_sql_times.values()])
             logger.info(f"第 {round_idx+1} 轮workload总执行时间: {round_total_time:.4f}s")
-            print(f"第 {round_idx+1} 轮workload总执行时间: {round_total_time:.4f}s")
-            print(f"第 {round_idx+1} 轮调优时间: {round_end - round_start:.4f}s")
+            logger.info(f"第 {round_idx+1} 轮各SQL执行时间: {round_sql_times}")
             
-            if workload_best_time is None or round_total_time < workload_best_time:
-                workload_best_time = round_total_time
-                workload_best_actions = round_sql_actions.copy()
+            # if workload_best_time is None or round_total_time < workload_best_time:
+            #     workload_best_time = round_total_time
+            #     workload_best_actions = round_sql_actions.copy()
 
-        logger.info(f"最优workload执行时间: {workload_best_time:.4f}s")
-        logger.info(f"最优SQL修复actions: {workload_best_actions}")
-        logger.info(f"各SQL最优执行时间: {best_sql_times}")
-        logger.info(f"各SQL最优修复actions: {best_sql_actions}")
+            logger.info(f"迭代至第 {round_idx+1} 轮，各SQL最优执行时间: {best_sql_times}")
+            logger.info(f"迭代至第 {round_idx+1} 轮，workload最优总执行时间: {sum(best_sql_times.values())}")
+            logger.info(f"迭代至第 {round_idx+1} 轮，各SQL最优修复actions: {best_sql_actions}")
+
+        # logger.info(f"最优workload执行时间: {workload_best_time:.4f}s")
+        # logger.info(f"最优SQL修复actions: {workload_best_actions}")
+        # logger.info(f"各SQL最优执行时间: {best_sql_times}")
+        # logger.info(f"各SQL最优修复actions: {best_sql_actions}")
         logger.info(f"诊断流程结束")
