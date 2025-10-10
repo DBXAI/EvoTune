@@ -6,41 +6,34 @@ import logging
 import os
 from datetime import datetime
 
-# 添加项目根目录到Python路径
+# add project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 配置日志，同时输出到控制台和文件
+# setup logging, output to console and file
 def setup_logging():
-    # 创建logs目录
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     log_dir = os.path.join(project_root, "logs")
     os.makedirs(log_dir, exist_ok=True)
     
-    # 生成日志文件名（包含时间戳）
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"dream_diagnosis_{timestamp}.log")
     
-    # 配置日志格式
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # 创建根日志记录器
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     
-    # 清除现有的处理器
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
     
-    # 控制台处理器
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     
-    # 文件处理器
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
@@ -49,7 +42,6 @@ def setup_logging():
     print(f"日志文件保存位置: {log_file}")
     return log_file
 
-# 在导入其他模块之前先配置日志
 setup_logging()
 
 from config.base_config import POSTGRES_CONFIG, KNOB_CONFIG, API_SETTINGS

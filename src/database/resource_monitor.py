@@ -15,12 +15,12 @@ class ResourceMonitor:
         self.warmup = warmup
         self.ticks = int(self.t / self.interval)
         
-        # 检查进程是否存在
+        # check if process exists
         try:
             self.process = psutil.Process(pid)
             self.n_cpu = len(self.process.cpu_affinity())
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            # 如果进程不存在，创建一个虚拟进程对象
+            # if process does not exist, create a virtual process object
             self.process = None
             self.n_cpu = 1
             print(f"警告: 进程 {pid} 不存在或无法访问，将使用默认值")
@@ -104,7 +104,6 @@ class ResourceMonitor:
                 count = count + 1
                 continue
             if self.process is None:
-                # 进程不存在，使用默认值
                 self.mem_physical_usage_seq.append(0.0)
                 self.mem_virtual_usage_seq.append(0.0)
             else:
@@ -114,7 +113,6 @@ class ResourceMonitor:
                     self.mem_physical_usage_seq.append(mem_physical)
                     self.mem_virtual_usage_seq.append(mem_virtual)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    # 进程不存在或无法访问，添加默认值
                     self.mem_physical_usage_seq.append(0.0)
                     self.mem_virtual_usage_seq.append(0.0)
             time.sleep(self.interval)
@@ -134,7 +132,6 @@ class ResourceMonitor:
                 self.io_read_seq.append((sp2[2]-sp1[2])/(1024.0 * 1024.0))
                 self.io_write_seq.append((sp2[3]-sp1[3])/(1024.0 * 1024.0))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError):
-                # 进程不存在或无法访问，添加默认值
                 self.io_read_seq.append(0.0)
                 self.io_write_seq.append(0.0)
             count += 1
@@ -147,14 +144,12 @@ class ResourceMonitor:
                 count = count + 1
                 continue
             if self.process is None:
-                # 进程不存在，使用默认值
                 self.cpu_usage_seq.append(0.0)
             else:
                 try:
                     cpu = self.process.cpu_percent(interval=self.interval)
                     self.cpu_usage_seq.append(cpu)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    # 进程不存在或无法访问，添加默认值
                     self.cpu_usage_seq.append(0.0)
             count += 1
 
@@ -172,7 +167,6 @@ class ResourceMonitor:
                 self.net_recv_seq.append((net2.bytes_recv - net1.bytes_recv) / (1024.0 * 1024.0))
                 self.net_sent_seq.append((net2.bytes_sent - net1.bytes_sent) / (1024.0 * 1024.0))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError):
-                # 进程不存在或无法访问，添加默认值
                 self.net_recv_seq.append(0.0)
                 self.net_sent_seq.append(0.0)
             count += 1

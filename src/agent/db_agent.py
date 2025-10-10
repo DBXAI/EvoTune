@@ -36,7 +36,7 @@ logger.setLevel(logging.INFO)
 logger.propagate = True
 
 class DBAgent:
-    def __init__(self, configs=None, memory_path: str = "memory_results", max_attempts: int = 10):
+    def __init__(self, configs=None, memory_path = "memory_results", max_attempts = 10):
         self.configs = configs
         self.db = PostgresDB(
             user=configs['POSTGRES_CONFIG']['user'],
@@ -69,21 +69,17 @@ class DBAgent:
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """异步上下文管理器出口，确保资源清理"""
+        """异步上下文管理器出口"""
         await self.cleanup()
         
     async def cleanup(self):
-        """清理资源"""
         try:
-            # 清理action_manager
             if self.action_manager:
                 try:
-                    # 防止取消传播到当前任务
                     await asyncio.shield(self.action_manager.cleanup())
                 except Exception as e:
                     logger.warning(f"清理action_manager时出现异常: {e}")
             
-            # 清理数据库连接
             if self.db:
                 try:
                     if hasattr(self.db, 'cleanup') and callable(getattr(self.db, 'cleanup')):
@@ -98,38 +94,29 @@ class DBAgent:
         except Exception as e:
             logger.error(f"清理资源时出现异常: {e}")
         finally:
-            # 不再主动取消事件循环中的其他任务，避免传播 CancelledError
             pass
 
-    def parse_action_result(self, diagnosis: str):
-        """从diagnosis文本中提取Explanation、Fix_Action和Query_Rewrite部分"""
-        
-        # 提取Explanation
+    def parse_action_result(self, diagnosis):        
+        # extract Explanation
         explanation_match = re.search(r'Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)', diagnosis, re.IGNORECASE)
         explanation = explanation_match.group(1).strip() if explanation_match else ""
         
-        # 提取FIX_ACTION
+        # extract FIX_ACTION
         fix_match = re.search(r'Fix_Action:\s*([\s\S]+?)Query_Rewrite:', diagnosis, re.IGNORECASE)
         fix_action = fix_match.group(1).strip() if fix_match else ""
         
-        # 提取Query_Rewrite
+        # extract Query_Rewrite
         is_rewrite_match = re.search(r'Query_Rewrite:\s*(yes|no)', diagnosis, re.IGNORECASE)
         is_rewrite = is_rewrite_match.group(1).strip() if is_rewrite_match else ""
         
         return explanation, fix_action, is_rewrite
     
-    def parse_query_rewrite(self, fix_action: str):
-        """
-        提取修复动作（所有CREATE/SET等）和主SQL（从第一个WITH/SELECT/INSERT/UPDATE/DELETE开始的所有内容）。
-        返回二元组（修复动作, 主SQL）。
-        """
-        # 按行分割
+    def parse_query_rewrite(self, fix_action):
         lines = fix_action.strip().splitlines()
         sql_start = None
         
         for idx, line in enumerate(lines):
             l = line.lstrip().upper()
-            # 检查是否是SQL语句开始（包括WITH子句）
             if (l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or 
                 l.startswith("UPDATE") or l.startswith("DELETE")):
                 sql_start = idx
@@ -140,10 +127,9 @@ class DBAgent:
             sql_part = "\n".join(lines[sql_start:]).strip()
             return fix_part, sql_part
         else:
-            # 如果没有找到SQL语句，整个内容作为修复动作
             return fix_action.strip(), ""
         
-    def extract_fix_action(self, action_result: str):
+    def extract_fix_action(self, action_result):
         explanation, fix_action, is_rewrite = self.parse_action_result(action_result)
         print("diagnosis output:")
         print("explanation:", explanation)
@@ -155,7 +141,6 @@ class DBAgent:
         else:
             return fix_action, ""
 
-
     def read_queries(self, slow_query_path, order):
         queries_order = []
         with open(os.path.join(slow_query_path, order), "r", encoding="utf-8") as f:
@@ -165,21 +150,15 @@ class DBAgent:
                     queries_order.append(os.path.join(slow_query_path, fname))
         return queries_order
     
-    def clean_query(self, sql: str) -> str:
-        # 去除单行注释
+    def clean_query(self, sql):
         sql = re.sub(r'--.*?(\n|$)', '', sql)
-        # 去除开头和结尾的空白字符
         sql = sql.strip()
-        # 将多个空白字符替换为单个空格
         sql = re.sub(r'\s+', ' ', sql)
         return sql
 
-    def _remove_hints_from_sql(self, sql: str) -> str:
-        """从 SQL 中移除所有 hint 注释块 /*+ ... */"""
+    def _remove_hints_from_sql(self, sql):
         import re
-        # 移除所有 /*+ ... */ 格式的 hint
         sql_without_hints = re.sub(r'/\*\+[\s\S]*?\*/', '', sql)
-        # 清理多余的空格
         sql_without_hints = ' '.join(sql_without_hints.split())
         return sql_without_hints.strip()
 

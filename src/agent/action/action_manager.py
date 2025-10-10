@@ -3,7 +3,6 @@ import sys
 import asyncio
 import yaml
 from pathlib import Path
-from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -28,8 +27,8 @@ from agent.prompt import *
 
 nest_asyncio.apply()
 
+# 避免LLM API调用时打印retry日志
 def delete_all_loggers():
-    """清理和重置所有日志记录器"""
     import logging
     loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
     for logger in loggers:
@@ -39,14 +38,11 @@ def delete_all_loggers():
         logger.propagate = True
         logger.setLevel(logging.CRITICAL)
 
-# 清理所有日志记录器
 delete_all_loggers()
 
-# 从配置文件加载API设置
+# 设置使用 chat_completions API
 os.environ['OPENAI_API_KEY'] = API_SETTINGS['openai']['api_key']
 os.environ['OPENAI_BASE_URL'] = API_SETTINGS['openai']['base_url']
-
-# 设置使用 chat_completions API
 set_default_openai_api("chat_completions")
 
 class ServerConfig:
@@ -82,7 +78,6 @@ class MultiServerManager:
                 self.servers[config.name] = server
             yield list(self.servers.values())
         except Exception as e:
-            # 如果初始化过程中出现异常，清理已创建的服务器
             for server in self.servers.values():
                 try:
                     await server.__aexit__(type(e), e, e.__traceback__)
@@ -90,12 +85,10 @@ class MultiServerManager:
                     pass
             raise
         finally:
-            # 确保所有服务器都被正确清理
             for server in self.servers.values():
                 try:
                     await server.__aexit__(None, None, None)
                 except asyncio.CancelledError:
-                    # 忽略取消错误
                     pass
                 except Exception as e:
                     print(f"Warning: Error cleaning up server: {e}")
@@ -126,21 +119,16 @@ class ActionManager:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """异步上下文管理器的退出方法"""
-        
-        # 仅释放agent引用，实际资源交由 exit_stack 管理
         if self.agent:
             self.agent = None
 
-        # 最后清理 exit_stack
         try:
             await self.exit_stack.aclose()
         except asyncio.CancelledError:
-            # 忽略取消错误
             pass
         except Exception as e:
             print(f"Warning: Error during exit stack cleanup: {e}")
 
-        # 清理引用
         self._servers = []
         self.server_manager = None
 
@@ -167,7 +155,6 @@ class ActionManager:
         return self.agent
 
     async def cleanup(self):
-        """清理资源"""
         try:
             await self.__aexit__(None, None, None)
         except Exception as e:
@@ -197,17 +184,14 @@ class ActionManager:
 
     @staticmethod
     def extract_index_names(sql):
-        """从多条CREATE INDEX语句中提取所有索引名"""
         return re.findall(r'CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)', sql, re.IGNORECASE)
         
     @staticmethod
     def extract_knob_names(sql):
-        """从多条SET语句中提取所有knob名"""
         return re.findall(r'SET\s+([a-zA-Z0-9_]+)\s*=', sql, re.IGNORECASE)
 
     def rollback_action(self, index_names, knob_names):
-        """撤销修复动作"""
-        # 撤销所有索引
+        # undo all index settings
         for index_name in index_names:
             try:  
                 with self.db.connection.cursor() as cur:
@@ -219,7 +203,7 @@ class ActionManager:
                 self.db.connection.rollback()
                 print(f"撤销索引失败: {e}")
 
-        # 撤销所有knob设置
+        # undo all knob settings
         for knob_name in knob_names:
             try:
                 with self.db.connection.cursor() as cur:
@@ -283,14 +267,11 @@ class ActionManager:
             return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""), "new_time": new_time}
 
     async def derive_fix_action_and_sql(self, fix_action, rewrite_sql, origin_sql):
-        """
-        处理hint相关逻辑
-        """
-        # 提取首个 hint 注释块
+        # extract hint
         match = re.search(r"/\*\+[\s\S]*?\*/", fix_action)
         if match:
             hint = match.group(0).strip()
-            # 从 fix_action 中移除该 hint
+            # remove the hint from fix_action
             clean_fix_action = (fix_action[:match.start()] + fix_action[match.end():]).strip()
             if rewrite_sql != "":
                 await self.check_sql_rewrite(origin_sql, rewrite_sql)
@@ -300,7 +281,7 @@ class ActionManager:
             fix_sql = self._inject_hint_into_sql(hint, target_sql)
             return clean_fix_action, fix_sql
         else:
-            # 无 hint
+            # no hint
             clean_fix_action = fix_action
             if rewrite_sql != "":
                 await self.check_sql_rewrite(origin_sql, rewrite_sql)
@@ -310,38 +291,32 @@ class ActionManager:
             return clean_fix_action, fix_sql
 
     def _inject_hint_into_sql(self, hint, sql):
-        """将 hint 注入到 SQL 中的每个顶层 SELECT（含 WITH 后主 SELECT）或 EXPLAIN 语句前。
-        
-        使用正则表达式匹配，在顶层 SELECT 或 EXPLAIN 前插入 hint。
-        """
-        # 使用简单的单词边界匹配，然后通过位置判断是否在括号内
         pattern = r'\b(WITH|SELECT|EXPLAIN)\b'
         
         def replace_match(match):
-            # 检查是否在括号内
+            # check if in parentheses
             start_pos = match.start()
             keyword = match.group(1).upper()
             
-            # 计算到当前位置的左括号和右括号数量
+            # count the number of left and right parentheses
             left_count = sql[:start_pos].count('(')
             right_count = sql[:start_pos].count(')')
             
-            # 如果在括号内，不注入hint
             if left_count > right_count:
                 return match.group(0)
             
-            # 特殊处理：如果是 SELECT 且在视图定义中（前面有 "as" 关键字），不注入
+            # special handling: if SELECT and in view definition (previous "as" keyword)
             if keyword == 'SELECT':
-                # 简单检查：如果前面有 "as" 关键字，不注入 hint
+                # simple check: if previous "as" keyword, not inject hint
                 before_text = sql[:start_pos].lower().strip()
                 if before_text.endswith('as'):
                     return match.group(0)
             
-            # 特殊处理：如果是 WITH，不注入 hint（只在主 SELECT 前注入）
+            # special handling: if WITH, not inject hint (only inject before main SELECT)
             if keyword == 'WITH':
                 return match.group(0)
             
-            # 如果前面已经有 hint，不重复添加
+            # if previous hint, not add again
             if start_pos > 0:
                 prefix = sql[:start_pos].strip()
                 if prefix.endswith(hint.strip()):
@@ -349,7 +324,6 @@ class ActionManager:
             
             return hint + ' ' + match.group(0)
         
-        # 替换所有匹配项
         result = re.sub(pattern, replace_match, sql, flags=re.IGNORECASE)
         return result
 
@@ -402,9 +376,6 @@ class ActionManager:
                 return new_action_result
 
     async def action_space_collect(self, root_causes):
-        """基于根因，提供相应的操作空间prompt，供后续大模型决策。
-        返回操作空间的详细说明。
-        """
         return build_action_space_prompt(root_causes, self.db)
 
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):

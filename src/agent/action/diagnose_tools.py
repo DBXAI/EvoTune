@@ -1,4 +1,3 @@
-from typing import Any, Dict, List
 from mcp.server.fastmcp import FastMCP
 import sqlparse
 from sqlparse.sql import IdentifierList, Identifier, Where, Comparison, Parenthesis, TokenList, Function, Parenthesis
@@ -22,22 +21,12 @@ import jpype as jp
 # 初始化 FastMCP 服务器
 mcp = FastMCP("db_diagnosis")
 
-def clean_sql(sql: str) -> str:
-    """清理SQL语句，去除多余的空格和换行符
-
-    Args:
-        sql: 原始SQL语句
-
-    Returns:
-        str: 清理后的SQL语句
-    """
-    # 去除开头和结尾的空白字符
+def clean_sql(sql):
     sql = sql.strip()
-    # 将多个空白字符替换为单个空格
     sql = re.sub(r'\s+', ' ', sql)
     return sql
 
-def extract_tables(parsed, postgres_config) -> list:
+def extract_tables(parsed, postgres_config):
     tables = set()
 
     def _extract(token_list):
@@ -84,7 +73,7 @@ def extract_tables(parsed, postgres_config) -> list:
 
     return [t for t in tables if t in existing_tables]
 
-def extract_columns(parsed, postgres_config) -> list:
+def extract_columns(parsed, postgres_config):
     columns = set()
 
     def _extract_columns(token_list):
@@ -148,8 +137,7 @@ def extract_columns(parsed, postgres_config) -> list:
 
     return [t for t in columns if t in existing_columns and t != "*"]
 
-def base_information_collect(query_info, postgres_config) -> Dict[str, Any]:
-    """收集关于数据库和查询的基本信息"""
+def base_information_collect(query_info, postgres_config):
     postgres_db = PostgresDB(
         user=postgres_config['user'], 
         password=postgres_config['password'], 
@@ -287,7 +275,7 @@ def find_related_views(sql, postgres_config):
 
 # info collect
 @mcp.tool()
-async def indexes_info_collect(postgres_config) -> Dict[str, Any]:
+async def indexes_info_collect(postgres_config):
     postgres_db = PostgresDB(
         user=postgres_config['user'], 
         password=postgres_config['password'], 
@@ -326,7 +314,7 @@ async def query_info_collect(query, postgres_config):
     return query_info
 
 @mcp.tool()
-async def system_knobs_info_collect(postgres_config) -> Dict[str, Any]:
+async def system_knobs_info_collect(postgres_config):
     postgres_db = PostgresDB(
         user=postgres_config['user'], 
         password=postgres_config['password'], 
@@ -370,7 +358,7 @@ async def query_knobs_info_collect(postgres_config):
     return query_knobs_info
 
 @mcp.tool()
-async def plan_info_collect(query, postgres_config) -> Dict[str, Any]:
+async def plan_info_collect(query, postgres_config):
     postgres_db = PostgresDB(
         user=postgres_config['user'], 
         password=postgres_config['password'], 
@@ -723,25 +711,11 @@ async def plan_action_space(query):
     return plan_action_space_prompt
 
 # action generate (no use)
-async def update_statistics(query: str) -> Dict[str, Any]:
-    """更新统计信息，通过执行ANALYZE命令更新查询中涉及的表的统计信息
-
-    Args:
-        query: 查询语句
-
-    Returns:
-        Dict[str, Any]: 包含统计信息更新结果的字典
-    """
-    # 清理SQL语句
+async def update_statistics(query):
     query = clean_sql(query)
-
-    # 解析SQL语句
     parsed = sqlparse.parse(query)[0]
-    
-    # 提取涉及的表名
     tables = extract_tables(parsed)
     
-    # 连接数据库
     engine = create_engine('postgresql://postgres:postgres@localhost:5432/tpch10G')
     
     result = {
@@ -750,13 +724,13 @@ async def update_statistics(query: str) -> Dict[str, Any]:
         "executed_commands": []
     }
     
-    # 对每个表执行ANALYZE
+    # execute ANALYZE for each table
     with engine.connect() as conn:
-        DEAD_TUPLE_RATIO_THRESHOLD = 0.1   # 死元组占比 >10% 建议 VACUUM
-        MOD_SINCE_ANALYZE_THRESHOLD = 1000 # 自上次 ANALYZE 修改行数 >1000 建议 ANALYZE
+        DEAD_TUPLE_RATIO_THRESHOLD = 0.1   # dead tuple ratio >10% suggest VACUUM
+        MOD_SINCE_ANALYZE_THRESHOLD = 1000 # modified rows since last ANALYZE >1000 suggest ANALYZE
 
         for table in tables:
-            # 从 pg_stat_all_tables 中获取统计
+            # get the statistics from pg_stat_all_tables
             stats = conn.execute(text(f"""
                 SELECT
                   n_live_tup,
@@ -771,7 +745,7 @@ async def update_statistics(query: str) -> Dict[str, Any]:
                 WHERE c.relkind = 'r' AND s.schemaname = current_schema() AND s.relname = :tbl
             """), {"tbl": table}).fetchone()
 
-            # 如果表不存在或无统计则跳过
+            # if the table does not exist or has no statistics, skip
             if not stats:
                 continue
 
@@ -790,21 +764,21 @@ async def update_statistics(query: str) -> Dict[str, Any]:
                 "last_auto_analyze": str(last_auto_an)
             })
 
-            # 如果表既需要 VACUUM 又需要 ANALYZE，可以合并
+            # whether to VACUUM and ANALYZE
             if dead_pct > DEAD_TUPLE_RATIO_THRESHOLD and n_mod > MOD_SINCE_ANALYZE_THRESHOLD:
                 result["vacuum_commands"].append(f"VACUUM ANALYZE {table};")
 
-            # 判断是否需要 VACUUM
+            # whether to VACUUM
             elif dead_pct > DEAD_TUPLE_RATIO_THRESHOLD:
                 result["vacuum_commands"].append(f"VACUUM {table};")
 
-            # 判断是否需要 ANALYZE
+            # whether to ANALYZE
             elif n_mod > MOD_SINCE_ANALYZE_THRESHOLD:
                 result["analyze_commands"].append(f"ANALYZE {table};")
 
     return result
 
-async def join_order_optimization(query: str) -> Dict[str, Any]:
+async def join_order_optimization(query):
     """优化查询的连接顺序，通过测试不同的连接策略找出最优执行计划
 
     Args:
@@ -959,7 +933,7 @@ async def join_order_optimization(query: str) -> Dict[str, Any]:
 
     return result
 
-async def optimize_index(query: str) -> Dict[str, Any]:
+async def optimize_index(query):
     """优化数据库索引
 
     Args:
@@ -1040,7 +1014,7 @@ async def optimize_index(query: str) -> Dict[str, Any]:
     
     return result
 
-async def optimize_repeatedly_subqueries(query: str) -> Dict[str, Any]:
+async def optimize_repeatedly_subqueries(query):
     """优化重复执行的子查询
 
     Args:
@@ -1117,7 +1091,7 @@ async def optimize_repeatedly_subqueries(query: str) -> Dict[str, Any]:
     
     return result
 
-async def optimize_query_knob(query: str) -> Dict[str, Any]:
+async def optimize_query_knob(query):
     """收集并返回数据库指定knob的当前值和范围信息
 
     Args:
@@ -1187,7 +1161,7 @@ async def optimize_query_knob(query: str) -> Dict[str, Any]:
         "instructions": "please use the knob_info to optimize the query, and do not use other knobs"
     }
 
-async def rewrite_query(query: str) -> Dict[str, Any]:
+async def rewrite_query(query):
     """重写SQL查询以提高性能，根据规则自动判断是否需要改写
 
     Args:

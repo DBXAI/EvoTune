@@ -5,7 +5,6 @@ import random
 import time
 import itertools
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 from utils.types import QueryInfo, CaseInfo
 import numpy as np
@@ -24,81 +23,70 @@ logger.propagate = True
 
 @dataclass
 class MemoryCase:
-    """表示知识库中的一个案例"""
     id: str
     case_info: CaseInfo
     timestamp: float = field(default_factory=time.time)
-    metrics: Dict[str, float] = field(default_factory=dict)  # 如性能提升、置信度等
-    sql_embedding: Optional[List[float]] = None
-    action_embedding: Optional[List[float]] = None
-
-    # def to_dict(self) -> Dict[str, Any]:
-    #     return asdict(self)
-
-    # @classmethod
-    # def from_dict(cls, data: Dict[str, Any]) -> "MemoryCase":
-    #     return cls(**data)
+    metrics: dict = field(default_factory=dict)
+    sql_embedding = None
+    action_embedding = None
 
 class MemoryManager:
-    def __init__(self, db_path: str = "memory.db", archive_size: int = 20, root_cause_types: List[str] = None,
-                 finetune_threshold: int = 220, finetune_epochs: int = 50, finetune_batch_size: int = 8,
-                 finetune_device: str = "cpu", model_output_dir: str = "/root/DREAM/src/agent/plan/model_res",
-                 bce_weight: float = 0.7, contrastive_weight: float = 0.3, enable_finetune: bool = True,
+    def __init__(self, db_path="memory.db", archive_size=20, root_cause_types=None,
+                 finetune_threshold=220, finetune_epochs=50, finetune_batch_size=8,
+                 finetune_device="cpu", model_output_dir="/root/DREAM/src/agent/plan/model_res",
+                 bce_weight=0.7, contrastive_weight=0.3, enable_finetune=True,
                  predictor=None):
         self.db_path = db_path
         self.archive_size = archive_size
-        self.cases: Dict[str, MemoryCase] = {}
-        self.archive: Set[str] = set()
-        self.best_case_id: Optional[str] = None
+        self.cases = {}
+        self.archive = set()
+        self.best_case_id = None
 
-        # 增量训练配置
-        self.enable_finetune = enable_finetune  # 控制持续学习是否开启
+        self.enable_finetune = enable_finetune
         self.finetune_threshold = finetune_threshold
         self.finetune_epochs = finetune_epochs
         self.finetune_batch_size = finetune_batch_size
         self.finetune_device = finetune_device
         self.model_output_dir = model_output_dir
         
-        # 混合损失配置
         self.bce_weight = bce_weight
         self.contrastive_weight = contrastive_weight
 
-        # root cause岛屿模型
         self.root_cause_types = root_cause_types or [
             "missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"
         ]
         # 假设有15种root cause，支持多根因组合
         self.island_keys = self._generate_island_keys(self.root_cause_types)
-        self.islands: Dict[frozenset, Set[str]] = {key: set() for key in self.island_keys}
+        self.islands = {key: set() for key in self.island_keys}
 
-        # 注入共享的 RCRankPredictor（可为 None，用到时检查）
         self._rcrank_predictor = predictor
 
         self._init_database()
         self.load()
 
-    def _cases_to_dataframe(self) -> pd.DataFrame:
+    def _cases_to_dataframe(self):
         rows = []
-        # 多标签空间取自 root_cause_types 顺序
         label_space = self.root_cause_types
+
         for cid, case in self.cases.items():
             info = case.case_info
             raw = info.get("query_info", {})
             query = raw.get("query", "")
             plan_json = raw.get("plan_json")
-            # 统一为字符串化的计划JSON，PlanEncoder会解析
+
+            # 统一为字符串化的计划JSON
             if isinstance(plan_json, dict):
                 plan_json = json.dumps({"Plan": plan_json})
-            # timeseries/log 列名需与load_data通用分支一致
             external_metrics = raw.get("external_metrics", [])
             internal_metrics = raw.get("internal_metrics", [])
-            # 组成多标签（按label_space one-hot）
+
             roots = info.get("root_causes") or []
             roots = roots if isinstance(roots, list) else [roots]
             label_vec = [1 if r in roots else 0 for r in label_space]
+
             duration = info.get("new_time", 0.0)
             rows.append({
-                "sql_file": self.db_path, # 用于表示是在线更新的
+                "sql_file": self.db_path,
                 "query": query,
                 "plan_json": plan_json,
                 "internal_metrics": json.dumps(internal_metrics),
@@ -106,25 +94,23 @@ class MemoryManager:
                 "multilabel": str(label_vec),
                 "duration": duration,
                 "error": None,
-                "case_label": info.get("label", "positive")  # 添加case_label列
+                "case_label": info.get("label", "positive")
             })
         return pd.DataFrame(rows)
 
-    def _export_cases_csv(self, csv_path: str) -> str:
+    def _export_cases_csv(self, csv_path):
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         df = self._cases_to_dataframe()
         df.to_csv(csv_path, index=False)
         return csv_path
 
-    def _run_finetune(self, csv_path: str, output_dir: str, device: str, epochs: int, batch_size: int, 
-                     bce_weight: float = 0.7, contrastive_weight: float = 0.3) -> str:
-        # 使用混合损失（BCE + 监督对比学习）对 RCRank 主模型进行微调
+    def _run_finetune(self, csv_path, output_dir, device, epochs, batch_size, 
+                     bce_weight = 0.7, contrastive_weight = 0.3):
+        # use the hybrid loss (BCE + supervised contrastive learning) to finetune the RCRank model
         os.makedirs(output_dir, exist_ok=True)
 
-        # 1) 数据加载：与原管线一致，得到标准化后的张量字典
         train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(csv_path, batch_size=batch_size, device=device)
 
-        # 2) 准备模型与优化器（复用/初始化 predictor）
         if not hasattr(self, '_rcrank_predictor') or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
             self._rcrank_predictor = RCRankPredictor(device=device, train_data_path=csv_path)
@@ -134,7 +120,7 @@ class MemoryManager:
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
         temperature = 0.07
         
-        # BCE损失函数（与原始训练保持一致）
+        # BCE loss function
         bce_loss_fn = nn.BCELoss(reduction="mean")
 
         def enhanced_supcon_loss(emb, labels, case_labels, temperature=0.07):
@@ -300,8 +286,7 @@ class MemoryManager:
         torch.save(model.state_dict(), best_path)
         return best_path
 
-    def _reload_predictor(self, model_path: str, stats_data_path: str, device: str):
-        # 就地热重载共享实例，确保 Planner/MemoryManager 同步
+    def _reload_predictor(self, model_path, stats_data_path, device):
         if not hasattr(self, '_rcrank_predictor') or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
             self._rcrank_predictor = RCRankPredictor(model_path=model_path, train_data_path=stats_data_path, device=device)
@@ -310,29 +295,29 @@ class MemoryManager:
         predictor = self._rcrank_predictor
         predictor.device = device
         predictor.model_path = model_path
-        # 重新计算统计信息
         predictor._compute_statistics(stats_data_path)
-        # 重新加载权重
         predictor.model.load_state_dict(torch.load(model_path, map_location=device))
         predictor.model.to(device)
         predictor.model.eval()
 
     def _maybe_finetune(self):
-        # 检查是否开启持续学习功能
         if not self.enable_finetune:
             return
         
         total = len(self.cases)
         if total - self._last_finetune_count < self.finetune_threshold:
             return
-        # 导出CSV
+
+        # export CSV
         csv_path = os.path.join(self.model_output_dir, "memory_cases.csv")
         os.makedirs(self.model_output_dir, exist_ok=True)
         self._export_cases_csv(csv_path)
-        # 继续训练（混合损失微调）
+
+        # finetune
         best_model = self._run_finetune(csv_path, self.model_output_dir, self.finetune_device, self.finetune_epochs, self.finetune_batch_size,
                                       self.bce_weight, self.contrastive_weight)
-        # 热重载预测器
+
+        # reload predictor
         self._reload_predictor(best_model, csv_path, self.finetune_device)
         self._last_finetune_count = total
 
@@ -341,22 +326,20 @@ class MemoryManager:
             with open(self.db_path, 'w') as f:
                 json.dump({}, f)
 
-    def _generate_island_keys(self, root_cause_types: List[str]) -> List[frozenset]:
+    def _generate_island_keys(self, root_cause_types):
         keys = []
         for i in range(1, len(root_cause_types) + 1):
             keys.extend([frozenset(pair) for pair in itertools.combinations(root_cause_types, i)])
         return keys
 
-    def add_case(self, case: MemoryCase) -> str:
-        # 保存前校验根因与动作/SQL是否匹配，并路由到正确岛屿
+    def add_case(self, case):
         self._validate_and_route_root_causes(case)
-        # 存入cases并维护结构
         self.cases[case.id] = case
         self._enforce_archive_limit()
 
         self._update_archive(case)
         self._update_best_case(case)
-        # 将案例加入对应island
+
         root_causes_key = self._normalize_root_causes(case.case_info.get("root_causes"))
         if root_causes_key in self.islands:
             self.islands[root_causes_key].add(case.id)
@@ -365,32 +348,27 @@ class MemoryManager:
 
         self.save_to_memory(case)
         logger.debug(f"Added case {case.id} to island {root_causes_key}")
-        # 达到阈值则触发增量训练
+
         try:
             self._maybe_finetune()
         except Exception as e:
             print(f"Online finetune failed: {e}")
         return case.id
     
-    def save_to_memory(self, new_case: MemoryCase = None):
+    def save_to_memory(self, new_case = None):
         if new_case is not None:
-            # 增量保存：只添加新案例
             try:
-                # 尝试读取现有数据
                 with open(self.db_path, 'r') as f:
                     data_to_save = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
-                # 文件不存在或格式错误，创建新的数据结构
                 data_to_save = {}
             
-            # 添加新案例
             data_to_save[new_case.id] = new_case.case_info
             
-            # 写入文件
             with open(self.db_path, 'w') as f:
                 json.dump(data_to_save, f)
         else:
-            # 全量保存：保存所有案例（用于兼容性）
+            # full save
             with open(self.db_path, 'w') as f:
                 data_to_save = {}
                 for cid, case in self.cases.items():
@@ -398,10 +376,8 @@ class MemoryManager:
                 json.dump(data_to_save, f)
 
     def save_case(self, query_info, fix_action, root_causes, old_time, new_time, label):
-        # 计算 approve_time
         approve_time = old_time - new_time
 
-        # 组装case_info，只存储必要信息
         case_info = {
             "query_info": query_info.__dict__,
             "fix_action": fix_action,
@@ -412,23 +388,21 @@ class MemoryManager:
             "approve_time": approve_time
         }
         
-        # 创建临时MemoryCase用于计算和存储
         case = MemoryCase(
             id=str(len(self.cases) + 1),
             case_info=case_info,
-            metrics={},  # 将在load时重新计算
-            sql_embedding=None,  # 将在load时重新计算
-            action_embedding=None,  # 将在load时重新计算
+            metrics={},
+            sql_embedding=None,
+            action_embedding=None,
         )
         self.add_case(case)
 
         return case.id
 
-    def get_case(self, case_id: str) -> Optional[MemoryCase]:
+    def get_case(self, case_id):
         return self.cases.get(case_id)
 
-    # 将 id 转为 MemoryCase
-    def ids_to_cases(self, ids: List[str]) -> List[MemoryCase]:
+    def ids_to_cases(self, ids):
         return [self.cases[cid] for cid in ids]
 
     def load(self):
@@ -436,16 +410,14 @@ class MemoryManager:
             with open(self.db_path, 'r') as f:
                 data = json.load(f)
                 for cid, case_info in data.items():
-                    # 从case_info重新构建MemoryCase
                     case = self._build_memory_case_from_info(cid, case_info)
                     self.cases[cid] = case
                     
-                    # 将case添加到对应的island中
                     root_causes = case.case_info.get("root_causes")
                     if root_causes:
                         island_key = self._normalize_root_causes(root_causes)
                         self.islands[island_key].add(cid)
-                # 依据正样例与approve_time重建archive（取前archive_size个）
+
                 positive_cases = [c for c in self.cases.values() if c.case_info.get("label") == "positive"]
                 positive_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
                 self.archive = set([c.id for c in positive_cases[: self.archive_size]])
@@ -455,18 +427,15 @@ class MemoryManager:
         else:
             self._last_finetune_count = 0
 
-    def _build_memory_case_from_info(self, case_id: str, case_info: dict) -> MemoryCase:
-        """从case_info重新构建完整的MemoryCase"""
-        # 计算embedding
+    def _build_memory_case_from_info(self, case_id, case_info):
         raw_info = case_info["query_info"]
-        # 确保is_rewrite字段存在，默认为False
+
         if "is_rewrite" not in raw_info:
             raw_info["is_rewrite"] = False
         query_info = QueryInfo(**raw_info)
         sql_embedding = self.build_sql_embedding(query_info)
         action_embedding = self.build_action_embedding(str(case_info["fix_action"]))
         
-        # 计算metrics
         approve_time = case_info.get("approve_time", 0.0)
         new_time = case_info.get("new_time", 0.0)
         metrics = {
@@ -482,21 +451,20 @@ class MemoryManager:
             action_embedding=action_embedding,
         )
 
-    def _feature_coords_to_key(self, coords: List[int]) -> str:
+    def _feature_coords_to_key(self, coords):
         return "-".join(str(c) for c in coords)
 
-    def _is_better(self, case1: MemoryCase, case2: MemoryCase) -> bool:
-        # 以approve_time为主（性能提升越大越好）
+    def _is_better(self, case1, case2):
         return case1.metrics.get("approve_time", 0.0) > case2.metrics.get("approve_time", 0.0)
 
-    # 分别选出同 SQL 与不同 SQL 的提升最大的1个
-    def best_by_approve(self, cases: List[MemoryCase]) -> Optional[MemoryCase]:
+    # select the best case by approve_time
+    def best_by_approve(self, cases):
         if not cases:
             return None
         return max(cases, key=lambda c: c.case_info.get("approve_time") or c.metrics.get("approve_time", 0.0))
 
-    def _update_archive(self, case: MemoryCase):
-        # 仅正样例才进入archive
+    def _update_archive(self, case):
+        # only positive cases are allowed to enter archive
         if case.case_info.get("label") != "positive":
             return
 
@@ -509,8 +477,8 @@ class MemoryManager:
             self.archive.remove(worst_case.id)
             self.archive.add(case.id)
 
-    def _update_best_case(self, case: MemoryCase):
-        # 仅正样例才允许成为best_case
+    def _update_best_case(self, case):
+        # only positive cases are allowed to become best_case
         if case.case_info.get("label") != "positive":
             return
 
@@ -519,11 +487,11 @@ class MemoryManager:
 
     def _enforce_archive_limit(self):
         if len(self.archive) > self.archive_size:
-            # 获取archive中的案例，按性能排序
+            # sort by approve_time
             archive_cases = [self.cases[case_id] for case_id in self.archive if case_id in self.cases]
             sorted_archive_cases = sorted(archive_cases, key=lambda c: c.metrics.get("approve_time"))
             
-            # 从archive中移除性能最差的案例
+            # remove the worst cases
             to_remove_count = len(self.archive) - self.archive_size
             to_remove_cases = sorted_archive_cases[:to_remove_count]
             
@@ -531,7 +499,7 @@ class MemoryManager:
                 if case.id in self.archive:
                     self.archive.remove(case.id)
 
-    def retrieve_cases(self, query_info: QueryInfo, root_causes: Any, pos_n: int = 2, neg_n: int = 2, mode: str = "exploit") -> Dict[str, Any]:
+    def retrieve_cases(self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"):
         """
         使用 islands 构造样本池并按标签输出：
         - exploitation pool: 目标根因对应的岛
@@ -544,22 +512,21 @@ class MemoryManager:
         query_text = query_info.query.lower().strip()
         target_root = self._normalize_root_causes(root_causes)
 
-        # 从 islands 获取池
         target_island_ids = list(self.islands.get(target_root, set()))
         other_island_ids = []
         for island_key, ids in self.islands.items():
             if island_key != target_root:
                 other_island_ids.extend(list(ids))
 
-        # exploitation 池：同岛全部（内部同/异 SQL 信息仅用于后续挑选）
+        # exploitation pool
         exploit_pool = self.ids_to_cases(target_island_ids)
         explore_pool = self.ids_to_cases(other_island_ids)
 
-        # ε-greedy 选择模式
+        # ε-greedy mode
         chosen_pool = explore_pool if mode == "explore" else exploit_pool
 
-        # 在 exploit 池内优先同 SQL 的案例
-        def split_by_sql(cases: List[MemoryCase]) -> Tuple[List[MemoryCase], List[MemoryCase]]:
+        # in exploit pool, prioritize same SQL cases
+        def split_by_sql(cases):
             same_sql_list = []
             diff_sql_list = []
             for c in cases:
@@ -570,10 +537,10 @@ class MemoryManager:
                     diff_sql_list.append(c)
             return same_sql_list, diff_sql_list
 
-        # 基于 label/approve_time 划分正负并组装结果
+        # split by label/approve_time
         same_sql_pool, diff_sql_pool = split_by_sql(chosen_pool)
 
-        # 正例池与负例池
+        # positive pool and negative pool
         pos_same = [c for c in same_sql_pool if c.case_info.get("label") == "positive"]
         pos_diff = [c for c in diff_sql_pool if c.case_info.get("label") == "positive"]
         neg_all = [c for c in chosen_pool if c.case_info.get("label") != "positive"]
@@ -586,7 +553,7 @@ class MemoryManager:
         if best_diff is not None:
             selected_pos.append(best_diff)
 
-        # 其余正例按 approve_time 降序补齐
+        # remaining positive cases are sorted by approve_time
         remaining_pos = [c for c in (pos_same + pos_diff) if c not in selected_pos]
         remaining_pos_sorted = sorted(
             remaining_pos,
@@ -596,30 +563,24 @@ class MemoryManager:
         selected_pos.extend(remaining_pos_sorted)
         selected_pos = selected_pos[:max(1, pos_n)]
 
-        # 负例随机采样
+        # negative cases are sampled randomly
         if len(neg_all) > neg_n:
             selected_neg = random.sample(neg_all, neg_n)
         else:
             selected_neg = neg_all
 
-        # 导出 case_info
+        # export case_info
         pos_infos = [c.case_info for c in selected_pos]
         neg_infos = [c.case_info for c in selected_neg]
 
         return {"mode": mode, "positive": pos_infos, "negative": neg_infos}
 
     def retrieve_embedding(self, query_info, top_n=5, metric='cosine', case_ids=None):
-        """
-        基于embedding相似度，返回与query_info最相近的top-N历史case。
-        可选：仅在给定的 case_ids 候选集合中检索（例如仅在 archive 内）。
-        支持欧氏距离和余弦相似度。
-        """
-        # 1. 获取当前query的embedding
         query_emb = np.array(self.build_sql_embedding(query_info))
         if norm(query_emb) == 0:
             return []
 
-        # 2. 计算候选集合的embedding相似度（若不提供则遍历所有cases）
+        # the embedding similarity
         case_sims = []
         if case_ids is not None:
             candidates = [self.get_case(cid) for cid in case_ids]
@@ -632,19 +593,17 @@ class MemoryManager:
             if metric == 'cosine':
                 sim = np.dot(query_emb, case_emb) / (norm(query_emb) * norm(case_emb) + 1e-8)
             elif metric == 'euclidean':
-                sim = -norm(query_emb - case_emb)  # 距离越小越相似
+                sim = -norm(query_emb - case_emb)
             else:
                 raise ValueError('Unknown metric')
             case_sims.append((sim, case))
-        # 3. 排序并返回top-N
+            
+        # sort and return top-N
         case_sims.sort(reverse=True, key=lambda x: x[0])
         return [c for _, c in case_sims[:top_n]]
 
-    def build_sql_embedding(self, query_info: QueryInfo):
-        """
-        使用RCRank异常检测模型的get_embedding接口，根据QueryInfo对象生成高质量embedding。
-        """
-        # 使用注入的 RCRankPredictor，若缺失则懒加载一个 CPU 版本
+    def build_sql_embedding(self, query_info):
+        # use the RCRankPredictor
         if not hasattr(self, '_rcrank_predictor') or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
             self._rcrank_predictor = RCRankPredictor(device='cpu')
@@ -665,10 +624,8 @@ class MemoryManager:
         encoded_df = plan_encoder.df
         plan_tensor = encoded_df['json_plan_tensor'].iloc[0]
         
-        # 处理SQL查询（BERT tokenizer 输出为映射）
         sql = predictor.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512).to(predictor.device)
         
-        # 按照online_predict中的方式准备plan张量（不要额外增加batch维度）
         plan = {
             'x': plan_tensor['x'].to(predictor.device).to(torch.float32),
             'attn_bias': plan_tensor['attn_bias'].to(predictor.device),
@@ -676,7 +633,6 @@ class MemoryManager:
             'heights': plan_tensor['heights'].to(predictor.device)
         }
         
-        # 准备时间序列和日志数据，形状与标准化方式对齐online_predict
         timeseries = torch.tensor(query_info.external_metrics)
         if len(timeseries.shape) == 2:
             timeseries = timeseries.unsqueeze(0)
@@ -689,16 +645,13 @@ class MemoryManager:
         log = (log - predictor.logs_train_mean) / (predictor.logs_train_std + 1e-6)
         log = log.to(predictor.device)
         
-        # 6. 获取embedding
+        # get the embedding
         emb = predictor.model.get_embedding(sql, plan, timeseries, log)
         return emb.squeeze(0).cpu().numpy().tolist()
     
-    def build_action_embedding(self, action: str):
-        """
-        使用BERT对action字符串进行embedding，返回[CLS]向量。
-        """
+    def build_action_embedding(self, action):
         from transformers import BertTokenizer, BertModel
-        # 延迟加载BERT模型，避免重复初始化
+
         if not hasattr(self, '_bert_tokenizer'):
             bert_path = 'agent/plan/RCRank/bert-base-uncased'
             self._bert_tokenizer = BertTokenizer.from_pretrained(bert_path)
@@ -706,14 +659,14 @@ class MemoryManager:
             self._bert_model.eval()
         tokenizer = self._bert_tokenizer
         model = self._bert_model
-        # 编码action
+
         inputs = tokenizer(action, return_tensors="pt", padding=True, truncation=True, max_length=128)
         with torch.no_grad():
             outputs = model(**inputs)
-            cls_emb = outputs.last_hidden_state[:, 0, :]  # 取[CLS]向量
+            cls_emb = outputs.last_hidden_state[:, 0, :]  # [CLS] vector
         return cls_emb.squeeze(0).cpu().numpy().tolist()
 
-    def _normalize_root_causes(self, root_causes: Any) -> frozenset:
+    def _normalize_root_causes(self, root_causes):
         if root_causes is None:
             return frozenset()
         if isinstance(root_causes, str):
@@ -723,8 +676,7 @@ class MemoryManager:
         except Exception:
             return frozenset([str(root_causes)])
 
-    def _infer_root_causes_from_action(self, fix_action, query_info) -> frozenset:
-        """基于动作文本的简单启发式推断根因类别集合。"""
+    def _infer_root_causes_from_action(self, fix_action, query_info):
         fix_action = str(fix_action).lower()
         query_text = query_info.query.lower().strip()
         inferred: Set[str] = set()
@@ -738,29 +690,25 @@ class MemoryManager:
             inferred.add("poorly written queries")
         return frozenset(inferred) if inferred else frozenset()
 
-    def _validate_and_route_root_causes(self, case: MemoryCase) -> None:
-        """在写入前校验动作/SQL与根因匹配，不匹配则修正根因并路由至对应岛屿。"""
+    def _validate_and_route_root_causes(self, case):
+        # validate and route the root causes
         declared = self._normalize_root_causes(case.case_info.get("root_causes"))
         raw_info = case.case_info.get("query_info")
         query_info = QueryInfo(**raw_info)
         inferred = self._infer_root_causes_from_action(case.case_info.get("fix_action"), query_info)
-        # 若声明为空而推断有值，或两者不一致，则以推断为准（非空优先）
+
         if inferred and (inferred != declared):
             case.case_info["root_causes"] = list(inferred)
-        # 确保对应岛存在
+
         key = self._normalize_root_causes(case.case_info.get("root_causes"))
         if key not in self.islands:
             self.islands[key] = set()
             self.island_generations[key] = 0
 
-    def explore_root_from_archive(self, query_info: QueryInfo, exclude_roots: set()) -> Optional[Any]:
+    def explore_root_from_archive(self, query_info, exclude_roots):
         """
-        从 archive 中检索最相似 SQL 的根因，用于根因切换。
-        返回最相似 SQL 案例的根因，如果没有找到则返回 None。
-        
-        Args:
-            query_info: 查询信息
-            exclude_roots: 要排除的根因集合（已失败的根因），元素为字符串化后的根因表示
+        retrieve the most similar SQL root cause from archive
+        return the most similar SQL root cause, if not found, return None
         """
         if not self.archive:
             return None
@@ -768,18 +716,13 @@ class MemoryManager:
         query_text = query_info.query.lower().strip()
         exclude_roots = exclude_roots
         
-        # 从 archive 中获取案例
         archive_cases = [self.cases[aid] for aid in self.archive]
         if not archive_cases:
             return None
         
-        # 计算相似度并排序：仅在 archive 候选集合中检索
-        # 要修改
         similar_cases = self.retrieve_embedding(query_info, top_n=len(archive_cases), case_ids=list(self.archive))
         
-        # 找到最相似且未被排除的案例
         for case in similar_cases:
-            # 使用规范化后的根因集合，并以字符串形式与 exclude_roots 对齐
             case_root_str = str(self._normalize_root_causes(case.case_info.get("root_causes")))
             if case_root_str not in exclude_roots:
                 return case.case_info.get("root_causes")

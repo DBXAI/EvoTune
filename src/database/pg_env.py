@@ -1,6 +1,5 @@
 import psycopg
 from psycopg.rows import dict_row
-from typing import Dict, Any, List
 from plumbum import local
 from collections import defaultdict
 import json
@@ -45,7 +44,7 @@ class PostgresDB:
             self.connection = psycopg.connect(self.conn_str, autocommit=True, prepare_threshold=None)
         return self.connection
 
-    def execute(self, sql: str, conn=None, timeout=0):
+    def execute(self, sql, conn=None, timeout=0):
         if conn is None:
             conn = self.connect()
         
@@ -115,19 +114,11 @@ class PostgresDB:
                 print(f"查询执行失败: {str(e)}")
                 return []
     
-    def extract_sql_statements(self, sql_text: str) -> List[str]:
-        """
-        从SQL文本中提取所有SQL语句。
-        """
+    def extract_sql_statements(self, sql_text):
         return [stmt.strip() for stmt in sql_text.split(';') if stmt.strip()]
     
-    def is_select_statement(self, sql: str) -> bool:
-        """
-        判断SQL语句是否为SELECT语句（包括WITH子句）或EXPLAIN语句。
-        """
-        # 去除开头的空白字符
+    def is_select_statement(self, sql):
         sql = sql.strip()
-        # 检查是否以WITH、SELECT或EXPLAIN开头
         return bool(re.match(r'^\s*(?:WITH\s+.*?\s+)?(?:SELECT|EXPLAIN)\s+', sql, re.IGNORECASE | re.DOTALL))
 
     def get_size(self):
@@ -155,7 +146,6 @@ class PostgresDB:
         return self.fetch_results(sql)
 
     def get_indexes(self):
-        """获取数据库中所有索引的详细信息"""
         sql = """
         SELECT indexname FROM pg_indexes 
         WHERE schemaname = 'public'
@@ -224,7 +214,6 @@ class PostgresDB:
         return dict(schema_dict)
 
     def start_db(self):
-        """启动PostgreSQL数据库服务"""
         if not all([self.postgres_path, self.postgres_data, self.log_path]):
             raise ValueError("postgres_path, postgres_data, and log_path must be configured to start the database.")
         pg_ctl_cmd = [
@@ -240,7 +229,6 @@ class PostgresDB:
         if retcode != 0:
             raise Exception(f"Failed to start PostgreSQL: {stderr}")
 
-        # 等待数据库准备好接受连接
         for _ in range(10):
             pg_isready_cmd = [
                 f"{self.postgres_path}/pg_isready",
@@ -256,7 +244,6 @@ class PostgresDB:
         raise Exception("PostgreSQL did not become ready in time.")
 
     def shutdown_db(self):
-        """关闭PostgreSQL数据库服务"""
         if not all([self.postgres_path, self.postgres_data]):
             raise ValueError("postgres_path and postgres_data must be configured to shut down the database.")
         pg_ctl_cmd = [
@@ -269,7 +256,6 @@ class PostgresDB:
         cmd = ["-u", "postgres"] + pg_ctl_cmd
         local["sudo"][cmd].run(retcode=None)
 
-        # 确认数据库已关闭
         for _ in range(10):
             pg_isready_cmd = [
                 f"{self.postgres_path}/pg_isready",
@@ -294,12 +280,6 @@ class PostgresDB:
     #     return pid
 
     def get_metrics(self, sql, interval=1, warmup=0, duration=20):
-        """
-        监控PostgreSQL主进程的资源（CPU、内存、IO等），返回平均值。
-        interval: 采样间隔（秒）
-        warmup: 预热时间（秒）
-        duration: 监控总时长（秒）
-        """
         pid = self.get_pid()
 
         monitor = ResourceMonitor(pid, interval, warmup, duration)
@@ -401,18 +381,13 @@ class PostgresDB:
         return data
 
     def get_log(self, sql=None):
-        # 还得修改
-        """
-        采集SQL执行前后的PostgreSQL内部指标，并返回差值（后-前）。
-        如果sql为None，则只采集一次。
-        """
         conn = self.connect()
 
         metrics_before = self.collect_metrics(conn)
         if sql is not None:
             _, _, execution_time, _ = self.execute(sql)
         metrics_after = self.collect_metrics(conn)
-        # 计算差值
+
         diff = self.get_log_diff(metrics_before, metrics_after)
         log_list = self.get_metrics_list(diff, execution_time)
 
@@ -451,7 +426,7 @@ class PostgresDB:
                 diff[table] = before if isinstance(before, str) else after
                 continue
             if table in ["pg_stat_user_tables", "pg_statio_user_tables"]:
-                # 对所有表的指标做加和
+                # sum up all the metrics
                 METRICS_SPECIFICATION = self.get_metrics_specification()
                 sum_row = {k: 0 for k in METRICS_SPECIFICATION[table]}
                 for i in range(min(len(before), len(after))):
@@ -466,7 +441,7 @@ class PostgresDB:
                             pass
                 diff[table] = sum_row
             else:
-                # 其他表（如pg_stat_database）仍然返回单条
+                # other tables (like pg_stat_database) still return single row
                 table_diff = []
                 for i in range(min(len(before), len(after))):
                     row_before = before[i]
@@ -489,29 +464,23 @@ class PostgresDB:
     def run_sql_and_collect_all(self, sql, interval=1, warmup=0, duration=20):
         conn = self.connect()
 
-        # 1. 采集SQL执行前的log
         log_before = self.collect_metrics(conn)
-        # 2. 获取执行计划
         plan = self.get_plan(sql)
-        # 3. 启动资源监控
         pid = self.get_pid()
         monitor = ResourceMonitor(pid, interval, warmup, duration)
         monitor.run()
-        # 4. 执行SQL
+
         _, _, execution_time, _ = self.execute(sql, timeout=duration)
-        # 5. 关闭资源监控
+
         monitor.terminate()
         cpu_usage, read_io, write_io, virtual_memory, physical_memory, net_recv, net_sent = monitor.get_monitor_data()
         metrics = [cpu_usage, read_io, write_io, virtual_memory, physical_memory, net_recv, net_sent]
 
-        # 6. 采集SQL执行后的log
         log_after = self.collect_metrics(conn)
 
-        # 7. 计算log差值
         diff = self.get_log_diff(log_before, log_after)
         log_list = self.get_metrics_list(diff, execution_time)
 
-        # 8. 返回所有结果
         return {
             "query": sql,
             "plan_json": plan,
@@ -532,7 +501,6 @@ class PostgresDB:
         如果两个SQL都有CREATE VIEW，会分别执行后比较结果。
         """
         def clean_sql(sql):
-            # 去除注释
             lines = sql.split('\n')
             cleaned_lines = []
             for line in lines:
@@ -553,7 +521,6 @@ class PostgresDB:
             # print(f"result1: {result1}")
             # print(f"result2: {result2}")
 
-            # 比较结果（顺序无关，重复保留 → 用multiset）
             from collections import Counter
             return Counter(result1) == Counter(result2)
 
