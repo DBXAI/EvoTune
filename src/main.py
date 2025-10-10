@@ -59,19 +59,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description='慢查询诊断工具')
     parser.add_argument('--data_path', type=str, required=True, help='慢查询数据文件路径')
     parser.add_argument('--order', type=str, required=True, help='慢查询执行顺序')
-    parser.add_argument('--max_iterations', type=int, default=200, help='最大诊断迭代轮数')
+    parser.add_argument('--duration', type=int, default=30, help='调优时间')
     return parser.parse_args()
 
 async def main():
     # cd /root/DREAM/src
-    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --max_iterations 10
+    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --duration 10
     logger = logging.getLogger(__name__)
     
     args = parse_args()
     logger.info(f"启动DREAM数据库诊断系统")
     logger.info(f"数据路径: {args.data_path}")
     logger.info(f"执行顺序: {args.order}")
-    logger.info(f"最大迭代轮数: {args.max_iterations}")
+    logger.info(f"调优时间: {args.duration}")
     
     configs = {
         'POSTGRES_CONFIG': POSTGRES_CONFIG,
@@ -82,7 +82,7 @@ async def main():
         await agent.run(
             slow_query_path=args.data_path,
             order=args.order,
-            max_iterations=args.max_iterations
+            duration=args.duration
         )
 
 if __name__ == "__main__":

@@ -183,14 +183,14 @@ class DBAgent:
         sql_without_hints = ' '.join(sql_without_hints.split())
         return sql_without_hints.strip()
 
-    async def run(self, slow_query_path, order, max_iterations, no_improvement_threshold=3, epsilon=0.1):
+    async def run(self, slow_query_path, order, duration, no_improvement_threshold=3, epsilon=0.1):
         """
         执行数据库调优流程
         
         Args:
             slow_query_path: 慢查询文件路径
             order: 查询顺序文件
-            max_iterations: 最大迭代轮数
+            duration: 超时时间（小时），在超时前会持续迭代优化
             no_improvement_threshold: 无提升次数阈值，达到后切换根因
         """
         # 读取负载
@@ -206,12 +206,25 @@ class DBAgent:
         # {query_id: {"root_tried": set[str], "current_root": Any, "mode": 'exploit'|'explore', "confidence": Dict[str,float], "attempts": Dict[str,int], "successes": Dict[str,int]}}
         sql_root_cause_states = {}
 
-        for round_idx in range(max_iterations):
-            logger.info(f"=== 第 {round_idx+1} 轮诊断 ===")
+        # 记录开始时间
+        start_time = time.time()
+        round_idx = 0
+        
+        while True:
+            current_time = time.time()
+            elapsed_time = current_time - start_time
+            
+            # 检查是否超时
+            if elapsed_time >= duration:
+                logger.info(f"达到超时时间 {duration}s，停止优化")
+                break
+                
+            round_idx += 1
+            logger.info(f"=== 第 {round_idx} 轮诊断 ===")
             round_start = time.time()
             round_sql_times = {}
             round_sql_actions = {}
-            for i, query_path in enumerate(queries_order):
+            for i, query_path in enumerate(queries_order):    
                 logger.info(f"处理第 {i+1}/{len(queries_order)} 条SQL")
 
                 # 读取慢SQL
@@ -259,8 +272,49 @@ class DBAgent:
                     sql_root_cause_states[query_id] = {"root_tried": set(), "current_root": None, "mode": "exploit", "confidence": {}, "attempts": {}, "successes": {}}
                     
                 state = sql_root_cause_states[query_id]
-                # epsilon-greedy 决策：explore 使用相似根因；exploit 使用小模型+LLM
-                state["mode"] = "explore" if random.random() < epsilon else "exploit"
+                
+                # 先预测根因（小模型+LLM）
+                logger.info(f"SQL {query_id} 开始预测根因")
+                current_root = state.get("current_root")
+                # 若已有 current_root，则直接复用；否则调用小模型+LLM 获取新的根因
+                if current_root is None:                        
+                    # 小模型初判 + 置信度
+                    model_out = self.planner.model_predict(query_info)
+                    current_root = model_out.get('root_causes')
+                    pred_opt = model_out.get('pred_label_opt')
+                    labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
+                    confidence = np.array(pred_opt).reshape(-1)
+                    state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
+
+                # 将当前根因和置信度传给LLM
+                # 构建按根因聚合的历史成功/失败计数
+                tuning_history = []
+                union_keys = set(state.get("attempts").keys()) | set(state.get("successes").keys())
+                for k in union_keys:
+                    # 归一化为 frozenset 或单元素集合
+                    label = list(k)
+                    tuning_history.append({
+                        "label": label,
+                        "success_count": int(state.get("successes").get(k, 0)),
+                        "fail_count": int(state.get("attempts").get(k, 0))
+                    })
+                llm_result = self.planner.llm_predict(
+                    query_info,
+                    current_root,
+                    state_confidence=state.get("confidence"),
+                    tuning_history=tuning_history
+                )
+                predicted_root = llm_result.get('root_causes')
+                state["confidence"] = llm_result.get('confidence')
+                
+                # 检查预测的根因是否已经在root_tried中
+                predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)
+                if predicted_root_key in state["root_tried"]:
+                    logger.info(f"SQL {query_id} 预测根因已在root_tried中，强制进入探索模式")
+                    state["mode"] = "explore"
+                else:
+                    # epsilon-greedy 决策：explore 使用相似根因；exploit 使用预测的根因
+                    state["mode"] = "explore" if random.random() < epsilon else "exploit"
 
                 if state["mode"] == "explore":
                     logger.info(f"SQL {query_id} 进入探索模式（archive 相似根因）")
@@ -276,38 +330,8 @@ class DBAgent:
                             next_root = random.choice(candidates)
                     state["current_root"] = next_root
                 else:
-                    logger.info(f"SQL {query_id} 进入利用模式（小模型+LLM）")
-                    current_root = state.get("current_root")
-                    # 若已有 current_root，则直接复用；否则调用小模型+LLM 获取新的根因
-                    if current_root is None:                        
-                        # 小模型初判 + 置信度
-                        model_out = self.planner.model_predict(query_info)
-                        current_root = model_out.get('root_causes')
-                        pred_opt = model_out.get('pred_label_opt')
-                        labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
-                        confidence = np.array(pred_opt).reshape(-1)
-                        state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
-
-                    # 将当前根因和置信度传给LLM
-                    # 构建按根因聚合的历史成功/失败计数
-                    tuning_history = []
-                    union_keys = set(state.get("attempts").keys()) | set(state.get("successes").keys())
-                    for k in union_keys:
-                        # 归一化为 frozenset 或单元素集合
-                        label = list(k)
-                        tuning_history.append({
-                            "label": label,
-                            "success_count": int(state.get("successes").get(k, 0)),
-                            "fail_count": int(state.get("attempts").get(k, 0))
-                        })
-                    llm_result = self.planner.llm_predict(
-                        query_info,
-                        current_root,
-                        state_confidence=state.get("confidence"),
-                        tuning_history=tuning_history
-                    )
-                    state["current_root"] = llm_result.get('root_causes')
-                    state["confidence"] = llm_result.get('confidence')
+                    logger.info(f"SQL {query_id} 进入利用模式（使用预测的根因）")
+                    state["current_root"] = predicted_root
                 
                 root_causes = state["current_root"]
                 if not root_causes:
@@ -315,53 +339,6 @@ class DBAgent:
                     continue
 
                 logger.info(f"SQL {query_id} 当前诊断根因: {root_causes}")
-
-                # if query_id == "01":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "02":
-                #     root_causes = "suboptimal plan optimizer"
-                # elif query_id == "03":
-                #     root_causes = ["inappropriate query knobs", "missing indexes"]
-                # elif query_id == "04":
-                #     root_causes = ["inappropriate query knobs", "missing indexes"]
-                # elif query_id == "05":
-                #     root_causes = ["inappropriate query knobs", "suboptimal plan optimizer", "missing indexes"]
-                # elif query_id == "06":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "07":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "08":
-                #     root_causes = ["inappropriate query knobs", "missing indexes"]
-                # elif query_id == "09":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "10":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "11":
-                #     root_causes = ["inappropriate query knobs", "missing indexes"]
-                # elif query_id == "12":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "13":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "14":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "15":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "16":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "17":
-                #     root_causes = ["inappropriate query knobs", "missing indexes"]
-                # elif query_id == "18":
-                #     root_causes = ["inappropriate query knobs", "missing indexes", "poorly written queries"]
-                # elif query_id == "19":
-                #     root_causes = "inappropriate query knobs"
-                # elif query_id == "20":
-                #     root_causes = "missing indexes"
-                # elif query_id == "21":
-                #     root_causes = ["inappropriate query knobs", "missing indexes"]
-                # elif query_id == "22":
-                #     root_causes = "missing indexes"
-                    
-                # logger.info(f"指定SQL {query_id} 根因: {root_causes}")
 
                 # 调用action_manager.step处理
                 action_result = await self.action_manager.step(query_info, root_causes, mode=state["mode"])
@@ -458,22 +435,27 @@ class DBAgent:
                     self.action_manager.rollback_action(pre_index_names, pre_knob_names)
 
 
-            round_end = time.time()
-            logger.info(f"第 {round_idx+1} 轮调优时间: {round_end - round_start:.4f}s")
+            round_end = time.time()         
+            logger.info(f"第 {round_idx} 轮调优时间: {round_end - round_start:.4f}s")
             round_total_time = sum([t for t in round_sql_times.values()])
-            logger.info(f"第 {round_idx+1} 轮workload总执行时间: {round_total_time:.4f}s")
-            logger.info(f"第 {round_idx+1} 轮各SQL执行时间: {round_sql_times}")
+            logger.info(f"第 {round_idx} 轮workload总执行时间: {round_total_time:.4f}s")
+            logger.info(f"第 {round_idx} 轮各SQL执行时间: {round_sql_times}")
             
             # if workload_best_time is None or round_total_time < workload_best_time:
             #     workload_best_time = round_total_time
             #     workload_best_actions = round_sql_actions.copy()
 
-            logger.info(f"迭代至第 {round_idx+1} 轮，各SQL最优执行时间: {best_sql_times}")
-            logger.info(f"迭代至第 {round_idx+1} 轮，workload最优总执行时间: {sum(best_sql_times.values())}")
-            logger.info(f"迭代至第 {round_idx+1} 轮，各SQL最优修复actions: {best_sql_actions}")
+            logger.info(f"迭代至第 {round_idx} 轮，各SQL最优执行时间: {best_sql_times}")
+            logger.info(f"迭代至第 {round_idx} 轮，workload最优总执行时间: {sum(best_sql_times.values())}")
+            logger.info(f"迭代至第 {round_idx} 轮，各SQL最优修复actions: {best_sql_actions}")
 
-        # logger.info(f"最优workload执行时间: {workload_best_time:.4f}s")
-        # logger.info(f"最优SQL修复actions: {workload_best_actions}")
-        # logger.info(f"各SQL最优执行时间: {best_sql_times}")
-        # logger.info(f"各SQL最优修复actions: {best_sql_actions}")
+        # 输出最终结果
+        final_time = time.time()
+        total_elapsed = final_time - start_time
+        logger.info(f"=== 优化完成 ===")
+        logger.info(f"总用时: {total_elapsed:.2f}s（超时限制: {duration}s）")
+        logger.info(f"完成轮数: {round_idx} 轮")
+        logger.info(f"各SQL最优执行时间: {best_sql_times}")
+        logger.info(f"workload最优总执行时间: {sum(best_sql_times.values()):.4f}s")
+        logger.info(f"各SQL最优修复actions: {best_sql_actions}")
         logger.info(f"诊断流程结束")
