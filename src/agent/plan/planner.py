@@ -15,25 +15,25 @@ if rcrank_path not in sys.path:
 import numpy as np
 import pandas as pd
 import json
-# import ast
-# import torch
 from agent.memory.memory_manager import MemoryManager
 from utils.types import QueryInfo, AnomalyInfo
 from agent.plan.online_predict import RCRankPredictor
 from model.modules.QueryFormer.utils import Encoding
 from RCRank.utils.plan_encoding import PlanEncoder
 from agents import Agent, Runner
-from config.base_config import PLANNER_CONFIG
 from agent.prompt import build_root_cause_diagnosis_prompt, get_root_cause_llm_instructions
 
 class Planner:
-    def __init__(self, memory_manager, predictor):
+    def __init__(self, memory_manager, predictor, agent_config):
         self.memory_manager = memory_manager
         self.predictor = predictor
+        self.agent_config = agent_config
         self.device = predictor.device
-        
+
         # Initialize encoding components
         self.encoding = Encoding(None, {'NA': 0})
+
+        self.root_cause_model = self.agent_config.get('root_cause_llm_model')
     
     def encode_plan(self, query_plan):            
         df = pd.DataFrame([{
@@ -62,7 +62,7 @@ class Planner:
     def diagnosis_agent(self, prompt):
         return Runner.run_sync(starting_agent=Agent(
         name="RootCauseLLM",
-        model="gpt-4.1",
+        model=self.root_cause_model,
         instructions=get_root_cause_llm_instructions()
         ), input=prompt).final_output.strip()
 
@@ -176,3 +176,40 @@ class Planner:
         #     "root_cause": root_causes,
         #     "confidence": root_causes_confidence
         # }
+
+    def predict(self, query_info, state, memory_manager):
+        # 若已有 current_root，则直接复用；否则调用小模型+LLM 获取新的根因
+        current_root = state.get("current_root")
+        if current_root is None:                        
+            # 小模型初判 + 置信度
+            model_out = self.model_predict(query_info)
+            current_root = model_out.get('root_causes')
+            print("小模型预测根因: ", current_root)
+            pred_opt = model_out.get('pred_label_opt')
+            labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
+            confidence = np.array(pred_opt).reshape(-1)
+            state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
+
+        # 将当前根因和置信度传给LLM
+        # 构建按根因聚合的历史成功/失败计数
+        tuning_history = []
+        union_keys = set(state.get("attempts", {}).keys()) | set(state.get("successes", {}).keys())
+        for k in union_keys:
+            # 归一化为 frozenset 或单元素集合
+            label = list(k)
+            tuning_history.append({
+                "label": label,
+                "success_count": int(state.get("successes", {}).get(k, 0)),
+                "fail_count": int(state.get("attempts", {}).get(k, 0))
+            })
+        
+        llm_result = self.llm_predict(
+            query_info,
+            current_root,
+            state_confidence=state.get("confidence"),
+            tuning_history=tuning_history
+        )
+        predicted_root = llm_result.get('root_causes')
+        state["confidence"] = llm_result.get('confidence')
+        
+        return predicted_root, state

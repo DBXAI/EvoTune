@@ -6,6 +6,10 @@ diagnostic_results/**
 .pytest_cache/
 src/agent/plan/model_res/**
 config/base_config.py
+config/base_config.json
+config/base_config.yaml
+config/tidb_config.json
+config/tidb_config.py
 src/agent/plan/RCRank/bert-base-uncased/**
 src/memory_results*
 test_sql_gen/data/**

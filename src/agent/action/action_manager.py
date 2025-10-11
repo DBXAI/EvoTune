@@ -10,7 +10,6 @@ from agents import Agent, Runner
 from agents.mcp import MCPServerStdio, MCPServerSse
 from agents._config import set_default_openai_api
 from agent.action import diagnose_tools
-from config.base_config import POSTGRES_CONFIG
 import nest_asyncio
 import re
 
@@ -21,7 +20,6 @@ if project_root not in sys.path:
 
 from agent.memory.memory_manager import MemoryManager
 from src.utils.types import QueryInfo, AnomalyInfo
-from config.base_config import API_SETTINGS
 from src.database.pg_env import PostgresDB
 from agent.prompt import *
 
@@ -40,10 +38,6 @@ def delete_all_loggers():
 
 delete_all_loggers()
 
-# 设置使用 chat_completions API
-os.environ['OPENAI_API_KEY'] = API_SETTINGS['openai']['api_key']
-os.environ['OPENAI_BASE_URL'] = API_SETTINGS['openai']['base_url']
-set_default_openai_api("chat_completions")
 
 class ServerConfig:
     def __init__(self, name, server_type, params):
@@ -95,20 +89,36 @@ class MultiServerManager:
             self.servers.clear()
 
 class ActionManager:
-    def __init__(self, config_path = None, memory_manager = None, db = None, planner = None):
+    def __init__(self, memory_manager, db, planner, configs):
         self.db = db
         self.memory_manager = memory_manager
         self.planner = planner
+        self.agent_config = configs.get('AGENT_CONFIG')
+        self.configs = configs
 
-        self.config_path = config_path or os.path.join(os.path.dirname(__file__), 'action_server_config.yaml')
+        
         self.agent = None
         self.server_manager = None
         self.exit_stack = AsyncExitStack()
         self._servers = []
+        
+        self.fix_model = self.agent_config.get('fix_agent_model')
+        self.diagnostic_model = self.agent_config.get('diagnostic_agent_model')
+        self.sql_timeout = self.agent_config.get('sql_execution_timeout')
+        self.config_path = self.agent_config.get('action_server_config')
+        self.fix_timeout = self.agent_config.get('fix_timeout')
+
+        self.api_settings = self.configs.get('API_SETTINGS')
+        
+        if self.api_settings:
+            openai_config = self.api_settings.get('openai')
+            os.environ['OPENAI_API_KEY'] = openai_config.get('api_key')
+            os.environ['OPENAI_BASE_URL'] = openai_config.get('base_url')
+            set_default_openai_api("chat_completions")
+
         self.fixAgent = Agent(
             name="FixAgent",
-            # model="gpt-4.1",
-            model="gpt-4.1",
+            model=self.fix_model,
             instructions=get_fix_agent_instructions(),
         )
 
@@ -144,11 +154,7 @@ class ActionManager:
         
         self.agent = Agent(
             name="DBDiagnosticAgent",
-            # model="gpt-4o-mini",
-            # model="o3-mini",
-            # model="o4-mini",
-            # model="gpt-4.1",
-            model="gpt-4.1",
+            model=self.diagnostic_model,
             instructions=get_diagnostic_agent_instructions(),
             mcp_servers=self._servers,
         )
@@ -171,12 +177,13 @@ class ActionManager:
         # 3. action_define
         # 4. action_generate
         # 5. evaluate_action
-        base_info = diagnose_tools.base_information_collect(query_info, POSTGRES_CONFIG)
+        postgres_config = self.configs.get('POSTGRES_CONFIG')
+        base_info = diagnose_tools.base_information_collect(query_info, postgres_config)
         
         retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
-        
         positives = retrieval.get('positive', [])
         negatives = retrieval.get('negative', [])
+        
         action_space = await self.action_space_collect(root_cause)
         action_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
 
@@ -226,7 +233,7 @@ class ActionManager:
 
         # 1. 检查修复SQL能否执行（如有 DDL/SET 等修复，需先执行）
         if fix_action != "":
-            success, _, _, err = self.db.execute(fix_action)
+            success, _, _, err = self.db.execute(fix_action, timeout=self.fix_timeout)
         else:
             success = True
             err = ""
@@ -238,7 +245,7 @@ class ActionManager:
             new_fix_action = result.final_output
             print(f"new_fix_action: {new_fix_action}")
             new_fix_action, new_fix_sql = await self.derive_fix_action_and_sql(new_fix_action, rewrite_sql, query_info.query)
-            success, _, _, err = self.db.execute(new_fix_action)
+            success, _, _, err = self.db.execute(new_fix_action, timeout=self.fix_timeout)
             fix_action = new_fix_action
             fix_sql = new_fix_sql
             retry_count += 1
@@ -248,7 +255,7 @@ class ActionManager:
         old_time = query_info.execution_time
 
         # 执行性能测试
-        success, _, new_time, err = self.db.execute(fix_sql, timeout=20)
+        success, _, new_time, err = self.db.execute(fix_sql, timeout=self.sql_timeout)
 
         if fix_action != "":
             index_names = self.extract_index_names(fix_action)
@@ -376,7 +383,9 @@ class ActionManager:
                 return new_action_result
 
     async def action_space_collect(self, root_causes):
-        return build_action_space_prompt(root_causes, self.db)
+        knob_config = self.configs.get('KNOB_CONFIG')
+        current_knob_values = self.db.get_current_knob_values(knob_config)
+        return build_action_space_prompt(root_causes, self.db, knob_config, current_knob_values)
 
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)

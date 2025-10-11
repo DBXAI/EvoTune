@@ -6,6 +6,7 @@ import time
 import itertools
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from typing import Optional, List
 from utils.types import QueryInfo, CaseInfo
 import numpy as np
 from numpy.linalg import norm
@@ -27,34 +28,28 @@ class MemoryCase:
     case_info: CaseInfo
     timestamp: float = field(default_factory=time.time)
     metrics: dict = field(default_factory=dict)
-    sql_embedding = None
-    action_embedding = None
+    sql_embedding: Optional[List[float]] = None
+    action_embedding: Optional[List[float]] = None
 
 class MemoryManager:
-    def __init__(self, db_path="memory.db", archive_size=20, root_cause_types=None,
-                 finetune_threshold=220, finetune_epochs=50, finetune_batch_size=8,
-                 finetune_device="cpu", model_output_dir="/root/DREAM/src/agent/plan/model_res",
-                 bce_weight=0.7, contrastive_weight=0.3, enable_finetune=True,
-                 predictor=None):
-        self.db_path = db_path
-        self.archive_size = archive_size
+    def __init__(self, config, predictor=None):
+        self.db_path = config.get('db_path')
+        self.archive_size = config.get('archive_size')
         self.cases = {}
         self.archive = set()
         self.best_case_id = None
 
-        self.enable_finetune = enable_finetune
-        self.finetune_threshold = finetune_threshold
-        self.finetune_epochs = finetune_epochs
-        self.finetune_batch_size = finetune_batch_size
-        self.finetune_device = finetune_device
-        self.model_output_dir = model_output_dir
+        self.enable_finetune = config.get('enable_finetune')
+        self.finetune_threshold = config.get('finetune_threshold')
+        self.finetune_epochs = config.get('finetune_epochs')
+        self.finetune_batch_size = config.get('finetune_batch_size')
+        self.finetune_device = config.get('finetune_device')
+        self.model_output_dir = config.get('model_output_dir')
         
-        self.bce_weight = bce_weight
-        self.contrastive_weight = contrastive_weight
+        self.bce_weight = config.get('bce_weight')
+        self.contrastive_weight = config.get('contrastive_weight')
 
-        self.root_cause_types = root_cause_types or [
-            "missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"
-        ]
+        self.root_cause_types = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
         # 假设有15种root cause，支持多根因组合
         self.island_keys = self._generate_island_keys(self.root_cause_types)
         self.islands = {key: set() for key in self.island_keys}

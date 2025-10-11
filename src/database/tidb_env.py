@@ -8,9 +8,8 @@ import subprocess
 import psutil
 import socket
 
-class TiDBConnector:
-    def __init__(self, host: str, port: int, user: str, password: str, database: str, db_type: str,
-                 ssl_mode: str = "VERIFY_IDENTITY", ssl_ca: str = "/etc/ssl/certs/ca-certificates.crt"):
+class TiDB:
+    def __init__(self, db_config):
         """
         初始化TiDB连接器
         
@@ -24,14 +23,14 @@ class TiDBConnector:
             ssl_mode: SSL模式 (DISABLED, REQUIRED, VERIFY_IDENTITY)
             ssl_ca: SSL证书路径
         """
-        self.host = host
-        self.port = port
-        self.user = user
-        self.password = password
-        self.database = database
-        self.ssl_mode = ssl_mode
-        self.ssl_ca = ssl_ca
-        self.db_type = db_type
+        self.host = db_config['host']
+        self.port = db_config['port']
+        self.user = db_config['user']
+        self.password = db_config['password']
+        self.database = db_config['dbname']
+        self.ssl_mode = db_config.get('ssl_mode', 'VERIFY_IDENTITY')
+        self.ssl_ca = db_config.get('ssl_ca', '/etc/ssl/certs/ca-certificates.crt')
+        self.db_type = db_config.get('db_type', 'tidb')
         self.connection = None
         
     def _check_tidb_running(self):

@@ -9,17 +9,18 @@ from decimal import Decimal
 import re
 
 class PostgresDB:
-    def __init__(self, user, password, host, port, dbname, workload_type, postgres_path = None, postgres_data = None, log_path = None):
-        self.user = user
-        self.password = password
-        self.host = host
-        self.port = port
-        self.dbname = dbname
+    def __init__(self, db_config):
+        self.user = db_config['user']
+        self.password = db_config['password']
+        self.host = db_config['host']
+        self.port = db_config['port']
+        self.dbname = db_config['dbname']
         self.db_type = 'postgresql'
-        self.workload_type = workload_type
-        self.postgres_path = postgres_path
-        self.postgres_data = postgres_data
-        self.log_path = log_path
+        self.workload_type = db_config.get('workload_type', 'OLAP')
+        self.postgres_path = db_config.get('postgres_path')
+        self.postgres_data = db_config.get('postgres_data')
+        self.log_path = db_config.get('log_path')
+        self.query_timeout = db_config.get('query_timeout')
 
         self.conn_str = self._connect_str()
         self.connection = None
@@ -44,9 +45,12 @@ class PostgresDB:
             self.connection = psycopg.connect(self.conn_str, autocommit=True, prepare_threshold=None)
         return self.connection
 
-    def execute(self, sql, conn=None, timeout=0):
+    def execute(self, sql, conn=None, timeout=None):
         if conn is None:
             conn = self.connect()
+        
+        if timeout is None:
+            timeout = self.query_timeout
         
         with conn.cursor() as cur:
             try:
@@ -66,7 +70,10 @@ class PostgresDB:
             except Exception as e:
                 return False, None, timeout, str(e)
 
-    def fetch_results(self, sql, as_json=False, timeout=0):
+    def fetch_results(self, sql, as_json=False, timeout=None):
+        if timeout is None:
+            timeout = self.query_timeout
+            
         conn = self.connect()
         with conn.cursor() as cursor:
             try:
@@ -152,6 +159,36 @@ class PostgresDB:
         AND indexname NOT LIKE 'pg_%';
         """
         return self.fetch_results(sql)
+
+    def get_current_knob_values(self, knob_config):
+        current_values = {
+            'system_knobs': {},
+            'query_knobs': {}
+        }
+
+        if 'system_knobs' in knob_config:
+            system_knobs = list(knob_config['system_knobs'].keys())
+            if system_knobs:
+                sql = f"SELECT name, setting FROM pg_settings WHERE name IN {tuple(system_knobs)};"
+                results = self.fetch_results(sql, as_json=True)
+                if results:
+                    if isinstance(results, str):
+                        results = json.loads(results)
+                    for row in results:
+                        current_values['system_knobs'][row['name']] = row['setting']
+        
+        if 'query_knobs' in knob_config:
+            query_knobs = list(knob_config['query_knobs'].keys())
+            if query_knobs:
+                sql = f"SELECT name, setting FROM pg_settings WHERE name IN {tuple(query_knobs)};"
+                results = self.fetch_results(sql, as_json=True)
+                if results:
+                    if isinstance(results, str):
+                        results = json.loads(results)
+                    for row in results:
+                        current_values['query_knobs'][row['name']] = row['setting']
+            
+        return current_values
 
     def fetch_schema_info(self):
         sql = """
@@ -461,16 +498,19 @@ class PostgresDB:
                 diff[table] = table_diff
         return diff
     
-    def run_sql_and_collect_all(self, sql, interval=1, warmup=0, duration=20):
+    def run_sql_and_collect_all(self, sql, interval=1, warmup=0, timeout=None):
+        if timeout is None:
+            timeout = self.query_timeout
+            
         conn = self.connect()
 
         log_before = self.collect_metrics(conn)
         plan = self.get_plan(sql)
         pid = self.get_pid()
-        monitor = ResourceMonitor(pid, interval, warmup, duration)
+        monitor = ResourceMonitor(pid, interval, warmup, timeout)
         monitor.run()
 
-        _, _, execution_time, _ = self.execute(sql, timeout=duration)
+        _, _, execution_time, _ = self.execute(sql, timeout=timeout)
 
         monitor.terminate()
         cpu_usage, read_io, write_io, virtual_memory, physical_memory, net_recv, net_sent = monitor.get_monitor_data()

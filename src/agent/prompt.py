@@ -221,7 +221,7 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negati
     }}"""
 
 
-def build_action_space_prompt(root_causes, db=None):
+def build_action_space_prompt(root_causes, db, knob_config, current_knob_values):
     """Build action space prompt based on root causes."""
     # 根因
     root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
@@ -231,73 +231,46 @@ def build_action_space_prompt(root_causes, db=None):
     
     # 索引相关
     if "missing indexes" in root_causes:
+        current_indexes = db.get_indexes() if db else []
         action_space_prompt += f"""
     • Index Space: 
     - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx.
     - Index creation should be strictly guided by the slow_sql queries.
     - Consider the query execution plan to identify missing indexes that could improve performance.
     - Avoid generating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
-    - Do not conflict with the existing indexes in the database: {db.get_indexes()}
+    - Do not conflict with the existing indexes in the database: {current_indexes}
     """
     
     # Knob相关
     if "inappropriate query knobs" in root_causes:
-        action_space_prompt += """
+        system_knobs_specs = knob_config.get('system_knobs')
+        current_values = current_knob_values.get('system_knobs')
+        
+        knob_lines = []
+        for knob_name, spec in system_knobs_specs.items():
+            current_val = current_values.get(knob_name)
+            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
+        
+        action_space_prompt += f"""
     • Knob Space:  
     - Knob Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
-    constraint_exclusion: type: enum, min: null, max: null, default: partition
-    cpu_index_tuple_cost: type: float, min: 0.0, max: 10, default: 0.005
-    cpu_operator_cost: type: float, min: 0.0, max: 1, default: 0.0025
-    cpu_tuple_cost: type: float, min: 0.0, max: 10, default: 0.01
-    cursor_tuple_fraction: type: float, min: 0.0, max: 1.0, default: 0.1
-    default_statistics_target: type: integer, min: 1, max: 5000, default: 100
-    effective_cache_size: type: integer, min: 1, max: 2147483647, default: 524288
-    from_collapse_limit: type: integer, min: 1, max: 24, default: 8
-    geqo: type: boolean, min: 0, max: 1, default: 0
-    hash_mem_multiplier: type: float, min: 1.0, max: 1000.0, default: 2.0
-    jit: type: boolean, min: 0, max: 1, default: 1
-    jit_above_cost: type: float, min: -1.0, max: 500000, default: 100000.0
-    jit_expressions: type: boolean, min: 0, max: 1, default: 1
-    jit_inline_above_cost: type: float, min: -1.0, max: 5000000, default: 500000.0
-    jit_optimize_above_cost: type: float, min: -1.0, max: 5000000, default: 500000.0
-    jit_tuple_deforming: type: boolean, min: 0, max: 1, default: 1
-    join_collapse_limit: type: integer, min: 1, max: 24, default: 8
-    max_parallel_workers: type: integer, min: 0, max: 1024, default: 8
-    max_parallel_workers_per_gather: type: integer, min: 0, max: 1024, default: 2
-    min_parallel_index_scan_size: type: integer, min: 0, max: 715827882, default: 64
-    min_parallel_table_scan_size: type: integer, min: 0, max: 715827882, default: 1024
-    parallel_setup_cost: type: float, min: 0.0, max: 50000.0, default: 1000.0
-    parallel_tuple_cost: type: float, min: 0.0, max: 10, default: 0.1
-    plan_cache_mode: type: enum, min: null, max: null, default: auto
-    random_page_cost: type: float, min: 0.0, max: 100, default: 4.0
-    seq_page_cost: type: float, min: 0.0, max: 100, default: 1.0
-    work_mem: type: integer, min: 64, max: 2147483647, default: 4096
+    {chr(10).join(knob_lines)}
     """
     
     # 执行计划/优化器相关
     if "suboptimal plan optimizer" in root_causes:
-        action_space_prompt += """
+        query_knobs_specs = knob_config.get('query_knobs')
+        current_values = current_knob_values.get('query_knobs')
+        
+        knob_lines = []
+        for knob_name, spec in query_knobs_specs.items():
+            current_val = current_values.get(knob_name)
+            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
+        
+        action_space_prompt += f"""
     • Plan Optimizer Space: 
     - Plan Optimizer Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
-    enable_async_append: type: boolean, min: 0, max: 1, default: 1
-    enable_bitmapscan: type: boolean, min: 0, max: 1, default: 1
-    enable_gathermerge: type: boolean, min: 0, max: 1, default: 1
-    enable_hashagg: type: boolean, min: 0, max: 1, default: 1
-    enable_hashjoin: type: boolean, min: 0, max: 1, default: 1
-    enable_incremental_sort: type: boolean, min: 0, max: 1, default: 1
-    enable_indexonlyscan: type: boolean, min: 0, max: 1, default: 1
-    enable_indexscan: type: boolean, min: 0, max: 1, default: 1
-    enable_material: type: boolean, min: 0, max: 1, default: 1
-    enable_memoize: type: boolean, min: 0, max: 1, default: 1
-    enable_mergejoin: type: boolean, min: 0, max: 1, default: 1
-    enable_nestloop: type: boolean, min: 0, max: 1, default: 1
-    enable_parallel_append: type: boolean, min: 0, max: 1, default: 1
-    enable_parallel_hash: type: boolean, min: 0, max: 1, default: 1
-    enable_partition_pruning: type: boolean, min: 0, max: 1, default: 1
-    enable_partitionwise_aggregate: type: boolean, min: 0, max: 1, default: 0
-    enable_partitionwise_join: type: boolean, min: 0, max: 1, default: 0
-    enable_seqscan: type: boolean, min: 0, max: 1, default: 1
-    enable_sort: type: boolean, min: 0, max: 1, default: 1
+    {chr(10).join(knob_lines)}
     - **IMPORTANT**: When using Plan Optimizer Space, output ONLY the hint block. Do NOT include the original SQL. Example: /*+ Set(enable_hashjoin on) Set(enable_sort on) */"""
 
     # SQL 可读性/重写相关

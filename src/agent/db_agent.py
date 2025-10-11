@@ -26,8 +26,8 @@ from agent.action.action_manager import ActionManager
 from agent.memory.memory_manager import MemoryManager
 from utils.types import QueryInfo, AnomalyInfo
 from src.database.pg_env import PostgresDB
+from src.database.tidb_env import TiDB
 from agent.plan.online_predict import RCRankPredictor
-from config.base_config import PLANNER_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -36,33 +36,28 @@ logger.setLevel(logging.INFO)
 logger.propagate = True
 
 class DBAgent:
-    def __init__(self, configs=None, memory_path = "memory_results", max_attempts = 10):
+    def __init__(self, configs=None):
         self.configs = configs
-        self.db = PostgresDB(
-            user=configs['POSTGRES_CONFIG']['user'],
-            password=configs['POSTGRES_CONFIG']['password'],
-            host=configs['POSTGRES_CONFIG']['host'],
-            port=configs['POSTGRES_CONFIG']['port'],
-            dbname=configs['POSTGRES_CONFIG']['dbname'],
-            workload_type=configs['POSTGRES_CONFIG']['workload_type'],
-            postgres_path=configs['POSTGRES_CONFIG']['postgres_path'],
-            postgres_data=configs['POSTGRES_CONFIG']['postgres_data'],
-            log_path=configs['POSTGRES_CONFIG']['log_path']
-        )
+        self.agent_config = configs.get('AGENT_CONFIG')
+        
+        db_type = configs.get('DATABASE_TYPE', 'postgres')
+        if db_type.lower() == 'postgres':
+            db_config = configs.get('POSTGRES_CONFIG')
+            self.db = PostgresDB(db_config)
+            logger.info("使用PostgreSQL数据库")
+        elif db_type.lower() == 'tidb':
+            db_config = configs.get('TiDB_CONFIG')
+            self.db = TiDB(db_config)
+            logger.info("使用TiDB数据库")
 
-        # 初始化 RCRankPredictor 并注入到组件
-        predictor = RCRankPredictor(
-            model_path=PLANNER_CONFIG['model_path'],
-            train_data_path=PLANNER_CONFIG['train_data_path'],
-            device=PLANNER_CONFIG['device'],
-            opt_threshold=PLANNER_CONFIG['opt_threshold'],
-            num_classes=PLANNER_CONFIG['num_classes']
-        )
+        rcrank_config = configs.get('RCRANK_PREDICTOR_CONFIG')
+        predictor = RCRankPredictor(rcrank_config)
 
-        self.memory_manager = MemoryManager(memory_path, predictor=predictor)
-        self.planner = Planner(self.memory_manager, predictor=predictor)
-        self.action_manager = ActionManager(memory_manager=self.memory_manager, db=self.db, planner=self.planner)
-        self.max_attempts = max_attempts
+        memory_config = configs.get('MEMORY_MANAGER_CONFIG')
+        self.memory_manager = MemoryManager(memory_config, predictor=predictor)
+        
+        self.planner = Planner(self.memory_manager, predictor=predictor, agent_config=self.agent_config)
+        self.action_manager = ActionManager(memory_manager=self.memory_manager, db=self.db, planner=self.planner, configs=configs)
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -194,7 +189,7 @@ class DBAgent:
             elapsed_time = current_time - start_time
             
             # 检查是否超时
-            if elapsed_time >= duration:
+            if elapsed_time >= duration*3600:
                 logger.info(f"达到超时时间 {duration}s，停止优化")
                 break
                 
@@ -227,7 +222,7 @@ class DBAgent:
                         pre_knob_names = self.action_manager.extract_knob_names(pre_fix_action)
                         pre_applied = True
 
-                result = self.db.run_sql_and_collect_all(collected_sql, duration=20)
+                result = self.db.run_sql_and_collect_all(collected_sql)
 
                 # 构建 QueryInfo；若 collected_sql 与 original_sql 不同，视为 rewrite
                 query_info = QueryInfo(
@@ -252,39 +247,9 @@ class DBAgent:
                     
                 state = sql_root_cause_states[query_id]
                 
-                # 先预测根因（小模型+LLM）
+                # 预测根因
                 logger.info(f"SQL {query_id} 开始预测根因")
-                current_root = state.get("current_root")
-                # 若已有 current_root，则直接复用；否则调用小模型+LLM 获取新的根因
-                if current_root is None:                        
-                    # 小模型初判 + 置信度
-                    model_out = self.planner.model_predict(query_info)
-                    current_root = model_out.get('root_causes')
-                    pred_opt = model_out.get('pred_label_opt')
-                    labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
-                    confidence = np.array(pred_opt).reshape(-1)
-                    state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
-
-                # 将当前根因和置信度传给LLM
-                # 构建按根因聚合的历史成功/失败计数
-                tuning_history = []
-                union_keys = set(state.get("attempts").keys()) | set(state.get("successes").keys())
-                for k in union_keys:
-                    # 归一化为 frozenset 或单元素集合
-                    label = list(k)
-                    tuning_history.append({
-                        "label": label,
-                        "success_count": int(state.get("successes").get(k, 0)),
-                        "fail_count": int(state.get("attempts").get(k, 0))
-                    })
-                llm_result = self.planner.llm_predict(
-                    query_info,
-                    current_root,
-                    state_confidence=state.get("confidence"),
-                    tuning_history=tuning_history
-                )
-                predicted_root = llm_result.get('root_causes')
-                state["confidence"] = llm_result.get('confidence')
+                predicted_root, state = self.planner.predict(query_info, state, self.memory_manager)
                 
                 # 检查预测的根因是否已经在root_tried中
                 predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)

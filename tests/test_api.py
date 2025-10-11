@@ -6,8 +6,8 @@ from pydantic import BaseModel
 from agents import Agent, Runner, function_tool
 
  # 设置大模型API
-os.environ['OPENAI_API_KEY'] = "sk-6B29GYJUvOdinhDgD4Be997d5b2a4e399dA5B7F2A275F3B6"
-os.environ['OPENAI_BASE_URL'] = "https://api.gpt.ge/v1/"
+os.environ['OPENAI_API_KEY'] = ""
+os.environ['OPENAI_BASE_URL'] = ""
 set_default_openai_api("chat_completions")
  
  

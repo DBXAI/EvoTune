@@ -15,7 +15,6 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from src.database.pg_env import PostgresDB
-from config.base_config import KNOB_CONFIG
 import jpype as jp
 
 # 初始化 FastMCP 服务器
@@ -138,17 +137,7 @@ def extract_columns(parsed, postgres_config):
     return [t for t in columns if t in existing_columns and t != "*"]
 
 def base_information_collect(query_info, postgres_config):
-    postgres_db = PostgresDB(
-        user=postgres_config['user'], 
-        password=postgres_config['password'], 
-        host=postgres_config['host'], 
-        port=postgres_config['port'], 
-        dbname=postgres_config['dbname'], 
-        workload_type=postgres_config['workload_type'],
-        postgres_path=postgres_config['postgres_path'],
-        postgres_data=postgres_config['postgres_data'], 
-        log_path=postgres_config['log_path']
-    )
+    postgres_db = PostgresDB(postgres_config)
 
     db_info = {
         'db_type': postgres_db.db_type,
@@ -314,44 +303,24 @@ async def query_info_collect(query, postgres_config):
     return query_info
 
 @mcp.tool()
-async def system_knobs_info_collect(postgres_config):
-    postgres_db = PostgresDB(
-        user=postgres_config['user'], 
-        password=postgres_config['password'], 
-        host=postgres_config['host'], 
-        port=postgres_config['port'], 
-        dbname=postgres_config['dbname'], 
-        workload_type=postgres_config['workload_type'],
-        postgres_path=postgres_config['postgres_path'],
-        postgres_data=postgres_config['postgres_data'], 
-        log_path=postgres_config['log_path']
-    )
+async def system_knobs_info_collect(postgres_config, knob_config):
+    postgres_db = PostgresDB(postgres_config)
 
     system_knobs_info = {}
 
-    system_knobs = tuple(KNOB_CONFIG["system_knobs"].keys())
+    system_knobs = tuple(knob_config["system_knobs"].keys())
     sql = f"SELECT name, setting FROM pg_settings WHERE name IN {system_knobs};"
     system_knobs_info = postgres_db.fetch_results(sql, json=True)
     
     return system_knobs_info
 
 @mcp.tool()
-async def query_knobs_info_collect(postgres_config):
-    postgres_db = PostgresDB(
-        user=postgres_config['user'], 
-        password=postgres_config['password'], 
-        host=postgres_config['host'], 
-        port=postgres_config['port'], 
-        dbname=postgres_config['dbname'], 
-        workload_type=postgres_config['workload_type'],
-        postgres_path=postgres_config['postgres_path'],
-        postgres_data=postgres_config['postgres_data'], 
-        log_path=postgres_config['log_path']
-    )
+async def query_knobs_info_collect(postgres_config, knob_config):
+    postgres_db = PostgresDB(postgres_config)
 
     query_knobs_info = {}
 
-    query_knobs = tuple(KNOB_CONFIG["query_knobs"].keys())
+    query_knobs = tuple(knob_config["query_knobs"].keys())
     sql = f"SELECT name, setting FROM pg_settings WHERE name IN {query_knobs};"
     query_knobs_info = postgres_db.fetch_results(sql, json=True)
     
@@ -469,25 +438,15 @@ async def indexes_action_space(query):
     return indexes_action_spaces_prompt
 
 @mcp.tool()
-async def system_knobs_action_space(postgres_config):
+async def system_knobs_action_space(postgres_config, knob_config):
 
     #这里还可以缩小到一个只调整和query相关的knobs的空间
 
-    postgres_db = PostgresDB(
-        user=postgres_config['user'], 
-        password=postgres_config['password'], 
-        host=postgres_config['host'], 
-        port=postgres_config['port'], 
-        dbname=postgres_config['dbname'], 
-        workload_type=postgres_config['workload_type'],
-        postgres_path=postgres_config['postgres_path'],
-        postgres_data=postgres_config['postgres_data'], 
-        log_path=postgres_config['log_path']
-    )
+    postgres_db = PostgresDB(postgres_config)
 
     knob_info = {}
 
-    for knob in KNOB_CONFIG["system_knobs"].keys():
+    for knob in knob_config["system_knobs"].keys():
         sql = f"""
         SELECT unit, vartype, min_val, max_val, boot_val, short_desc
         FROM pg_settings
@@ -613,23 +572,13 @@ async def rewrite_action_space(sql, postgres_config):
     return rewrite_action_space_prompt
 
 @mcp.tool()
-async def query_knobs_action_space(postgres_config):
+async def query_knobs_action_space(postgres_config, knob_config):
 
-    postgres_db = PostgresDB(
-        user=postgres_config['user'], 
-        password=postgres_config['password'], 
-        host=postgres_config['host'], 
-        port=postgres_config['port'], 
-        dbname=postgres_config['dbname'], 
-        workload_type=postgres_config['workload_type'],
-        postgres_path=postgres_config['postgres_path'],
-        postgres_data=postgres_config['postgres_data'], 
-        log_path=postgres_config['log_path']
-    )
+    postgres_db = PostgresDB(postgres_config)
 
     knob_info = {}
 
-    for knob in KNOB_CONFIG["query_knobs"].keys():
+    for knob in knob_config["query_knobs"].keys():
         sql = f"""
         SELECT unit, vartype, min_val, max_val, boot_val, short_desc
         FROM pg_settings
@@ -666,7 +615,7 @@ async def plan_action_space(query):
     # hint_actions += ["/*+ Set(GUC-param value) */"]
 
     # 1. Query Knob
-    for knob in KNOB_CONFIG["query_knobs"].keys():
+    for knob in knob_config["query_knobs"].keys():
         hint_actions += [
             f"/*+ Set({knob} on) */",
             f"/*+ Set({knob} off) */"

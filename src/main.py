@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 import logging
 import os
+import json
 from datetime import datetime
 
 # add project root to Python path
@@ -44,7 +45,6 @@ def setup_logging():
 
 setup_logging()
 
-from config.base_config import POSTGRES_CONFIG, KNOB_CONFIG, API_SETTINGS
 from agent.db_agent import DBAgent
 
 def parse_args():
@@ -52,6 +52,8 @@ def parse_args():
     parser.add_argument('--data_path', type=str, required=True, help='慢查询数据文件路径')
     parser.add_argument('--order', type=str, required=True, help='慢查询执行顺序')
     parser.add_argument('--duration', type=int, default=30, help='调优时间')
+    parser.add_argument('--config', type=str, required=True, help='配置文件路径')
+    
     return parser.parse_args()
 
 async def main():
@@ -63,18 +65,21 @@ async def main():
     logger.info(f"启动DREAM数据库诊断系统")
     logger.info(f"数据路径: {args.data_path}")
     logger.info(f"执行顺序: {args.order}")
-    logger.info(f"调优时间: {args.duration}")
+    logger.info(f"调优时间: {args.duration} 小时")
+    logger.info(f"配置文件: {args.config}")
     
-    configs = {
-        'POSTGRES_CONFIG': POSTGRES_CONFIG,
-        'KNOB_CONFIG': KNOB_CONFIG,
-        'API_SETTINGS': API_SETTINGS
-    }
+    # 加载JSON配置文件
+    with open(args.config, 'r', encoding='utf-8') as f:
+        configs = json.load(f)
+    
+    
     async with DBAgent(configs=configs) as agent:
         await agent.run(
             slow_query_path=args.data_path,
             order=args.order,
-            duration=args.duration
+            duration=args.duration,
+            no_improvement_threshold=configs['AGENT_CONFIG']['no_improvement_threshold'],
+            epsilon=configs['AGENT_CONFIG']['epsilon']
         )
 
 if __name__ == "__main__":

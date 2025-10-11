@@ -24,22 +24,22 @@ from model.modules.TSModel.ts_model import CustomConvAutoencoder
 from RCRank.utils.plan_encoding import PlanEncoder
 
 class RCRankPredictor:
-    def __init__(self, model_path="/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt", 
-                train_data_path="/root/DREAM/src/agent/plan/slow_sql_data_gen.csv", device='cpu', opt_threshold=0.1, num_classes=4):
-        self.device = device
-        self.num_classes = num_classes
-        self.model_path = model_path
+    def __init__(self, config):
+        self.device = config.get('device', 'cpu')
+        self.num_classes = config.get('num_classes', 4)
+        self.model_path = config.get('model_path')
+        train_data_path = config.get('train_data_path')
         
         # Get the absolute path to bert-base-uncased
         current_dir = os.path.dirname(os.path.abspath(__file__))
         bert_path = os.path.join(current_dir, "RCRank/bert-base-uncased")
         
         self.tokenizer = BertTokenizer.from_pretrained(bert_path)
-        self.opt_threshold = opt_threshold
+        self.opt_threshold = config.get('opt_threshold', 0.5)
         self.pred_type = "multilabel"
         
         self.plan_args = Args()
-        self.plan_args.device = device
+        self.plan_args.device = self.device
         self.para_args = ArgsPara()
         
         self._compute_statistics(train_data_path)
@@ -75,17 +75,17 @@ class RCRankPredictor:
             l_hidden_dim=64,
             t_hidden_him=64,
             emb_dim=32,
-            device=device,
+            device=self.device,
             plan_args=self.plan_args,
             sql_model=sql_model,
             cross_model=fuse_model,
             time_model=time_model,
             rootcause_cross_model=rootcause_cross_model
-        ).to(device)
+        ).to(self.device)
         
         # load pre-trained model
-        print(f"Loading model from {model_path}")
-        self.model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"Loading model from {self.model_path}")
+        self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
         self.model.eval()
 
     def _compute_statistics(self, train_data_path):
@@ -138,7 +138,7 @@ class RCRankPredictor:
             log = log.to(self.device)
             
             pred_label_opt, _ = self.model(sql, plan, timeseries, log)
-            pred_label = torch.where(pred_label_opt > 0.5, 1, 0)
+            pred_label = torch.where(pred_label_opt > self.opt_threshold, 1, 0)
             
             return pred_label_opt, pred_label
 
@@ -169,12 +169,13 @@ def load_sample_data(data_path):
     
     return sample
 
-def online_predict(data_path):
+def online_predict(data_path, opt_threshold=0.5, num_classes=4):
     predictor = RCRankPredictor(
         model_path="model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
         train_data_path=data_path,
         device='cpu',
-        opt_threshold=0.5
+        opt_threshold=opt_threshold,
+        num_classes=num_classes
     )
     
     sample = load_sample_data(data_path)
