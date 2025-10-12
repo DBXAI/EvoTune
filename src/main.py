@@ -59,6 +59,7 @@ def parse_args():
 async def main():
     # cd /root/DREAM/src
     # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --duration 10
+    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --duration 1 --config /root/DREAM/config/base_config.json
     logger = logging.getLogger(__name__)
     
     args = parse_args()

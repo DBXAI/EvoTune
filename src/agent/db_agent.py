@@ -316,7 +316,7 @@ class DBAgent:
                 if evaluation_result.get("status") == -1:
                     print(evaluation_result.get("msg"))
                     logger.info(f"SQL {query_id} 修复失败，执行下一条SQL语句")
-                    new_time = 20
+                    new_time = self.agent_config.get("sql_execution_timeout")
                     # 保存案例并获取修正后的根因
                     case_id = self.memory_manager.save_case(query_info, fix_action, root_causes, old_time, new_time, "negative")
                     # 获取修正后的根因

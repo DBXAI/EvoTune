@@ -322,3 +322,83 @@ def get_root_cause_llm_instructions():
     """Get instructions for the root cause diagnosis LLM."""
     return """You are a database slow SQL root cause diagnosis expert.
     Only output the allowed root cause label(s) and their confidence in json format, nothing else."""
+
+
+def build_simple_diagnosis_prompt(query_info, base_info):
+    """Build prompt for simple LLM-based diagnosis without root cause prediction."""
+    db_info = base_info.get('database_info', {})
+    
+    return f"""As an SQL optimization expert, your task is to diagnose and fix the following slow SQL query.
+    You need to analyze the query and provide a direct fix without root cause prediction.
+
+    ## Context
+    1. Query Information:
+    • SQL: {query_info.query}
+    • Execution Plan: {query_info.plan_json}
+    • Execution Runtime: {query_info.execution_time} s
+    • Internal Metrics: Tuples Returned:{query_info.internal_metrics[0]}, Blocks Hit:{query_info.internal_metrics[1]}, Blocks Read:{query_info.internal_metrics[2]}, Tuples Fetched:{query_info.internal_metrics[3]}, Index Tuples Fetched:{query_info.internal_metrics[4]}, Sequential Tuples Read:{query_info.internal_metrics[5]}, Sequential Scans:{query_info.internal_metrics[6]}, Index Scans:{query_info.internal_metrics[7]}, Heap Blocks Hit:{query_info.internal_metrics[8]}, Heap Blocks Read:{query_info.internal_metrics[9]}, Index Blocks Hit:{query_info.internal_metrics[10]}, Index Blocks Read:{query_info.internal_metrics[11]}
+
+    2. Database Environment Information:
+    • Database Type: {db_info.get('db_type')}
+    • Workload Type: {db_info.get('workload_type')}
+    • Database Size: {db_info.get('size')}
+    • Database Schema: TPC-H
+    • CPU: {query_info.external_metrics[0]}
+    • Read I/O: {query_info.external_metrics[1]}
+    • Write I/O: {query_info.external_metrics[2]}
+    • Virtual Memory: {query_info.external_metrics[3]}
+    • Physical Memory: {query_info.external_metrics[4]}
+    • Net Received: {query_info.external_metrics[5]}
+    • Net Sent: {query_info.external_metrics[6]}
+
+    ## Available Action Spaces
+    You can perform the following types of optimizations:
+    
+    • Index Space: Create indexes to improve query performance
+    - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx
+    - You MUST use the CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS to create or drop indexes.
+    - Index creation should be strictly guided by the slow_sql queries
+    - Consider the query execution plan to identify missing indexes
+    - Avoid generating duplicate or subsumed indexes
+    - Do not drop primary keys, unique indexes, or constraint indexes
+    
+    • Knob Space: Adjust database configuration parameters
+    - You MUST use the SET knob = value to modify database knobs.
+    - Focus on parameters that can improve query performance
+    - Be conservative with changes to avoid system instability
+    
+    • Plan Optimizer Space: Use PostgreSQL hints to guide query execution
+    - Output ONLY the hint block like: /*+ Set(knob_name value) Set(knob_name value) ... */
+    - Do NOT include the SQL query when using hints
+    - Use hints to force specific join methods, scan types, etc.
+    
+    • Query Rewrite Space: Rewrite the SQL for better performance
+    - Generate a semantically equivalent SELECT statement
+    - Ensure the rewritten query produces exactly the same result set
+    - Focus on reducing computational complexity and optimizing data access patterns
+    - Maintain identical result set and semantic equivalence
+
+    ## Constraints
+    - Fix action must be executable directly in {db_info.get('db_type')}
+    - The fix action should be safe and should not drop or delete data unless necessary
+    - Ensure all proposed actions are syntactically correct and executable
+
+    ## Output Format
+    You must output ONLY in the following format:
+
+    Explanation:
+    <concise technical reason for the performance issue and proposed solution>
+
+    Fix_Action:
+    <your fix SQL or optimization action here>
+
+    Query_Rewrite:
+    <yes or no>
+
+    ## Output Requirements
+    - "Explanation" must be a short, precise, technical summary
+    - If the fix rewrites the SQL, "Query_Rewrite" must be "yes", else "no"
+    - If rewriting, provide the optimized SQL under Fix_Action
+    - If adding indexes or changing knobs, provide the exact SQL or command
+    - Do not output any extra sections, comments, or steps
+    - Focus on the most impactful optimization for this specific query"""
