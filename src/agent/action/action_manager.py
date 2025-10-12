@@ -184,7 +184,7 @@ class ActionManager:
         positives = retrieval.get('positive', [])
         negatives = retrieval.get('negative', [])
         
-        action_space = await self.action_space_collect(root_cause)
+        action_space = await self.action_space_collect(root_cause, query_info)
         action_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
 
         return action_result
@@ -382,10 +382,10 @@ class ActionManager:
                 self.memory_manager.save(query_info, sql_fixes, root_cause, old_time, new_time, "negative")
                 return new_action_result
 
-    async def action_space_collect(self, root_causes):
+    async def action_space_collect(self, root_causes, query_info=None):
         knob_config = self.configs.get('KNOB_CONFIG')
         current_knob_values = self.db.get_current_knob_values(knob_config)
-        return build_action_space_prompt(root_causes, self.db, knob_config, current_knob_values)
+        return build_action_space_prompt(root_causes, self.db, knob_config, current_knob_values, query_info)
 
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)

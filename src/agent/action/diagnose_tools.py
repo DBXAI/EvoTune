@@ -20,6 +20,116 @@ import jpype as jp
 # 初始化 FastMCP 服务器
 mcp = FastMCP("db_diagnosis")
 
+class SQLRuleMatcher:
+    def __init__(self):
+        self.rules_file = "/root/DREAM/src/agent/action/calcite_rewrite_rules_abbreviated.jsonl"
+        self.rules = self._load_rules()
+    
+    def _load_rules(self):
+        rules = []
+        with open(self.rules_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    rule = json.loads(line.strip())
+                    rules.append(rule)
+        return rules
+    
+    def _has_union_all(self, sql):
+        return bool(re.search(r'\bUNION\s+ALL\b', sql, re.IGNORECASE))
+    
+    def _has_order_by(self, sql):
+        return bool(re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE))
+    
+    def _has_window_functions(self, sql):
+        return bool(re.search(r'\bOVER\s*\(', sql, re.IGNORECASE))
+    
+    def _has_distinct_aggregates(self, sql):
+        return bool(re.search(r'\b(COUNT|SUM|MIN|MAX|AVG)\s*\(\s*DISTINCT\b', sql, re.IGNORECASE))
+    
+    def _has_subqueries(self, sql):
+        return bool(re.search(r'\(\s*SELECT\b', sql, re.IGNORECASE))
+    
+    def _has_joins(self, sql):
+        return bool(re.search(r'\b(INNER|LEFT|RIGHT|FULL)\s+JOIN\b', sql, re.IGNORECASE))
+    
+    def _has_where_clauses(self, sql):
+        return bool(re.search(r'\bWHERE\b', sql, re.IGNORECASE))
+    
+    def _has_group_by(self, sql):
+        return bool(re.search(r'\bGROUP\s+BY\b', sql, re.IGNORECASE))
+    
+    def _has_constant_expressions(self, sql):
+        order_by_match = re.search(r'\bORDER\s+BY\b(.+?)(?:\bLIMIT\b|\bOFFSET\b|$)', sql, re.IGNORECASE | re.DOTALL)
+        if order_by_match:
+            order_clause = order_by_match.group(1)
+            return bool(re.search(r'\b\d+\b|\'[^\']*\'', order_clause))
+        return False
+    
+    def _has_redundant_projections(self, sql):
+        select_count = len(re.findall(r'\bSELECT\b', sql, re.IGNORECASE))
+        return select_count > 1
+    
+    def match_rules(self, sql):
+        applicable_rules = []
+        
+        if self._has_union_all(sql) and self._has_order_by(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['SORT_UNION_TRANSPOSE', 'UNION']))
+        
+        if self._has_subqueries(sql) and self._has_where_clauses(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['FILTER_MERGE', 'FILTER_SUB_QUERY']))
+        
+        if self._has_joins(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['JOIN']))
+        
+        if self._has_joins(sql) and self._has_where_clauses(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['JOIN_CONDITION_PUSH']))
+        
+        if self._has_distinct_aggregates(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['AGGREGATE_EXPAND_DISTINCT']))
+        
+        if self._has_window_functions(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['PROJECT_WINDOW_TRANSPOSE', 'WINDOW']))
+        
+        if self._has_redundant_projections(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['PROJECT_REMOVE', 'PROJECT_MERGE']))
+        
+        if self._has_constant_expressions(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['SORT_REMOVE_CONSTANT', 'REDUCE_EXPRESSIONS']))
+        
+        if self._has_group_by(sql):
+            applicable_rules.extend(self._get_rules_by_pattern(['AGGREGATE']))
+        
+        seen = set()
+        unique_rules = []
+        for rule in applicable_rules:
+            if rule['name'] not in seen:
+                seen.add(rule['name'])
+                unique_rules.append(rule)
+        
+        return unique_rules
+    
+    def _get_rules_by_pattern(self, patterns):
+        matched_rules = []
+        for rule in self.rules:
+            rule_name = rule['name'].upper()
+            for pattern in patterns:
+                if pattern.upper() in rule_name:
+                    matched_rules.append(rule)
+                    break
+        return matched_rules
+    
+    def get_rule_descriptions(self, sql):
+        applicable_rules = self.match_rules(sql)
+        
+        if not applicable_rules:
+            return "    - No specific rewrite rules identified for this query structure."
+        
+        descriptions = []
+        for rule in applicable_rules:
+            descriptions.append(f'    - "{rule["name"]}": {rule["conditions"]} → {rule["transformations"]}')
+        
+        return "\n".join(descriptions)
+
 def clean_sql(sql):
     sql = sql.strip()
     sql = re.sub(r'\s+', ' ', sql)

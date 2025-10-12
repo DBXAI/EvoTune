@@ -221,7 +221,7 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negati
     }}"""
 
 
-def build_action_space_prompt(root_causes, db, knob_config, current_knob_values):
+def build_action_space_prompt(root_causes, db, knob_config, current_knob_values, query_info=None):
     """Build action space prompt based on root causes."""
     # 根因
     root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
@@ -254,7 +254,7 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values)
         action_space_prompt += f"""
     • Knob Space:  
     - Knob Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
-    {chr(10).join(knob_lines)}
+    {knob_lines}
     """
     
     # 执行计划/优化器相关
@@ -270,18 +270,28 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values)
         action_space_prompt += f"""
     • Plan Optimizer Space: 
     - Plan Optimizer Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
-    {chr(10).join(knob_lines)}
+    {knob_lines}
     - **IMPORTANT**: When using Plan Optimizer Space, output ONLY the hint block. Do NOT include the original SQL. Example: /*+ Set(enable_hashjoin on) Set(enable_sort on) */"""
 
     # SQL 可读性/重写相关
     if "poorly written queries" in root_causes:
-        action_space_prompt += """
+        from .action.diagnose_tools import SQLRuleMatcher
+        matcher = SQLRuleMatcher()
+        rule_descriptions = matcher.get_rule_descriptions(query_info.query)
+        
+        action_space_prompt += f"""
     • Query Rewrite Space: 
-    - The output must always be a semantically equivalent SELECT statement that produces exactly the same result set as the original query.
-    - The following rules are provided in the format ["rule name": "rule description"], consider the rules when rewriting the SQL:
-    "name": "SORT_UNION_TRANSPOSE_MATCH_NULL_FETCH", "rewrite_rules_structured": ["conditions": "1. A SQL query performs a `UNION ALL` operation on multiple select statements. 2. Following the `UNION ALL`, there's an `ORDER BY` clause intending to sort the results, with no `OFFSET` clause present in the query.3. Each select statement involved in the `UNION ALL` could potentially benefit from pre-application of the order defined by the `ORDER BY` clause, without violating the intended sort order across the combined result set.", "transformations": "1. Identify the `ORDER BY` clause following a `UNION ALL` that combines multiple select statements and verify there's no associated `OFFSET` directive. 2. For each select statement involved in the `UNION ALL`:   - Apply the `ORDER BY` clause directly to the select statement if doing so does not change the intended order of the final result set. This effectively means prepending an `ORDER BY` to each select statement based on the `ORDER BY` clause initially following the `UNION ALL` operation. 3. Retain the original `ORDER BY` clause following the `UNION ALL`. This ensures that the final result set is ordered as intended, taking into account that individual select statements are now pre-sorted. 4. Implement this transformation only if it's determined that sorting individual select statements before the `UNION ALL` would maintain the overall desired sort order and is expected to either improve performance by reducing sorting overhead or have no negative impact."]
+    - Query Rewrite need to generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query while improving performance.
+    - **Analysis-Based Optimization**: The following rewrite rules have been identified as applicable based on the query structure analysis:
+    {rule_descriptions}
+    - **Implementation Guidelines**:
+      * Apply only the rules that match the specific query structure and are expected to improve performance
+      * Ensure the rewritten query maintains identical result set and semantic equivalence
+      * Prioritize rules that reduce computational complexity, eliminate redundant operations, or optimize data access patterns
+      * Test the rewritten query to verify it produces the same results as the original
+    - **Quality Assurance**: The final output must be a complete, executable SQL statement that preserves all original query semantics while demonstrating measurable performance improvements.
     """
-    
+
     return action_space_prompt
 
 
