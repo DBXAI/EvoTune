@@ -70,6 +70,9 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     • Positive Cases (effective references): {positives_text}
     • Negative Cases (ineffective references to avoid): {negatives_text}
 
+    ## Historical Case Reflection
+    Before proposing your optimization solution, analyze the historical cases to understand why certain approaches succeeded or failed, then adapt successful patterns to the current context while avoiding patterns that failed in similar situations.
+
     ## Action Space
     - If the root cause is "inappropriate query knobs", you MUST perform actions within Knob Space using SET knob = value.
     - If the root cause is "suboptimal plan optimizer", you MUST perform actions within Plan Optimizer Space using PostgreSQL comment-style hints ONLY. Output ONLY the hint block like: /*+ Set(knob_name value) Set(knob_name value) ... */. Do NOT include the SQL query.
@@ -133,7 +136,7 @@ def build_rewrite_prompt(origin_sql, rewrite_sql):
     — Output Format —
     <paste only the revised SQL here, exactly as SQL, nothing else>"""
 
-def build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negatives, state_confidence, tuning_history=None, timeout=20):
+def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence, tuning_history=None, timeout=300):
     """Build prompt for LLM-based root cause diagnosis with per-label confidence map.
 
     tuning_history: Optional list summarizing per-root-cause success/failure counts, e.g.,
@@ -143,9 +146,6 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, positives, negati
       ]
     """
 
-    # positives_text = fmt_cases(positives)
-    # negatives_text = fmt_cases(negatives)
-    
     # 处理 timeout 情况
     execution_time_text = f"{query_info.execution_time} s"
     if query_info.execution_time == timeout:

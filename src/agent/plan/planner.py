@@ -68,15 +68,13 @@ class Planner:
 
     def llm_predict(self, query_info, root_causes, state_confidence, tuning_history=None):
         # ε-greedy retrieval structure: {"positive", "negative"}
-        retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
-        positives = retrieval.get('positive', [])
-        negatives = retrieval.get('negative', [])
+        # retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
+        # positives = retrieval.get('positive', [])
+        # negatives = retrieval.get('negative', [])
 
         prompt = build_root_cause_diagnosis_prompt(
             query_info,
             root_causes,
-            positives,
-            negatives,
             state_confidence=state_confidence,
             tuning_history=tuning_history
         )

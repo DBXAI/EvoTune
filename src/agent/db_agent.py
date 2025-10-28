@@ -15,6 +15,7 @@ import signal
 import atexit
 import time
 import numpy as np
+from scipy.stats import beta
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent.parent)
@@ -58,6 +59,61 @@ class DBAgent:
         
         self.planner = Planner(self.memory_manager, predictor=predictor, agent_config=self.agent_config)
         self.action_manager = ActionManager(memory_manager=self.memory_manager, db=self.db, planner=self.planner, configs=configs)
+        
+        self.alpha_0 = 1.0  # Beta prior alpha
+        self.beta_0 = 1.0   # Beta prior beta
+        self.p_crit = 0.5   # Critical probability threshold
+        self.epsilon_min = 0.1  
+        self.epsilon_max = 0.8  
+        self.kappa = 0.5    
+        self.N_th = 3      # Failure count threshold
+    
+    def calculate_dynamic_epsilon(self, root_cause_key, state):
+        # Get success and failure counts for this root cause
+        s_r = state.get("successes").get(root_cause_key, 0)  # successes
+        n_r = state.get("attempts").get(root_cause_key, 0)   # total attempts
+        
+        # Calculate reliability score P_r = 1 - F_Beta(p_crit; alpha_0 + s_r, beta_0 + n_r - s_r)
+        if n_r == 0:
+            # No attempts yet, use prior
+            alpha = self.alpha_0
+            beta_param = self.beta_0
+        else:
+            alpha = self.alpha_0 + s_r
+            beta_param = self.beta_0 + n_r - s_r
+        
+        P_r = 1 - beta.cdf(self.p_crit, alpha, beta_param)
+        U_r = 1 - P_r
+
+        G_nr = 1 / (1 + np.exp(-self.kappa * (n_r - self.N_th)))
+
+        epsilon_r = self.epsilon_min + (self.epsilon_max - self.epsilon_min) * G_nr * U_r
+        
+        return epsilon_r
+    
+    def decide_exploration_mode(self, query_info, predicted_root, state):
+        """
+        Decide between exploration and exploitation based on dynamic epsilon-greedy
+        
+        Args:
+            query_info: Current query information
+            predicted_root: Predicted root cause
+            state: Current SQL state
+            
+        Returns:
+            mode: 'explore' or 'exploit'
+        """
+        predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)
+        
+        # Calculate dynamic epsilon for the predicted root cause
+        epsilon_r = self.calculate_dynamic_epsilon(predicted_root_key, state)
+        print(f"epsilon_r: {epsilon_r}")
+        
+        # Sample p ~ U(0,1) and decide
+        p = random.random()
+        mode = "explore" if p < epsilon_r else "exploit"
+        
+        return mode
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -90,51 +146,6 @@ class DBAgent:
             logger.error(f"清理资源时出现异常: {e}")
         finally:
             pass
-
-    def parse_action_result(self, diagnosis):        
-        # extract Explanation
-        explanation_match = re.search(r'Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)', diagnosis, re.IGNORECASE)
-        explanation = explanation_match.group(1).strip() if explanation_match else ""
-        
-        # extract FIX_ACTION
-        fix_match = re.search(r'Fix_Action:\s*([\s\S]+?)Query_Rewrite:', diagnosis, re.IGNORECASE)
-        fix_action = fix_match.group(1).strip() if fix_match else ""
-        
-        # extract Query_Rewrite
-        is_rewrite_match = re.search(r'Query_Rewrite:\s*(yes|no)', diagnosis, re.IGNORECASE)
-        is_rewrite = is_rewrite_match.group(1).strip() if is_rewrite_match else ""
-        
-        return explanation, fix_action, is_rewrite
-    
-    def parse_query_rewrite(self, fix_action):
-        lines = fix_action.strip().splitlines()
-        sql_start = None
-        
-        for idx, line in enumerate(lines):
-            l = line.lstrip().upper()
-            if (l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or 
-                l.startswith("UPDATE") or l.startswith("DELETE")):
-                sql_start = idx
-                break
-        
-        if sql_start is not None:
-            fix_part = "\n".join([line for line in lines[:sql_start] if line.strip()])
-            sql_part = "\n".join(lines[sql_start:]).strip()
-            return fix_part, sql_part
-        else:
-            return fix_action.strip(), ""
-        
-    def extract_fix_action(self, action_result):
-        explanation, fix_action, is_rewrite = self.parse_action_result(action_result)
-        print("diagnosis output:")
-        print("explanation:", explanation)
-        print("fix_action:", fix_action)
-        print("is_rewrite:", is_rewrite)
-        if is_rewrite == "yes":
-            fix_action, rewrite_sql = self.parse_query_rewrite(fix_action)
-            return fix_action, rewrite_sql
-        else:
-            return fix_action, ""
 
     def read_queries(self, slow_query_path, order):
         queries_order = []
@@ -257,8 +268,9 @@ class DBAgent:
                     logger.info(f"SQL {query_id} 预测根因已在root_tried中，强制进入探索模式")
                     state["mode"] = "explore"
                 else:
-                    # epsilon-greedy 决策：explore 使用相似根因；exploit 使用预测的根因
-                    state["mode"] = "explore" if random.random() < epsilon else "exploit"
+                    # Dynamic epsilon-greedy 决策
+                    state["mode"] = self.decide_exploration_mode(query_info, predicted_root, state)
+                    logger.info(f"SQL {query_id} 动态epsilon决策")
 
                 if state["mode"] == "explore":
                     logger.info(f"SQL {query_id} 进入探索模式（archive 相似根因）")
@@ -284,12 +296,8 @@ class DBAgent:
 
                 logger.info(f"SQL {query_id} 当前诊断根因: {root_causes}")
 
-                # 调用action_manager.step处理
-                action_result = await self.action_manager.step(query_info, root_causes, mode=state["mode"])
-                # 提取fix action
-                fix_action, rewrite_sql = self.extract_fix_action(action_result)
-                # 进行action验证
-                evaluation_result = await self.action_manager.evaluate_action(fix_action, rewrite_sql, query_info)
+                # 调用action_manager.step处理（包含evaluate_action和经验池更新）
+                evaluation_result = await self.action_manager.step(query_info, root_causes, mode=state["mode"])
 
                 # 获取修复内容
                 fix_action = evaluation_result.get("fix_action")
