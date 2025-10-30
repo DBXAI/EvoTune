@@ -1,53 +1,50 @@
-# DREAM - Database Recovery via Explainable Autonomous Management
+# DREAM
 
-DREAM 是一个智能代理系统，用于自动检测和修复数据库性能异常。该系统结合了机器学习和专家系统的优点，能够自动分析数据库查询性能问题，并提供相应的修复方案。
+Source code for the DREAM framework, proposed in "From Anomalies to Actions: An Anomaly-Aware Approach for Multi-Component Tuning in DBMSs". Please refer to the paper for the experimental details.
 
-## 系统架构
+## Setup and Run
 
-DREAM 系统包含三个核心模块：
-
-1. **Plan 模块**
-2. **Action 模块**
-3. **Memory 模块**
-
-## 项目设置与运行
-
-1. 项目准备
+1) Environment setup
 
 ```bash
-# 克隆项目
-git clone https://github.com/yourusername/DREAM.git
+# Clone repository
+git clone https://github.com/HarneyHong/DREAM.git
 cd DREAM
 
-# 创建名为DREAM的Python 3.10虚拟环境
+# Create conda environment
 conda create -n DREAM python=3.10
-
-# 激活虚拟环境
 conda activate DREAM
 
-# 安装依赖包
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-2. 运行项目：
+2) Configure APIs
 
 ```bash
 cd config
-cp base_config.py.example base_config.py
+cp base_config.json.example base_config.json
 
-# 更改config/basic_config.py
-OPENAI_CONFIG = {
-    "api_key": "api_key",
-    "base_url": "https://api.gpt.ge/v1/",
-    "model": "gpt-4o-mini"
-}
+# In base_config.py, set API keys and models if needed
+# OPENAI_CONFIG / ANTHROPIC_CONFIG are already defined in example
+```
 
-ANTHROPIC_CONFIG = {
-    "api_key": "api_key",
-    "base_url": "https://api.gpt.ge",
-    "model": "claude-3-5-sonnet-20241022"
-}
+3) Download detection data
 
-# 运行主程序
-python main.py --data=../data/tpc_c.csv
+For the diagnosis tool, we provide both the pre-collected training data and the pre-trained RCRank model, which can be downloaded directly from the [link](https://drive.google.com/drive/folders/1mRkA_CJvKImJeHuaXm-W0h0riVmvB_2w?usp=sharing). You can also retrain the model and recollect data using the modified RCRank [code](https://
+github.com/HarneyHong/RCRank.git) if needed.
+
+After downloading, please place the data and model files in the following specified paths:
+- DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt
+- DREAM/src/agent/plan/slow_sql_data_gen.csv
+
+4) Run
+
+```bash
+cd src
+python main.py \
+  --data_path /root/DREAM/data/slow_queries/TPC-H \
+  --order qorder.txt \
+  --duration 30 \
+  --config /root/DREAM/config/base_config.json
 ```

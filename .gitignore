@@ -18,6 +18,10 @@ test_sql_gen/rubbish/**
 test_sql_gen/slow_queries/**
 logs/**
 src/agent/plan/slow_sql_data_gen.csv
+config/ablation_experiments_config.json
+src/ablation_main.py
+src/agent/ablation_db_agent.py
+ablation.md
 # test_sql_gen/data/hint/**
 # test_sql_gen/data/hint_normal/**
 # test_sql_gen/data/hint+index/**

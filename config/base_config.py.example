@@ -1,18 +1,83 @@
-"""
-基础配置文件，包含所有API和服务的配置信息
-"""
+POSTGRES_CONFIG = {
+    "user": "postgres",
+    "password": "postgres",
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "tpch10G",
+    "workload_type": "OLAP",
+    "postgres_path": "/usr/lib/postgresql/14/bin",
+    "postgres_data": "/usr/lib/postgresql/14/data",
+    "log_path": "/usr/lib/postgresql/14/log",
+    "db_type": "postgres"
+}
+
+KNOB_CONFIG = {
+    # - Query Knobs -
+    "query_knobs": {
+        "enable_async_append": "on",
+        "enable_bitmapscan": "on",
+        "enable_gathermerge": "on",
+        "enable_hashagg": "on",
+        "enable_hashjoin": "on",
+        "enable_incremental_sort": "on",
+        "enable_indexonlyscan": "on",
+        "enable_indexscan": "on",
+        "enable_material": "on",
+        "enable_memoize": "on",
+        "enable_mergejoin": "on",
+        "enable_nestloop": "on",
+        "enable_parallel_append": "on",
+        "enable_parallel_hash": "on",
+        "enable_partition_pruning": "on",
+        "enable_partitionwise_aggregate": "off",
+        "enable_partitionwise_join": "off",
+        "enable_seqscan": "on",
+        "enable_sort": "on",
+    },
+    
+    # - System knobs -
+    "system_knobs": {
+        "constraint_exclusion": "partition",
+        "cpu_index_tuple_cost": 0.005,
+        "cpu_operator_cost": 0.0025,
+        "cpu_tuple_cost": 0.01,
+        "cursor_tuple_fraction": 0.1,
+        "default_statistics_target": 100,
+        "effective_cache_size": 524288,
+        "from_collapse_limit": 8,
+        "geqo": "on",
+        "hash_mem_multiplier": 2.0,
+        "jit": "on",
+        "jit_above_cost": 100000.0,
+        "jit_expressions": "on",
+        "jit_inline_above_cost": 500000.0,
+        "jit_optimize_above_cost": 500000.0,
+        "jit_tuple_deforming": "on",
+        "join_collapse_limit": 8,
+        "max_parallel_workers": 8,
+        "max_parallel_workers_per_gather": 2,
+        "min_parallel_index_scan_size": 64,
+        "min_parallel_table_scan_size": 1024,
+        "parallel_setup_cost": 1000.0,
+        "parallel_tuple_cost": 0.1,
+        "plan_cache_mode": "auto",
+        "random_page_cost": 4.0,
+        "seq_page_cost": 1.0,
+        "work_mem": 4096,
+    }
+}
 
 # OpenAI API配置
 OPENAI_CONFIG = {
-    "api_key": "api_key",
-    "base_url": "https://api.gpt.ge/v1/",
+    "api_key": "",
+    "base_url": "",
     "model": "gpt-4o-mini"
 }
 
 # Anthropic API配置
 ANTHROPIC_CONFIG = {
-    "api_key": "api_key",
-    "base_url": "https://api.gpt.ge",
+    "api_key": "",
+    "base_url": "",
     "model": "claude-3-5-sonnet-20241022"
 }
 
@@ -20,4 +85,75 @@ ANTHROPIC_CONFIG = {
 API_SETTINGS = {
     "openai": OPENAI_CONFIG,
     "anthropic": ANTHROPIC_CONFIG
+}
+
+# Planner配置
+PLANNER_CONFIG = {
+    "device": "cpu",
+    "model_path": "/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
+    "train_data_path": "/root/DREAM/src/agent/plan/slow_sql_data_gen.csv",
+    "opt_threshold": 0.5,
+    "num_classes": 4
+}
+
+# RCRankPredictor配置
+RCRANK_PREDICTOR_CONFIG = {
+    "model_path": "/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
+    "train_data_path": "/root/DREAM/src/agent/plan/slow_sql_data_gen.csv",
+    "device": "cpu",
+    "opt_threshold": 0.1,
+    "num_classes": 4
+}
+
+# Memory Manager配置
+MEMORY_MANAGER_CONFIG = {
+    "db_path": "memory.db",
+    "archive_size": 20,
+    "finetune_threshold": 220,
+    "finetune_epochs": 50,
+    "finetune_batch_size": 8,
+    "finetune_device": "cpu",
+    "model_output_dir": "/root/DREAM/src/agent/plan/model_res",
+    "bce_weight": 0.7,
+    "contrastive_weight": 0.3,
+    "enable_finetune": True
+}
+
+# Agent配置
+AGENT_CONFIG = {
+    "memory_path": "memory_results",
+    "max_attempts": 10,
+    "no_improvement_threshold": 3,
+    "epsilon": 0.1
+}
+
+# 超时配置
+TIMEOUT_CONFIG = {
+    "sql_execution_timeout": 20,
+    "diagnosis_timeout": 30,
+    "action_evaluation_timeout": 60,
+    "total_optimization_timeout": 3600  # 1小时
+}
+
+# 模型配置
+MODEL_CONFIG = {
+    "diagnostic_agent_model": "gpt-4.1",
+    "fix_agent_model": "gpt-4.1",
+    "root_cause_llm_model": "gpt-4.1"
+}
+
+# 日志配置
+LOGGING_CONFIG = {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "date_format": "%Y-%m-%d %H:%M:%S",
+    "log_dir": "logs"
+}
+
+# 数据库连接配置
+DATABASE_CONFIG = {
+    "connection_timeout": 30,
+    "query_timeout": 300,
+    "max_retries": 3,
+    "retry_delay": 1
 }
