@@ -31,12 +31,11 @@ cp base_config.json.example base_config.json
 
 3) Download detection data
 
-For the diagnosis tool, we provide both the pre-collected training data and the pre-trained RCRank model, which can be downloaded directly from the [link](https://drive.google.com/drive/folders/1mRkA_CJvKImJeHuaXm-W0h0riVmvB_2w?usp=sharing). You can also retrain the model and recollect data using the modified RCRank [code](https://
-github.com/HarneyHong/RCRank.git) if needed.
+- For the diagnosis tool, we provide both the pre-collected training data and the pre-trained RCRank model, which can be downloaded directly from the [link](https://drive.google.com/drive/folders/1mRkA_CJvKImJeHuaXm-W0h0riVmvB_2w?usp=sharing). You can also retrain the model and recollect data using the modified RCRank [code](https://github.com/HarneyHong/RCRank.git) if needed.
 
-After downloading, please place the data and model files in the following specified paths:
-- DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt
-- DREAM/src/agent/plan/slow_sql_data_gen.csv
+- After downloading, please place the data and model files in the following specified paths:
+    - DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt
+    - DREAM/src/agent/plan/slow_sql_data_gen.csv
 
 4) Run
 
