@@ -1,10 +1,10 @@
-import pdb
-import time
-import psutil
-import subprocess
 import multiprocessing as mp
+import time
 from multiprocessing import Manager
+
 import numpy as np
+import psutil
+
 
 class ResourceMonitor:
 
@@ -14,7 +14,7 @@ class ResourceMonitor:
         self.process = psutil.Process(pid)
         self.warmup = warmup
         self.ticks = int(self.t / self.interval)
-        
+
         # check if process exists
         try:
             self.process = psutil.Process(pid)
@@ -24,7 +24,7 @@ class ResourceMonitor:
             self.process = None
             self.n_cpu = 1
             print(f"警告: 进程 {pid} 不存在或无法访问，将使用默认值")
-        
+
         self.cpu_usage_seq = Manager().list()
         self.mem_virtual_usage_seq = Manager().list()
         self.mem_physical_usage_seq = Manager().list()
@@ -32,7 +32,7 @@ class ResourceMonitor:
         self.net_recv_seq, self.net_sent_seq = Manager().list(), Manager().list()
         self.dirty_pages_pct_seq = Manager().list()
         self.processes = []
-        self.alive = mp.Value('b', False)
+        self.alive = mp.Value("b", False)
 
     def run(self):
         p1 = mp.Process(target=self.monitor_cpu_usage, args=())
@@ -52,12 +52,12 @@ class ResourceMonitor:
             return arr.tolist()
         elif len(arr) == 0:
             return [0] * target_len
-        
+
         x_old = np.linspace(0, 1, len(arr))
         x_new = np.linspace(0, 1, target_len)
         return np.interp(x_new, x_old, arr).tolist()
-    
-    def get_monitor_data(self, process_len = 9):
+
+    def get_monitor_data(self, process_len=9):
         [proc.join() for proc in self.processes]
         # cpu = list(self.cpu_usage_seq)
         # io_read = list(self.io_read_seq)
@@ -94,7 +94,15 @@ class ResourceMonitor:
         avg_physical_memory = sum(mem_physical) / (len(mem_physical) + 1e-9)
         avg_net_recv = sum(net_recv) / (len(net_recv) + 1e-9)
         avg_net_sent = sum(net_sent) / (len(net_sent) + 1e-9)
-        return avg_cpu, avg_read_io, avg_write_io, avg_virtual_memory, avg_physical_memory, avg_net_recv, avg_net_sent
+        return (
+            avg_cpu,
+            avg_read_io,
+            avg_write_io,
+            avg_virtual_memory,
+            avg_physical_memory,
+            avg_net_recv,
+            avg_net_sent,
+        )
 
     def monitor_mem_usage(self):
         count = 0
@@ -108,11 +116,19 @@ class ResourceMonitor:
                 self.mem_virtual_usage_seq.append(0.0)
             else:
                 try:
-                    mem_physical = self.process.memory_info()[0]/(1024.0 * 1024.0 * 1024.0)
-                    mem_virtual = self.process.memory_info()[1]/(1024.0 * 1024.0 * 1024.0)
+                    mem_physical = self.process.memory_info()[0] / (
+                        1024.0 * 1024.0 * 1024.0
+                    )
+                    mem_virtual = self.process.memory_info()[1] / (
+                        1024.0 * 1024.0 * 1024.0
+                    )
                     self.mem_physical_usage_seq.append(mem_physical)
                     self.mem_virtual_usage_seq.append(mem_virtual)
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                except (
+                    psutil.NoSuchProcess,
+                    psutil.AccessDenied,
+                    psutil.ZombieProcess,
+                ):
                     self.mem_physical_usage_seq.append(0.0)
                     self.mem_virtual_usage_seq.append(0.0)
             time.sleep(self.interval)
@@ -129,9 +145,14 @@ class ResourceMonitor:
                 sp1 = psutil.disk_io_counters()
                 time.sleep(self.interval)
                 sp2 = psutil.disk_io_counters()
-                self.io_read_seq.append((sp2[2]-sp1[2])/(1024.0 * 1024.0))
-                self.io_write_seq.append((sp2[3]-sp1[3])/(1024.0 * 1024.0))
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError):
+                self.io_read_seq.append((sp2[2] - sp1[2]) / (1024.0 * 1024.0))
+                self.io_write_seq.append((sp2[3] - sp1[3]) / (1024.0 * 1024.0))
+            except (
+                psutil.NoSuchProcess,
+                psutil.AccessDenied,
+                psutil.ZombieProcess,
+                TypeError,
+            ):
                 self.io_read_seq.append(0.0)
                 self.io_write_seq.append(0.0)
             count += 1
@@ -149,7 +170,11 @@ class ResourceMonitor:
                 try:
                     cpu = self.process.cpu_percent(interval=self.interval)
                     self.cpu_usage_seq.append(cpu)
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                except (
+                    psutil.NoSuchProcess,
+                    psutil.AccessDenied,
+                    psutil.ZombieProcess,
+                ):
                     self.cpu_usage_seq.append(0.0)
             count += 1
 
@@ -164,12 +189,21 @@ class ResourceMonitor:
                 net1 = psutil.net_io_counters()
                 time.sleep(self.interval)
                 net2 = psutil.net_io_counters()
-                self.net_recv_seq.append((net2.bytes_recv - net1.bytes_recv) / (1024.0 * 1024.0))
-                self.net_sent_seq.append((net2.bytes_sent - net1.bytes_sent) / (1024.0 * 1024.0))
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError):
+                self.net_recv_seq.append(
+                    (net2.bytes_recv - net1.bytes_recv) / (1024.0 * 1024.0)
+                )
+                self.net_sent_seq.append(
+                    (net2.bytes_sent - net1.bytes_sent) / (1024.0 * 1024.0)
+                )
+            except (
+                psutil.NoSuchProcess,
+                psutil.AccessDenied,
+                psutil.ZombieProcess,
+                TypeError,
+            ):
                 self.net_recv_seq.append(0.0)
                 self.net_sent_seq.append(0.0)
             count += 1
 
     def terminate(self):
-        self.alive.value = False 
+        self.alive.value = False

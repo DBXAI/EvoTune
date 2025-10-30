@@ -1,15 +1,17 @@
-import os
-import time
-import psycopg2
 import asyncio
+import os
 import re
-import concurrent.futures
+import time
+
+import psycopg2
 from agents import Agent, Runner
 from agents._config import set_default_openai_api
+
 
 def delete_all_loggers():
     """清理和重置所有日志记录器"""
     import logging
+
     loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
     for logger in loggers:
         handlers = logger.handlers[:]
@@ -17,6 +19,7 @@ def delete_all_loggers():
             logger.removeHandler(handler)
         logger.propagate = True
         logger.setLevel(logging.CRITICAL)
+
 
 # 清理所有日志记录器
 delete_all_loggers()
@@ -27,12 +30,12 @@ PG_CONN_INFO = {
     "port": 5432,
     "user": "postgres",
     "password": "postgres",
-    "dbname": "tpch10G"
+    "dbname": "tpch10G",
 }
 
 # 设置大模型API
-os.environ['OPENAI_API_KEY'] = "sk-Os3W9DMCISbc0cIGA0AdCf971b5e4a98968dF361Ea6285A7"
-os.environ['OPENAI_BASE_URL'] = "https://api.gpt.ge/v1/"
+os.environ["OPENAI_API_KEY"] = "sk-Os3W9DMCISbc0cIGA0AdCf971b5e4a98968dF361Ea6285A7"
+os.environ["OPENAI_BASE_URL"] = "https://api.gpt.ge/v1/"
 set_default_openai_api("chat_completions")
 
 TPCH_SCHEMA = """
@@ -143,17 +146,23 @@ Query_Rewrite:
 #                 sql_files.append(os.path.join(root, file))
 #     return sql_files
 
+
 def extract_index_names(sql):
     """从多条CREATE INDEX语句中提取所有索引名"""
-    return re.findall(r'CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)', sql, re.IGNORECASE)
+    return re.findall(
+        r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE
+    )
+
 
 def extract_knob_names(sql):
     """从多条SET语句中提取所有索引名"""
-    return re.findall(r'SET\s+([a-zA-Z0-9_]+)\s*=', sql, re.IGNORECASE)
+    return re.findall(r"SET\s+([a-zA-Z0-9_]+)\s*=", sql, re.IGNORECASE)
+
 
 def read_sql_file(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         return f.read()
+
 
 def execute_sql_and_time(conn, sql, timeout=120):
     """
@@ -180,23 +189,28 @@ def execute_sql_and_time(conn, sql, timeout=120):
             conn.rollback()
             raise e
 
+
 async def call_fix_agent(slow_sql, sql_plan):
     fixAgent = Agent(
         name="SQLFixAgent",
         model="gpt-4.1",
-        instructions="You are an SQL optimization expert, able to provide precise fixes for slow SQL."
+        instructions="You are an SQL optimization expert, able to provide precise fixes for slow SQL.",
     )
-    prompt = FIX_PROMPT_TEMPLATE.format(SLOW_SQL=slow_sql, SCHEMA=TPCH_SCHEMA, SQL_PLAN=sql_plan)
+    prompt = FIX_PROMPT_TEMPLATE.format(
+        SLOW_SQL=slow_sql, SCHEMA=TPCH_SCHEMA, SQL_PLAN=sql_plan
+    )
     result = await Runner.run(starting_agent=fixAgent, input=prompt)
     return result.final_output.strip()
 
+
 def parse_fix_action(result):
-    fix_match = re.search(r'FIX_ACTION:\s*([\s\S]+?)Query_Rewrite:', result)
+    fix_match = re.search(r"FIX_ACTION:\s*([\s\S]+?)Query_Rewrite:", result)
     fix_action = fix_match.group(1).strip() if fix_match else ""
     # 只匹配yes或no
-    query_rewrite = re.search(r'Query_Rewrite:\s*(yes|no)', result, re.IGNORECASE)
+    query_rewrite = re.search(r"Query_Rewrite:\s*(yes|no)", result, re.IGNORECASE)
     query_rewrite = query_rewrite.group(1).strip().lower() if query_rewrite else ""
     return fix_action, query_rewrite
+
 
 def get_sql_plan(sql, timeout=120):
     cmd = f"EXPLAIN ANALYZE {sql}"
@@ -214,6 +228,7 @@ def get_sql_plan(sql, timeout=120):
         except Exception as e:
             print(f"获取SQL计划失败: {e}")
             return ""
+
 
 def rollback_action(conn, index_names, knob_names):
     # 撤销所有索引
@@ -236,6 +251,7 @@ def rollback_action(conn, index_names, knob_names):
             conn.rollback()
             print(f"恢复{knob_name}失败: {e}")
 
+
 def extract_fix_action(fix_action: str):
     """
     提取修复动作（所有CREATE/SET等）和主SQL（从第一个WITH/SELECT/INSERT/UPDATE/DELETE开始的所有内容）。
@@ -246,7 +262,13 @@ def extract_fix_action(fix_action: str):
     sql_start = None
     for idx, line in enumerate(lines):
         l = line.lstrip().upper()
-        if l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or l.startswith("UPDATE") or l.startswith("DELETE"):
+        if (
+            l.startswith("WITH")
+            or l.startswith("SELECT")
+            or l.startswith("INSERT")
+            or l.startswith("UPDATE")
+            or l.startswith("DELETE")
+        ):
             sql_start = idx
             break
     if sql_start is not None:
@@ -255,6 +277,7 @@ def extract_fix_action(fix_action: str):
         return fix_part, sql_part
     else:
         return fix_action.strip(), ""
+
 
 async def main():
     sql_dir = "/root/DREAM/test_sql_gen/slow_queries/gen_query"
@@ -277,7 +300,7 @@ async def main():
             continue
         print(f"优化前执行时间: {before_time:.4f}秒")
         total_before += before_time
-        if i!=15:
+        if i != 15:
             sql_plan = get_sql_plan(sql, timeout=30)
         else:
             sql_plan = ""
@@ -300,7 +323,7 @@ async def main():
             else:
                 print(f"修复动作: {fix_action}")
                 print(f"是否重写SQL: {query_rewrite}")
-            
+
             # 执行修复动作
             try:
                 fix_time = execute_sql_and_time(conn, fix_action, timeout=500)
@@ -331,7 +354,8 @@ async def main():
     print(f"所有SQL优化前总时间: {total_before:.4f}秒")
     print(f"所有SQL优化后总时间: {total_after:.4f}秒")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     start_time = time.time()
     asyncio.run(main())
     end_time = time.time()

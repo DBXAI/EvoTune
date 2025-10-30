@@ -1,8 +1,8 @@
-import os
-import csv
 import argparse
-from collections import defaultdict
+import csv
+import os
 import shutil
+from collections import defaultdict
 
 # 使用方法
 # python clean_sql.py --mode check_duplicate --input tpch_queries.csv
@@ -11,9 +11,10 @@ import shutil
 # python clean_sql.py --mode copy_files --dir_path /root/DREAM/test_sql_gen/slow_queries/pool_queries_sql_files --dst_dir /root/DREAM/test_sql_gen/slow_queries/pool_queries_sql_files1
 # python clean_sql.py --mode filter_by_time_diff --input /root/DREAM/test_sql_gen/gen_slow_sql_tpch.csv --output /root/DREAM/test_sql_gen/gen_slow_sql_tpch_filtered.csv
 
+
 def check_duplicate_queries(input_file):
     query_lines = defaultdict(list)
-    with open(input_file, 'r', encoding='utf-8') as f:
+    with open(input_file, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader)
         for idx, row in enumerate(reader, start=2):
@@ -23,16 +24,17 @@ def check_duplicate_queries(input_file):
     for query, lines in query_lines.items():
         if len(lines) > 1:
             has_duplicate = True
-            print(f'重复SQL出现在第{lines}行:')
+            print(f"重复SQL出现在第{lines}行:")
             print(query)
-            print('-' * 60)
+            print("-" * 60)
     if not has_duplicate:
-        print('没有发现重复的SQL语句。')
+        print("没有发现重复的SQL语句。")
+
 
 def remove_duplicate_queries(input_file, output_file):
     seen = set()
     rows = []
-    with open(input_file, 'r', encoding='utf-8') as f:
+    with open(input_file, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader)
         rows.append(header)
@@ -41,10 +43,11 @@ def remove_duplicate_queries(input_file, output_file):
             if query not in seen:
                 seen.add(query)
                 rows.append(row)
-    with open(output_file, 'w', encoding='utf-8', newline='') as f:
+    with open(output_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(rows)
-    print(f'去重后已写入{len(rows)-1}条SQL到{output_file}')
+    print(f"去重后已写入{len(rows)-1}条SQL到{output_file}")
+
 
 def delete_sql_files(dir_path, files_to_delete):
     for filename in files_to_delete:
@@ -56,6 +59,7 @@ def delete_sql_files(dir_path, files_to_delete):
             print(f"未找到: {file_path}")
         except Exception as e:
             print(f"删除 {file_path} 时出错: {e}")
+
 
 def copy_sql_files(file_list, src_dir, dst_dir):
     if not os.path.exists(dst_dir):
@@ -71,41 +75,64 @@ def copy_sql_files(file_list, src_dir, dst_dir):
         except Exception as e:
             print(f"复制 {src_path} 时出错: {e}")
 
+
 def filter_by_time_diff(input_file, output_file, threshold=1.0):
     """
     过滤before_time和after_time差值小于threshold的行，写入output_file。
     """
-    with open(input_file, 'r', encoding='utf-8') as f:
+    with open(input_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        rows = [row for row in reader if abs(float(row['before_time']) - float(row['after_time'])) >= threshold]
+        rows = [
+            row
+            for row in reader
+            if abs(float(row["before_time"]) - float(row["after_time"])) >= threshold
+        ]
         fieldnames = reader.fieldnames
-    with open(output_file, 'w', encoding='utf-8', newline='') as f:
+    with open(output_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f'过滤后剩余{len(rows)}条数据，已写入{output_file}')
+    print(f"过滤后剩余{len(rows)}条数据，已写入{output_file}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description='SQL清洗工具：查重、去重、批量删除/复制SQL文件')
-    parser.add_argument('--mode', required=True, choices=['check_duplicate', 'remove_duplicate', 'delete_files', 'copy_files', 'filter_by_time_diff'], help='运行模式')
-    parser.add_argument('--input', type=str, help='输入CSV文件路径（查重/去重/过滤）')
-    parser.add_argument('--output', type=str, help='输出CSV文件路径（去重/过滤）')
-    parser.add_argument('--dir_path', type=str, help='SQL文件目录（批量删除源目录）')
-    parser.add_argument('--dst_dir', type=str, help='SQL文件复制目标目录（复制模式）')
-    parser.add_argument('--file_list', type=str, help='要复制的SQL文件名列表txt文件，每行一个文件名（复制模式）')
+    parser = argparse.ArgumentParser(
+        description="SQL清洗工具：查重、去重、批量删除/复制SQL文件"
+    )
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=[
+            "check_duplicate",
+            "remove_duplicate",
+            "delete_files",
+            "copy_files",
+            "filter_by_time_diff",
+        ],
+        help="运行模式",
+    )
+    parser.add_argument("--input", type=str, help="输入CSV文件路径（查重/去重/过滤）")
+    parser.add_argument("--output", type=str, help="输出CSV文件路径（去重/过滤）")
+    parser.add_argument("--dir_path", type=str, help="SQL文件目录（批量删除源目录）")
+    parser.add_argument("--dst_dir", type=str, help="SQL文件复制目标目录（复制模式）")
+    parser.add_argument(
+        "--file_list",
+        type=str,
+        help="要复制的SQL文件名列表txt文件，每行一个文件名（复制模式）",
+    )
     args = parser.parse_args()
 
-    if args.mode == 'check_duplicate':
+    if args.mode == "check_duplicate":
         if not args.input:
-            print('请指定--input参数')
+            print("请指定--input参数")
             return
         check_duplicate_queries(args.input)
-    elif args.mode == 'remove_duplicate':
+    elif args.mode == "remove_duplicate":
         if not args.input or not args.output:
-            print('请指定--input和--output参数')
+            print("请指定--input和--output参数")
             return
         remove_duplicate_queries(args.input, args.output)
-    elif args.mode == 'delete_files':
+    elif args.mode == "delete_files":
         files_to_delete = [
             "sql_1.sql",
             "sql_105.sql",
@@ -353,12 +380,12 @@ def main():
             "sql_98.sql",
         ]
         if not args.dir_path:
-            print('请指定--dir_path参数')
+            print("请指定--dir_path参数")
             return
         delete_sql_files(args.dir_path, files_to_delete)
-    elif args.mode == 'copy_files':
+    elif args.mode == "copy_files":
         if not args.dir_path or not args.dst_dir:
-            print('请指定--dir_path、--dst_dir参数')
+            print("请指定--dir_path、--dst_dir参数")
             return
         file_list = [
             "sql_1020.sql",
@@ -421,13 +448,14 @@ def main():
             "sql_9607.sql",
         ]
         copy_sql_files(file_list, args.dir_path, args.dst_dir)
-    elif args.mode == 'filter_by_time_diff':
+    elif args.mode == "filter_by_time_diff":
         if not args.input or not args.output:
-            print('请指定--input和--output参数')
+            print("请指定--input和--output参数")
             return
         filter_by_time_diff(args.input, args.output)
     else:
-        print('未知模式')
+        print("未知模式")
 
-if __name__ == '__main__':
-    main() 
+
+if __name__ == "__main__":
+    main()

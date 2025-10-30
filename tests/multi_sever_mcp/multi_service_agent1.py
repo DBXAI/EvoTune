@@ -2,9 +2,10 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+
 from agents import Agent, Runner
 from agents._config import set_default_openai_api
-from agents.mcp import MCPServerStdio, MCPServerSse
+from agents.mcp import MCPServerSse, MCPServerStdio
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent.parent)
@@ -14,11 +15,12 @@ if project_root not in sys.path:
 # 在设置Python路径后导入config
 from config.base_config import API_SETTINGS
 
-os.environ['OPENAI_API_KEY'] = API_SETTINGS['openai']['api_key']
-os.environ['OPENAI_BASE_URL'] = API_SETTINGS['openai']['base_url']
+os.environ["OPENAI_API_KEY"] = API_SETTINGS["openai"]["api_key"]
+os.environ["OPENAI_BASE_URL"] = API_SETTINGS["openai"]["base_url"]
 
 # 设置使用 chat_completions API
 set_default_openai_api("chat_completions")
+
 
 async def run_multi_service_example(pg_server, math_server, weather_server):
     agent = Agent(
@@ -62,6 +64,7 @@ async def run_multi_service_example(pg_server, math_server, weather_server):
     result = await Runner.run(starting_agent=agent, input=message)
     print(f"回答:\n{result.final_output}")
 
+
 # 多个服务嵌套
 async def main():
     # 启动 PostgreSQL 服务
@@ -69,7 +72,11 @@ async def main():
         name="Postgres",
         params={
             "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://postgres:postgres@localhost:5432/postgres"],
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-postgres",
+                "postgresql://postgres:postgres@localhost:5432/postgres",
+            ],
             "cwd": os.path.dirname(os.path.abspath(__file__)),
         },
     ) as pg_server:
@@ -96,8 +103,10 @@ async def main():
 
 
 if __name__ == "__main__":
+
     def delete_all_loggers():
         import logging
+
         loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
         for logger in loggers:
             handlers = logger.handlers[:]
@@ -107,4 +116,4 @@ if __name__ == "__main__":
             logger.setLevel(logging.CRITICAL)
 
     delete_all_loggers()
-    asyncio.run(main()) 
+    asyncio.run(main())

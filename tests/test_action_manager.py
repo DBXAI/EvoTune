@@ -1,4 +1,3 @@
-import os
 import sys
 from pathlib import Path
 
@@ -7,8 +6,10 @@ project_root = str(Path(__file__).parent.parent)
 sys.path.append(project_root)
 
 import pytest
+
 from src.agent.action.action_manager import ActionManager
-from src.utils.types import QueryInfo, AnomalyInfo
+from src.utils.types import AnomalyInfo, QueryInfo
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio
@@ -23,20 +24,10 @@ async def test_analyze_and_act_real():
             "Relation Name": "users",
             "Index Name": "users_pkey",
             "Scan Direction": "Forward",
-            "Index Cond": "(id > 1000)"
+            "Index Cond": "(id > 1000)",
         },
         query_kpis={
-            "cpu_usage": [
-                        3.99,
-                        6.66,
-                        4.79,
-                        7.27,
-                        4.71,
-                        8.07,
-                        4.44,
-                        5.41,
-                        6.49
-                    ],
+            "cpu_usage": [3.99, 6.66, 4.79, 7.27, 4.71, 8.07, 4.44, 5.41, 6.49],
             "memory_usage": [
                 432156.695458,
                 9953127.871385999,
@@ -46,7 +37,7 @@ async def test_analyze_and_act_real():
                 3905716.280115,
                 1079630.335619,
                 6755084.977418,
-                1093518.767145
+                1093518.767145,
             ],
             "io_wait": [
                 423261.91899499996,
@@ -57,7 +48,7 @@ async def test_analyze_and_act_real():
                 4214266.963897,
                 1203685.4308099998,
                 6732651.100027,
-                1163080.240563
+                1163080.240563,
             ],
             "network_traffic": [
                 432156.749552,
@@ -68,30 +59,16 @@ async def test_analyze_and_act_real():
                 3905713.454921,
                 1079630.407596,
                 6755084.861524001,
-                1093518.952031
-            ]
+                1093518.952031,
+            ],
         },
-        log_all={
-            "read_rows": 199642.5,
-            "write_rows": 0.0,
-            "scan_rows": 0.0
-        },
-        execution_time=199642.50
+        log_all={"read_rows": 199642.5, "write_rows": 0.0, "scan_rows": 0.0},
+        execution_time=199642.50,
     )
-    
+
     anomaly_info = AnomalyInfo(
         kpis={
-            "cpu_usage": [
-                3.99,
-                6.66,
-                4.79,
-                7.27,
-                4.71,
-                8.07,
-                4.44,
-                5.41,
-                6.49
-            ],
+            "cpu_usage": [3.99, 6.66, 4.79, 7.27, 4.71, 8.07, 4.44, 5.41, 6.49],
             "memory_usage": [
                 432156.695458,
                 9953127.871385999,
@@ -101,7 +78,7 @@ async def test_analyze_and_act_real():
                 3905716.280115,
                 1079630.335619,
                 6755084.977418,
-                1093518.767145
+                1093518.767145,
             ],
             "io_wait": [
                 423261.91899499996,
@@ -112,7 +89,7 @@ async def test_analyze_and_act_real():
                 4214266.963897,
                 1203685.4308099998,
                 6732651.100027,
-                1163080.240563
+                1163080.240563,
             ],
             "network_traffic": [
                 432156.749552,
@@ -123,56 +100,54 @@ async def test_analyze_and_act_real():
                 3905713.454921,
                 1079630.407596,
                 6755084.861524001,
-                1093518.952031
-            ]
+                1093518.952031,
+            ],
         },
         kpi_descriptions={
             "cpu_usage": "avg_value: 5.76",
             "memory_usage": "avg_value: 3114636.06",
             "io_wait": "avg_value: 3287872.63",
-            "network_traffic": "avg_value: 3114635.74"
+            "network_traffic": "avg_value: 3114635.74",
         },
-        log_info={
-            "read_rows": 199642.5,
-            "write_rows": 0.0,
-            "scan_rows": 0.0        
-        }
+        log_info={"read_rows": 199642.5, "write_rows": 0.0, "scan_rows": 0.0},
     )
-    
+
     historical_data = [
         {
             "query_id": "hist_1",
             "execution_time": 1.2,
             "cpu_usage": 60.5,
             "memory_usage": 800.2,
-            "timestamp": "2024-03-21T09:55:00"
+            "timestamp": "2024-03-21T09:55:00",
         },
         {
             "query_id": "hist_2",
             "execution_time": 1.8,
             "cpu_usage": 70.5,
             "memory_usage": 900.3,
-            "timestamp": "2024-03-21T09:57:00"
-        }
+            "timestamp": "2024-03-21T09:57:00",
+        },
     ]
 
     try:
         # 创建 ActionManager 实例并使用异步上下文管理器
         async with ActionManager() as action_manager:
             print("\n=== Starting analyze_and_act with real MCP server ===")
-            
+
             result = await action_manager.analyze_and_act(
                 root_causes=["Query performance degradation due to high CPU usage"],
                 query_info=query_info,
                 anomaly_info=anomaly_info,
-                historical_data=historical_data
+                historical_data=historical_data,
             )
-            
+
     except Exception as e:
         print(f"\nError during test: {str(e)}")
         raise
 
+
 if __name__ == "__main__":
     # 直接运行此文件时使用
     import asyncio
-    asyncio.run(test_analyze_and_act_real()) 
+
+    asyncio.run(test_analyze_and_act_real())

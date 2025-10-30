@@ -1,60 +1,65 @@
-import psycopg
-from psycopg.rows import dict_row
-from plumbum import local
-from collections import defaultdict
 import json
-import time
-from .resource_monitor import ResourceMonitor
-from decimal import Decimal
 import re
+import time
+from collections import defaultdict
+from decimal import Decimal
+
+import psycopg
+from plumbum import local
+from psycopg.rows import dict_row
+
+from .resource_monitor import ResourceMonitor
+
 
 class PostgresDB:
     def __init__(self, db_config):
-        self.user = db_config['user']
-        self.password = db_config['password']
-        self.host = db_config['host']
-        self.port = db_config['port']
-        self.dbname = db_config['dbname']
-        self.db_type = 'postgresql'
-        self.workload_type = db_config.get('workload_type', 'OLAP')
-        self.postgres_path = db_config.get('postgres_path')
-        self.postgres_data = db_config.get('postgres_data')
-        self.log_path = db_config.get('log_path')
-        self.query_timeout = db_config.get('query_timeout')
+        self.user = db_config["user"]
+        self.password = db_config["password"]
+        self.host = db_config["host"]
+        self.port = db_config["port"]
+        self.dbname = db_config["dbname"]
+        self.db_type = "postgresql"
+        self.workload_type = db_config.get("workload_type", "OLAP")
+        self.postgres_path = db_config.get("postgres_path")
+        self.postgres_data = db_config.get("postgres_data")
+        self.log_path = db_config.get("log_path")
+        self.query_timeout = db_config.get("query_timeout")
 
         self.conn_str = self._connect_str()
         self.connection = None
 
     def _connect_str(self):
         return "host={host} port={port} dbname={dbname} user={user} password={password}".format(
-                host=self.host,
-                port=int(self.port),
-                dbname=self.dbname,
-                user=self.user,
-                password=self.password
+            host=self.host,
+            port=int(self.port),
+            dbname=self.dbname,
+            user=self.user,
+            password=self.password,
         )
 
     def close(self):
         if self.connection:
             self.connection.close()
             self.connection = None
-    
+
     def connect(self):
         """建立并返回一个数据库连接"""
         if self.connection is None or self.connection.closed:
-            self.connection = psycopg.connect(self.conn_str, autocommit=True, prepare_threshold=None)
+            self.connection = psycopg.connect(
+                self.conn_str, autocommit=True, prepare_threshold=None
+            )
         return self.connection
 
     def execute(self, sql, conn=None, timeout=None):
         if conn is None:
             conn = self.connect()
-        
+
         if timeout is None:
             timeout = self.query_timeout
-        
+
         with conn.cursor() as cur:
             try:
-                cur.execute(f"SET statement_timeout = {timeout * 1000}") # 设置超时
+                cur.execute(f"SET statement_timeout = {timeout * 1000}")  # 设置超时
                 start_time = time.time()
                 cur.execute(sql)
                 end_time = time.time()
@@ -73,60 +78,71 @@ class PostgresDB:
     def fetch_results(self, sql, as_json=False, timeout=None):
         if timeout is None:
             timeout = self.query_timeout
-            
+
         conn = self.connect()
         with conn.cursor() as cursor:
             try:
                 statements = self.extract_sql_statements(sql)
                 if not statements:
                     statements = [sql]
-                
+
                 select_results = None
-                
+
                 for i, stmt in enumerate(statements):
                     if self.is_select_statement(stmt):
                         # print(f"执行SELECT语句 {i+1}: {stmt[:100]}...")
                         cursor.execute(f"SET statement_timeout = {timeout * 1000}")
                         cursor.execute(stmt)
-                        
+
                         select_results = cursor.fetchall()
                         if len(cursor.description) == 1:
                             select_results = [row[0] for row in select_results]
 
                         # print("result:", select_results)
                         # print(f"SELECT语句返回 {len(select_results)} 行结果")
-                        
+
                     else:
                         # print(f"执行非SELECT语句 {i+1}: {stmt[:50]}...")
                         # 执行非SELECT语句（如CREATE VIEW, DROP VIEW）
                         cursor.execute(stmt)
                         conn.commit()
-                
+
                 if select_results is not None:
                     if as_json:
                         columns = [col.name for col in cursor.description]
                         results = [dict(zip(columns, row)) for row in select_results]
-                        return json.dumps(results, indent=4, ensure_ascii=False, default=self.decimal_default)
+                        return json.dumps(
+                            results,
+                            indent=4,
+                            ensure_ascii=False,
+                            default=self.decimal_default,
+                        )
                     if select_results and isinstance(select_results[0], (dict, list)):
                         return json.dumps(select_results, ensure_ascii=False)
                     return select_results
                 else:
                     # print("未找到SELECT语句，返回空结果")
                     return []
-                
+
             except psycopg.errors.QueryCanceled as e:
-                print(f"查询超时 (>{timeout}秒): {str(e)}") 
+                print(f"查询超时 (>{timeout}秒): {str(e)}")
                 return []
             except Exception as e:
                 print(f"查询执行失败: {str(e)}")
                 return []
-    
+
     def extract_sql_statements(self, sql_text):
-        return [stmt.strip() for stmt in sql_text.split(';') if stmt.strip()]
-    
+        return [stmt.strip() for stmt in sql_text.split(";") if stmt.strip()]
+
     def is_select_statement(self, sql):
         sql = sql.strip()
-        return bool(re.match(r'^\s*(?:WITH\s+.*?\s+)?(?:SELECT|EXPLAIN)\s+', sql, re.IGNORECASE | re.DOTALL))
+        return bool(
+            re.match(
+                r"^\s*(?:WITH\s+.*?\s+)?(?:SELECT|EXPLAIN)\s+",
+                sql,
+                re.IGNORECASE | re.DOTALL,
+            )
+        )
 
     def get_size(self):
         sql = f"""
@@ -161,13 +177,10 @@ class PostgresDB:
         return self.fetch_results(sql)
 
     def get_current_knob_values(self, knob_config):
-        current_values = {
-            'system_knobs': {},
-            'query_knobs': {}
-        }
+        current_values = {"system_knobs": {}, "query_knobs": {}}
 
-        if 'system_knobs' in knob_config:
-            system_knobs = list(knob_config['system_knobs'].keys())
+        if "system_knobs" in knob_config:
+            system_knobs = list(knob_config["system_knobs"].keys())
             if system_knobs:
                 sql = f"SELECT name, setting FROM pg_settings WHERE name IN {tuple(system_knobs)};"
                 results = self.fetch_results(sql, as_json=True)
@@ -175,10 +188,10 @@ class PostgresDB:
                     if isinstance(results, str):
                         results = json.loads(results)
                     for row in results:
-                        current_values['system_knobs'][row['name']] = row['setting']
-        
-        if 'query_knobs' in knob_config:
-            query_knobs = list(knob_config['query_knobs'].keys())
+                        current_values["system_knobs"][row["name"]] = row["setting"]
+
+        if "query_knobs" in knob_config:
+            query_knobs = list(knob_config["query_knobs"].keys())
             if query_knobs:
                 sql = f"SELECT name, setting FROM pg_settings WHERE name IN {tuple(query_knobs)};"
                 results = self.fetch_results(sql, as_json=True)
@@ -186,8 +199,8 @@ class PostgresDB:
                     if isinstance(results, str):
                         results = json.loads(results)
                     for row in results:
-                        current_values['query_knobs'][row['name']] = row['setting']
-            
+                        current_values["query_knobs"][row["name"]] = row["setting"]
+
         return current_values
 
     def fetch_schema_info(self):
@@ -241,25 +254,32 @@ class PostgresDB:
             fk_info = None
             if ref_table and ref_col:
                 fk_info = {"referenced_table": ref_table, "referenced_column": ref_col}
-            schema_dict[table_name]["columns"].append({
-                "column_name": column_name,
-                "data_type": data_type,
-                "is_primary_key": is_pk,
-                "foreign_key": fk_info
-            })
+            schema_dict[table_name]["columns"].append(
+                {
+                    "column_name": column_name,
+                    "data_type": data_type,
+                    "is_primary_key": is_pk,
+                    "foreign_key": fk_info,
+                }
+            )
 
         return dict(schema_dict)
 
     def start_db(self):
         if not all([self.postgres_path, self.postgres_data, self.log_path]):
-            raise ValueError("postgres_path, postgres_data, and log_path must be configured to start the database.")
+            raise ValueError(
+                "postgres_path, postgres_data, and log_path must be configured to start the database."
+            )
         pg_ctl_cmd = [
             f"{self.postgres_path}/pg_ctl",
-            "-D", self.postgres_data,
+            "-D",
+            self.postgres_data,
             "--wait",
-            "-t", "180",
-            "-l", f"{self.log_path}/pg.log",
-            "start"
+            "-t",
+            "180",
+            "-l",
+            f"{self.log_path}/pg.log",
+            "start",
         ]
         cmd = ["-u", "postgres"] + pg_ctl_cmd
         retcode, _, stderr = local["sudo"][cmd].run(retcode=None)
@@ -269,9 +289,12 @@ class PostgresDB:
         for _ in range(10):
             pg_isready_cmd = [
                 f"{self.postgres_path}/pg_isready",
-                "--host", self.host,
-                "--port", str(self.port),
-                "--dbname", self.dbname
+                "--host",
+                self.host,
+                "--port",
+                str(self.port),
+                "--dbname",
+                self.dbname,
             ]
             cmd = ["-u", "postgres"] + pg_isready_cmd
             retcode, _, _ = local["sudo"][cmd].run(retcode=None)
@@ -282,13 +305,17 @@ class PostgresDB:
 
     def shutdown_db(self):
         if not all([self.postgres_path, self.postgres_data]):
-            raise ValueError("postgres_path and postgres_data must be configured to shut down the database.")
+            raise ValueError(
+                "postgres_path and postgres_data must be configured to shut down the database."
+            )
         pg_ctl_cmd = [
             f"{self.postgres_path}/pg_ctl",
             "stop",
             "--wait",
-            "-t", "180",
-            "-D", self.postgres_data
+            "-t",
+            "180",
+            "-D",
+            self.postgres_data,
         ]
         cmd = ["-u", "postgres"] + pg_ctl_cmd
         local["sudo"][cmd].run(retcode=None)
@@ -296,9 +323,12 @@ class PostgresDB:
         for _ in range(10):
             pg_isready_cmd = [
                 f"{self.postgres_path}/pg_isready",
-                "--host", self.host,
-                "--port", str(self.port),
-                "--dbname", self.dbname
+                "--host",
+                self.host,
+                "--port",
+                str(self.port),
+                "--dbname",
+                self.dbname,
             ]
             cmd = ["-u", "postgres"] + pg_isready_cmd
             retcode, _, _ = local["sudo"][cmd].run(retcode=None)
@@ -325,8 +355,24 @@ class PostgresDB:
         self.execute(sql)
 
         monitor.terminate()
-        cpu_usage, read_io, write_io, virtual_memory, physical_memory, net_recv, net_sent = monitor.get_monitor_data()
-        return cpu_usage, read_io, write_io, virtual_memory, physical_memory, net_recv, net_sent
+        (
+            cpu_usage,
+            read_io,
+            write_io,
+            virtual_memory,
+            physical_memory,
+            net_recv,
+            net_sent,
+        ) = monitor.get_monitor_data()
+        return (
+            cpu_usage,
+            read_io,
+            write_io,
+            virtual_memory,
+            physical_memory,
+            net_recv,
+            net_sent,
+        )
 
     def get_plan(self, sql):
         """
@@ -354,7 +400,14 @@ class PostgresDB:
 
                 # 2. 找到第一个可 EXPLAIN 的查询语句（WITH/SELECT/INSERT/UPDATE/DELETE）
                 for stmt in statements:
-                    if stmt.upper().startswith("WITH") or stmt.upper().startswith("SELECT") or stmt.upper().startswith("/*+") or stmt.upper().startswith("INSERT") or stmt.upper().startswith("UPDATE") or stmt.upper().startswith("DELETE"):
+                    if (
+                        stmt.upper().startswith("WITH")
+                        or stmt.upper().startswith("SELECT")
+                        or stmt.upper().startswith("/*+")
+                        or stmt.upper().startswith("INSERT")
+                        or stmt.upper().startswith("UPDATE")
+                        or stmt.upper().startswith("DELETE")
+                    ):
                         try:
                             plan_sql = f"EXPLAIN (FORMAT JSON) {stmt}"
                             plan_result = self.fetch_results(plan_sql)
@@ -382,20 +435,29 @@ class PostgresDB:
             except Exception as e:
                 print(f"获取执行计划失败: {e}")
                 return None
-    
+
     def get_metrics_specification(self):
         return {
             "pg_stat_database": [
-                "tup_returned", "blks_hit", "blks_read", "tup_fetched"
+                "tup_returned",
+                "blks_hit",
+                "blks_read",
+                "tup_fetched",
             ],
             "pg_stat_user_tables": [
-                "idx_tup_fetch", "seq_tup_read", "seq_scan", "idx_scan"
+                "idx_tup_fetch",
+                "seq_tup_read",
+                "seq_scan",
+                "idx_scan",
             ],
             "pg_statio_user_tables": [
-                "heap_blks_hit", "heap_blks_read", "idx_blks_hit", "idx_blks_read"
+                "heap_blks_hit",
+                "heap_blks_read",
+                "idx_blks_hit",
+                "idx_blks_read",
             ],
         }
-    
+
     def collect_metrics(self, conn):
         data = {}
         METRICS_SPECIFICATION = self.get_metrics_specification()
@@ -404,7 +466,9 @@ class PostgresDB:
                 try:
                     # 只采集当前数据库
                     if table == "pg_stat_database":
-                        cursor.execute(f"SELECT * FROM {table} WHERE datname = current_database()")
+                        cursor.execute(
+                            f"SELECT * FROM {table} WHERE datname = current_database()"
+                        )
                     else:
                         cursor.execute(f"SELECT * FROM {table}")
                     records = cursor.fetchall()
@@ -453,7 +517,7 @@ class PostgresDB:
         # 4. execution_time
         metrics_list.append(execution_time)
         return metrics_list
-    
+
     def get_log_diff(self, log_before, log_after):
         diff = {}
         for table in log_before:
@@ -473,7 +537,9 @@ class PostgresDB:
                         v_before = row_before.get(k, 0)
                         v_after = row_after.get(k, 0)
                         try:
-                            sum_row[k] += (v_after if v_after is not None else 0) - (v_before if v_before is not None else 0)
+                            sum_row[k] += (v_after if v_after is not None else 0) - (
+                                v_before if v_before is not None else 0
+                            )
                         except Exception:
                             pass
                 diff[table] = sum_row
@@ -488,20 +554,22 @@ class PostgresDB:
                         v_before = row_before.get(k, 0)
                         v_after = row_after.get(k, 0)
                         try:
-                            row_diff[k] = (v_after if v_after is not None else 0) - (v_before if v_before is not None else 0)
+                            row_diff[k] = (v_after if v_after is not None else 0) - (
+                                v_before if v_before is not None else 0
+                            )
                         except Exception:
                             row_diff[k] = None
-                    for id_key in ['relname', 'datname', 'table_name']:
+                    for id_key in ["relname", "datname", "table_name"]:
                         if id_key in row_before:
                             row_diff[id_key] = row_before[id_key]
                     table_diff.append(row_diff)
                 diff[table] = table_diff
         return diff
-    
+
     def run_sql_and_collect_all(self, sql, interval=1, warmup=0, timeout=None):
         if timeout is None:
             timeout = self.query_timeout
-            
+
         conn = self.connect()
 
         log_before = self.collect_metrics(conn)
@@ -513,8 +581,24 @@ class PostgresDB:
         _, _, execution_time, _ = self.execute(sql, timeout=timeout)
 
         monitor.terminate()
-        cpu_usage, read_io, write_io, virtual_memory, physical_memory, net_recv, net_sent = monitor.get_monitor_data()
-        metrics = [cpu_usage, read_io, write_io, virtual_memory, physical_memory, net_recv, net_sent]
+        (
+            cpu_usage,
+            read_io,
+            write_io,
+            virtual_memory,
+            physical_memory,
+            net_recv,
+            net_sent,
+        ) = monitor.get_monitor_data()
+        metrics = [
+            cpu_usage,
+            read_io,
+            write_io,
+            virtual_memory,
+            physical_memory,
+            net_recv,
+            net_sent,
+        ]
 
         log_after = self.collect_metrics(conn)
 
@@ -526,7 +610,7 @@ class PostgresDB:
             "plan_json": plan,
             "internal_metrics": log_list,
             "external_metrics": metrics,
-            "duration": execution_time
+            "duration": execution_time,
         }
 
     def decimal_default(self, obj):
@@ -540,16 +624,17 @@ class PostgresDB:
         支持 SQL 中包含 CREATE VIEW + SELECT + DROP VIEW。
         如果两个SQL都有CREATE VIEW，会分别执行后比较结果。
         """
+
         def clean_sql(sql):
-            lines = sql.split('\n')
+            lines = sql.split("\n")
             cleaned_lines = []
             for line in lines:
-                if '--' in line:
-                    line = line.split('--')[0]
+                if "--" in line:
+                    line = line.split("--")[0]
                 cleaned_lines.append(line.strip())
-            sql = ' '.join(cleaned_lines)
-            sql = ' '.join(sql.split())
-            return sql.strip().rstrip(';')
+            sql = " ".join(cleaned_lines)
+            sql = " ".join(sql.split())
+            return sql.strip().rstrip(";")
 
         try:
             sql1 = clean_sql(sql1)
@@ -562,12 +647,12 @@ class PostgresDB:
             # print(f"result2: {result2}")
 
             from collections import Counter
+
             return Counter(result1) == Counter(result2)
 
         except Exception as e:
             print(f"比较SQL结果时出错: {e}")
             return False
-
 
     # def compare_sql_results(self, sql1, sql2):
     #     """
@@ -585,7 +670,7 @@ class PostgresDB:
     #                 if '--' in line:
     #                     line = line.split('--')[0]
     #                 cleaned_lines.append(line.strip())
-                
+
     #             # 合并并清理
     #             sql = ' '.join(cleaned_lines)
     #             # 去除多余空白
@@ -593,29 +678,27 @@ class PostgresDB:
     #             # 去除结尾分号
     #             sql = sql.rstrip(';')
     #             return sql
-            
+
     #         sql1 = clean_sql(sql1)
     #         sql2 = clean_sql(sql2)
-            
+
     #         conn = self.connect()
-            
+
     #         # 构建EXCEPT查询，确保SQL语法正确
     #         except1 = f"SELECT * FROM ({sql1}) AS t1 EXCEPT ALL SELECT * FROM ({sql2}) AS t2"
     #         except2 = f"SELECT * FROM ({sql2}) AS t2 EXCEPT ALL SELECT * FROM ({sql1}) AS t1"
-            
+
     #         with conn.cursor() as cursor:
     #             cursor.execute(except1)
     #             diff1 = cursor.fetchall()
     #             cursor.execute(except2)
     #             diff2 = cursor.fetchall()
-            
+
     #         return len(diff1) == 0 and len(diff2) == 0
-            
+
     #     except Exception as e:
     #         print(f"比较SQL结果时出错: {e}")
     #         print(f"SQL1: {sql1}")
     #         print(f"SQL2: {sql2}")
     #         # 如果比较失败，返回False表示结果不一致
     #         return False
-
-

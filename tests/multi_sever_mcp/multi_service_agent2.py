@@ -2,9 +2,10 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+
 from agents import Agent, Runner
 from agents._config import set_default_openai_api
-from agents.mcp import MCPServerStdio, MCPServerSse
+from agents.mcp import MCPServerSse, MCPServerStdio
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent.parent)
@@ -14,11 +15,12 @@ if project_root not in sys.path:
 # 在设置Python路径后导入config
 from config.base_config import API_SETTINGS
 
-os.environ['OPENAI_API_KEY'] = API_SETTINGS['openai']['api_key']
-os.environ['OPENAI_BASE_URL'] = API_SETTINGS['openai']['base_url']
+os.environ["OPENAI_API_KEY"] = API_SETTINGS["openai"]["api_key"]
+os.environ["OPENAI_BASE_URL"] = API_SETTINGS["openai"]["base_url"]
 
 # 设置使用 chat_completions API
 set_default_openai_api("chat_completions")
+
 
 async def run_multi_service_example(pg_server, math_server, weather_server):
     agent = Agent(
@@ -62,6 +64,7 @@ async def run_multi_service_example(pg_server, math_server, weather_server):
     result = await Runner.run(starting_agent=agent, input=message)
     print(f"回答:\n{result.final_output}")
 
+
 # asyncio.gather的形式
 async def start_servers():
     async def start_postgres():
@@ -69,7 +72,11 @@ async def start_servers():
             name="Postgres",
             params={
                 "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://postgres:postgres@localhost:5432/postgres"],
+                "args": [
+                    "-y",
+                    "@modelcontextprotocol/server-postgres",
+                    "postgresql://postgres:postgres@localhost:5432/postgres",
+                ],
                 "cwd": os.path.dirname(os.path.abspath(__file__)),
             },
         )
@@ -102,11 +109,10 @@ async def start_servers():
         return server
 
     pg_server, math_server, weather_server = await asyncio.gather(
-        start_postgres(),
-        start_math(),
-        start_weather()
+        start_postgres(), start_math(), start_weather()
     )
     return pg_server, math_server, weather_server
+
 
 async def main():
     servers = await start_servers()
@@ -120,9 +126,12 @@ async def main():
             except Exception as e:
                 print(f"Error during cleanup: {e}")
 
+
 if __name__ == "__main__":
+
     def delete_all_loggers():
         import logging
+
         loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
         for logger in loggers:
             handlers = logger.handlers[:]

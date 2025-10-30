@@ -1,9 +1,5 @@
 import os
 import sys
-import re
-import time
-import threading
-from sqlalchemy import create_engine, text
 
 # Add RCRank to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -12,16 +8,19 @@ if rcrank_path not in sys.path:
     sys.path.append(rcrank_path)
 
 
+import json
+
 import numpy as np
 import pandas as pd
-import json
-from agent.memory.memory_manager import MemoryManager
-from utils.types import QueryInfo, AnomalyInfo
-from agent.plan.online_predict import RCRankPredictor
+from agents import Agent, Runner
 from model.modules.QueryFormer.utils import Encoding
 from RCRank.utils.plan_encoding import PlanEncoder
-from agents import Agent, Runner
-from agent.prompt import build_root_cause_diagnosis_prompt, get_root_cause_llm_instructions
+
+from agent.prompt import (
+    build_root_cause_diagnosis_prompt,
+    get_root_cause_llm_instructions,
+)
+
 
 class Planner:
     def __init__(self, memory_manager, predictor, agent_config):
@@ -31,42 +30,52 @@ class Planner:
         self.device = predictor.device
 
         # Initialize encoding components
-        self.encoding = Encoding(None, {'NA': 0})
+        self.encoding = Encoding(None, {"NA": 0})
 
-        self.root_cause_model = self.agent_config.get('root_cause_llm_model')
-    
-    def encode_plan(self, query_plan):            
-        df = pd.DataFrame([{
-            'plan_json': json.dumps({'Plan': query_plan}) if isinstance(query_plan, dict) else query_plan
-        }])
-        
+        self.root_cause_model = self.agent_config.get("root_cause_llm_model")
+
+    def encode_plan(self, query_plan):
+        df = pd.DataFrame(
+            [
+                {
+                    "plan_json": (
+                        json.dumps({"Plan": query_plan})
+                        if isinstance(query_plan, dict)
+                        else query_plan
+                    )
+                }
+            ]
+        )
+
         plan_encoder = PlanEncoder(df=df, encoding=self.encoding)
         encoded_df = plan_encoder.df
-        
-        return encoded_df['json_plan_tensor'].iloc[0]
-    
+
+        return encoded_df["json_plan_tensor"].iloc[0]
+
     def model_predict(self, query_info):
         query, plan, timeseries, log = self._build_prediction_input(query_info)
-        
+
         pred_label_opt, pred_label = self.predictor.predict(
-            query=query,
-            plan=plan,
-            timeseries=timeseries,
-            log=log
+            query=query, plan=plan, timeseries=timeseries, log=log
         )
-        
+
         result = self._extract_top_root_cause(pred_label, pred_label_opt)
         result["pred_label_opt"] = pred_label_opt.cpu().numpy()
         return result
 
     def diagnosis_agent(self, prompt):
-        return Runner.run_sync(starting_agent=Agent(
-        name="RootCauseLLM",
-        model=self.root_cause_model,
-        instructions=get_root_cause_llm_instructions()
-        ), input=prompt).final_output.strip()
+        return Runner.run_sync(
+            starting_agent=Agent(
+                name="RootCauseLLM",
+                model=self.root_cause_model,
+                instructions=get_root_cause_llm_instructions(),
+            ),
+            input=prompt,
+        ).final_output.strip()
 
-    def llm_predict(self, query_info, root_causes, state_confidence, tuning_history=None):
+    def llm_predict(
+        self, query_info, root_causes, state_confidence, tuning_history=None
+    ):
         # ε-greedy retrieval structure: {"positive", "negative"}
         # retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
         # positives = retrieval.get('positive', [])
@@ -76,20 +85,20 @@ class Planner:
             query_info,
             root_causes,
             state_confidence=state_confidence,
-            tuning_history=tuning_history
+            tuning_history=tuning_history,
         )
         print("prompt: ", prompt)
 
         output = self.diagnosis_agent(prompt)
         print("output: ", output)
         parsed = self.parse_and_validate(output)
-        labels, conf_map = (parsed if parsed is not None else (None, None))
+        labels, conf_map = parsed if parsed is not None else (None, None)
         # retry
         retry = 0
         while labels is None and retry < 5:
             output = self.diagnosis_agent(prompt)
             parsed = self.parse_and_validate(output)
-            labels, conf_map = (parsed if parsed is not None else (None, None))
+            labels, conf_map = parsed if parsed is not None else (None, None)
             retry += 1
 
         if labels is None:
@@ -98,11 +107,12 @@ class Planner:
 
         return {"root_causes": labels, "confidence": conf_map}
 
-
     def parse_and_validate(self, json_text):
         try:
             data = json.loads(json_text)
-            reported_pred = [str(x).lower().strip() for x in data.get("predicted_root_causes", [])]
+            reported_pred = [
+                str(x).lower().strip() for x in data.get("predicted_root_causes", [])
+            ]
             items = data.get("root_causes", [])
 
             derived_pred = []
@@ -117,7 +127,7 @@ class Planner:
             # check
             if set(reported_pred) != set(derived_pred):
                 return None
-            
+
             if len(derived_pred) == 0:
                 derived_pred = ["normal"]
                 conf_map = {"normal": 1.0}
@@ -128,39 +138,39 @@ class Planner:
 
     def _build_prediction_input(self, query_info):
 
-        query = query_info.query if hasattr(query_info, 'query') else ""
+        query = query_info.query if hasattr(query_info, "query") else ""
         plan = self.encode_plan(query_info.plan_json)
         # timeseries = json.loads(query_info.external_metrics)
         # log = json.loads(query_info.internal_metrics)
         timeseries = query_info.external_metrics
         log = query_info.internal_metrics
-        
+
         return query, plan, timeseries, log
-    
+
     def _extract_top_root_cause(self, pred_label, pred_label_opt):
         pred_label = pred_label.cpu().numpy()
         pred_label_opt = pred_label_opt.cpu().numpy()
-        
+
         # issue type mapping
         issue_types = {
             0: "missing indexes",
             1: "inappropriate query knobs",
             2: "suboptimal plan optimizer",
             3: "poorly written queries",
-            4: "normal"
+            4: "normal",
         }
-        
+
         print("pred_label: ", pred_label)
         print("pred_label_opt: ", pred_label_opt)
-        
+
         if pred_label.sum() == 0:
             return {"root_causes": "normal"}
-        
+
         predicted_classes = np.where(pred_label[0] == 1)[0]
         if len(predicted_classes) == 0:
             return {"root_causes": "normal"}
             # return {"root_cause": "normal", "confidence": pred_label_opt}
-        
+
         root_causes = []
         root_causes_confidence = []
         for class_idx in predicted_classes:
@@ -168,7 +178,7 @@ class Planner:
             if root_cause not in root_causes:
                 root_causes.append(root_cause)
                 root_causes_confidence.append(pred_label_opt[0][class_idx])
-        
+
         return {"root_causes": root_causes}
         # root_cause = {
         #     "root_cause": root_causes,
@@ -178,36 +188,47 @@ class Planner:
     def predict(self, query_info, state, memory_manager):
         # 若已有 current_root，则直接复用；否则调用小模型+LLM 获取新的根因
         current_root = state.get("current_root")
-        if current_root is None:                        
+        if current_root is None:
             # 小模型初判 + 置信度
             model_out = self.model_predict(query_info)
-            current_root = model_out.get('root_causes')
+            current_root = model_out.get("root_causes")
             print("小模型预测根因: ", current_root)
-            pred_opt = model_out.get('pred_label_opt')
-            labels = ["missing indexes", "inappropriate query knobs", "suboptimal plan optimizer", "poorly written queries"]
+            pred_opt = model_out.get("pred_label_opt")
+            labels = [
+                "missing indexes",
+                "inappropriate query knobs",
+                "suboptimal plan optimizer",
+                "poorly written queries",
+            ]
             confidence = np.array(pred_opt).reshape(-1)
-            state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
+            state["confidence"] = {
+                labels[i]: float(confidence[i]) for i in range(confidence.shape[0])
+            }
 
         # 将当前根因和置信度传给LLM
         # 构建按根因聚合的历史成功/失败计数
         tuning_history = []
-        union_keys = set(state.get("attempts", {}).keys()) | set(state.get("successes", {}).keys())
+        union_keys = set(state.get("attempts", {}).keys()) | set(
+            state.get("successes", {}).keys()
+        )
         for k in union_keys:
             # 归一化为 frozenset 或单元素集合
             label = list(k)
-            tuning_history.append({
-                "label": label,
-                "success_count": int(state.get("successes", {}).get(k, 0)),
-                "fail_count": int(state.get("attempts", {}).get(k, 0))
-            })
-        
+            tuning_history.append(
+                {
+                    "label": label,
+                    "success_count": int(state.get("successes", {}).get(k, 0)),
+                    "fail_count": int(state.get("attempts", {}).get(k, 0)),
+                }
+            )
+
         llm_result = self.llm_predict(
             query_info,
             current_root,
             state_confidence=state.get("confidence"),
-            tuning_history=tuning_history
+            tuning_history=tuning_history,
         )
-        predicted_root = llm_result.get('root_causes')
-        state["confidence"] = llm_result.get('confidence')
-        
+        predicted_root = llm_result.get("root_causes")
+        state["confidence"] = llm_result.get("confidence")
+
         return predicted_root, state

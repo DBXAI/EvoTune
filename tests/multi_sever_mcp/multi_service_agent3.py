@@ -1,12 +1,13 @@
 import asyncio
 import os
 import sys
-import yaml
+from contextlib import asynccontextmanager
 from pathlib import Path
+
+import yaml
 from agents import Agent, Runner
 from agents._config import set_default_openai_api
-from agents.mcp import MCPServerStdio, MCPServerSse
-from contextlib import asynccontextmanager
+from agents.mcp import MCPServerSse, MCPServerStdio
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent.parent)
@@ -15,11 +16,12 @@ if project_root not in sys.path:
 
 from config.base_config import API_SETTINGS
 
-os.environ['OPENAI_API_KEY'] = API_SETTINGS['openai']['api_key']
-os.environ['OPENAI_BASE_URL'] = API_SETTINGS['openai']['base_url']
+os.environ["OPENAI_API_KEY"] = API_SETTINGS["openai"]["api_key"]
+os.environ["OPENAI_BASE_URL"] = API_SETTINGS["openai"]["base_url"]
 
 # 设置使用 chat_completions API
 set_default_openai_api("chat_completions")
+
 
 async def run_multi_service_example(pg_server, math_server, weather_server):
     agent = Agent(
@@ -63,6 +65,7 @@ async def run_multi_service_example(pg_server, math_server, weather_server):
     result = await Runner.run(starting_agent=agent, input=message)
     print(f"回答:\n{result.final_output}")
 
+
 class ServerConfig:
     def __init__(self, name, server_type, params):
         self.name = name
@@ -71,15 +74,16 @@ class ServerConfig:
 
     @classmethod
     def from_dict(cls, config):
-        server_type = MCPServerStdio if config['server_type'] == 'stdio' else MCPServerSse
-        # 处理相对路径
-        if 'cwd' in config['params'] and config['params']['cwd'] == '.':
-            config['params']['cwd'] = os.path.dirname(os.path.abspath(__file__))
-        return cls(
-            name=config['name'],
-            server_type=server_type,
-            params=config['params']
+        server_type = (
+            MCPServerStdio if config["server_type"] == "stdio" else MCPServerSse
         )
+        # 处理相对路径
+        if "cwd" in config["params"] and config["params"]["cwd"] == ".":
+            config["params"]["cwd"] = os.path.dirname(os.path.abspath(__file__))
+        return cls(
+            name=config["name"], server_type=server_type, params=config["params"]
+        )
+
 
 class MultiServerManager:
     def __init__(self, configs):
@@ -91,29 +95,37 @@ class MultiServerManager:
         try:
             for config in self.configs:
                 self.servers[config.name] = await config.server_type(
-                    name=config.name,
-                    params=config.params
+                    name=config.name, params=config.params
                 ).__aenter__()
             yield list(self.servers.values())
         finally:
             for server in self.servers.values():
                 await server.__aexit__(None, None, None)
 
+
 async def main():
     # 读取配置文件
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mcp_config.yaml')
-    with open(config_path, 'r', encoding='utf-8') as f:
+    config_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "mcp_config.yaml"
+    )
+    with open(config_path, "r", encoding="utf-8") as f:
         config_data = yaml.safe_load(f)
-    
-    configs = [ServerConfig.from_dict(service_config) for service_config in config_data['services']]
-    
+
+    configs = [
+        ServerConfig.from_dict(service_config)
+        for service_config in config_data["services"]
+    ]
+
     manager = MultiServerManager(configs)
     async with manager.manage_servers() as servers:
         await run_multi_service_example(*servers)
 
+
 if __name__ == "__main__":
+
     def delete_all_loggers():
         import logging
+
         loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
         for logger in loggers:
             handlers = logger.handlers[:]

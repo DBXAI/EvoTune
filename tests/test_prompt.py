@@ -1,14 +1,16 @@
-import os
-import time
-import psycopg2
 import asyncio
+import os
 import re
 import sys
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
-from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
-from agents._config import set_default_openai_api
+import time
 from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg2
+from agents import Agent, Runner
+from agents._config import set_default_openai_api
+
 # from pydantic import BaseModel
 
 # 添加项目根目录到Python路径
@@ -22,9 +24,11 @@ sys.path.append(str(Path(__file__).parent.parent))
 from src.database.pg_env import PostgresDB
 from src.utils.types import QueryInfo
 
+
 def delete_all_loggers():
     """清理和重置所有日志记录器"""
     import logging
+
     loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
     for logger in loggers:
         handlers = logger.handlers[:]
@@ -32,6 +36,7 @@ def delete_all_loggers():
             logger.removeHandler(handler)
         logger.propagate = True
         logger.setLevel(logging.CRITICAL)
+
 
 # 清理所有日志记录器
 delete_all_loggers()
@@ -42,7 +47,7 @@ PG_CONN_INFO = {
     "port": 5432,
     "user": "postgres",
     "password": "postgres",
-    "dbname": "tpch10G"
+    "dbname": "tpch10G",
 }
 
 # PostgreSQL配置
@@ -55,12 +60,12 @@ POSTGRES_CONFIG = {
     "workload_type": "OLAP",
     "postgres_path": None,
     "postgres_data": None,
-    "log_path": None
+    "log_path": None,
 }
 
 # 设置大模型API
-os.environ['OPENAI_API_KEY'] = ""
-os.environ['OPENAI_BASE_URL'] = ""
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["OPENAI_BASE_URL"] = ""
 set_default_openai_api("chat_completions")
 
 # class ActionResult(BaseModel):
@@ -68,9 +73,10 @@ set_default_openai_api("chat_completions")
 #     Fix_Action: str
 #     Query_Rewrite: str
 
+
 class TestPromptManager:
     """SQL测试和修复管理器，参照action_manager.py的结构"""
-    
+
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = config_path
         self.agent = None
@@ -78,29 +84,29 @@ class TestPromptManager:
         self.exit_stack = AsyncExitStack()
         self._conn = None
         self.postgres_db = None
-        
+
     async def __aenter__(self):
         """异步上下文管理器的进入方法"""
         await self.initialize()
         return self
-        
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """异步上下文管理器的退出方法"""
-        
+
         # 清理数据库连接
         if self._conn:
             try:
                 self._conn.close()
             except Exception as e:
                 print(f"Warning: Error closing database connection: {e}")
-        
+
         # 清理 agent
         if self.agent:
             self.agent = None
-            
+
         if self.fix_agent:
             self.fix_agent = None
-            
+
         # 清理 exit_stack
         try:
             await self.exit_stack.aclose()
@@ -108,25 +114,25 @@ class TestPromptManager:
             pass
         except Exception as e:
             print(f"Warning: Error during exit stack cleanup: {e}")
-            
+
     async def initialize(self):
         """初始化 Agent 和数据库连接"""
         # 初始化PostgresDB
         self.postgres_db = PostgresDB(
-            user=POSTGRES_CONFIG['user'],
-            password=POSTGRES_CONFIG['password'],
-            host=POSTGRES_CONFIG['host'],
-            port=POSTGRES_CONFIG['port'],
-            dbname=POSTGRES_CONFIG['dbname'],
-            workload_type=POSTGRES_CONFIG['workload_type'],
-            postgres_path=POSTGRES_CONFIG['postgres_path'],
-            postgres_data=POSTGRES_CONFIG['postgres_data'],
-            log_path=POSTGRES_CONFIG['log_path']
+            user=POSTGRES_CONFIG["user"],
+            password=POSTGRES_CONFIG["password"],
+            host=POSTGRES_CONFIG["host"],
+            port=POSTGRES_CONFIG["port"],
+            dbname=POSTGRES_CONFIG["dbname"],
+            workload_type=POSTGRES_CONFIG["workload_type"],
+            postgres_path=POSTGRES_CONFIG["postgres_path"],
+            postgres_data=POSTGRES_CONFIG["postgres_data"],
+            log_path=POSTGRES_CONFIG["log_path"],
         )
-        
+
         # 初始化数据库连接（保持向后兼容）
         self._conn = psycopg2.connect(**PG_CONN_INFO)
-        
+
         # # 初始化主Agent
         self.agent = Agent(
             name="SQLFixAgent",
@@ -147,7 +153,7 @@ class TestPromptManager:
         # self.agent = Agent(
         #     name="SQLFixAgent",
         #     instructions=self._get_agent_instructions(),
-        #     model=OpenAIChatCompletionsModel( 
+        #     model=OpenAIChatCompletionsModel(
         #         model="claude-3-7-sonnet-20250219",
         #         openai_client=claude_client,
         #     ),
@@ -155,7 +161,7 @@ class TestPromptManager:
         # )
 
         return self.agent
-            
+
     def _get_agent_instructions(self) -> str:
         """获取主Agent的指令"""
         return """You are an expert in database performance diagnosis and SQL optimization.
@@ -172,28 +178,30 @@ class TestPromptManager:
     def get_database_info(self) -> Dict[str, Any]:
         """获取数据库信息"""
         return {
-            'db_type': self.postgres_db.db_type,
-            'workload_type': self.postgres_db.workload_type,
-            'size': self.postgres_db.get_size(),
-            'schema': self.postgres_db.fetch_schema_info(),
+            "db_type": self.postgres_db.db_type,
+            "workload_type": self.postgres_db.workload_type,
+            "size": self.postgres_db.get_size(),
+            "schema": self.postgres_db.fetch_schema_info(),
         }
-        
+
     @staticmethod
     def extract_index_names(sql: str) -> List[str]:
         """从多条CREATE INDEX语句中提取所有索引名"""
-        return re.findall(r'CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)', sql, re.IGNORECASE)
-        
+        return re.findall(
+            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE
+        )
+
     @staticmethod
     def extract_knob_names(sql: str) -> List[str]:
         """从多条SET语句中提取所有knob名"""
-        return re.findall(r'SET\s+([a-zA-Z0-9_]+)\s*=', sql, re.IGNORECASE)
-        
+        return re.findall(r"SET\s+([a-zA-Z0-9_]+)\s*=", sql, re.IGNORECASE)
+
     @staticmethod
     def read_sql_file(file_path: str) -> str:
         """读取SQL文件"""
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
-            
+
     def execute_sql_and_time(self, sql: str, timeout: int = 120) -> float:
         """执行SQL并计时"""
         with self._conn.cursor() as cur:
@@ -216,7 +224,7 @@ class TestPromptManager:
             except Exception as e:
                 self._conn.rollback()
                 raise e
-                
+
     def get_sql_plan(self, sql: str, timeout: int = 120) -> str:
         """获取SQL执行计划"""
         cmd = f"EXPLAIN ANALYZE {sql}"
@@ -233,7 +241,7 @@ class TestPromptManager:
             except Exception as e:
                 print(f"获取SQL计划失败: {e}")
                 return ""
-                
+
     def rollback_action(self, index_names: List[str], knob_names: List[str]):
         """撤销修复动作"""
         # 撤销所有索引
@@ -246,7 +254,7 @@ class TestPromptManager:
             except Exception as e:
                 self._conn.rollback()
                 print(f"撤销索引失败: {e}")
-                
+
         # 撤销所有knob设置
         for knob_name in knob_names:
             try:
@@ -257,34 +265,36 @@ class TestPromptManager:
             except Exception as e:
                 self._conn.rollback()
                 print(f"恢复{knob_name}失败: {e}")
-                
+
     @staticmethod
     def parse_action_result(diagnosis: str):
         """从diagnosis文本中提取Explanation、Fix_Action和Query_Rewrite部分"""
 
         # 提取Explanation (匹配 Explanation: 或 **Explanation** 或 Explanation)
         explanation_match = re.search(
-            r'(?:\*\*?\s*)?Explanation(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:Fix_Action|SQL\s*Fix|Query_Rewrite|$))',
+            r"(?:\*\*?\s*)?Explanation(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:Fix_Action|SQL\s*Fix|Query_Rewrite|$))",
             diagnosis,
-            re.IGNORECASE
+            re.IGNORECASE,
         )
         explanation = explanation_match.group(1).strip() if explanation_match else ""
 
         # 提取FIX_ACTION (匹配 FIX_ACTION: 或 **SQL Fix** 或 SQL Fix)
         fix_match = re.search(
-            r'(?:\*\*?\s*)?(?:Fix_Action|SQL\s*Fix)(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:Query_Rewrite|Explanation|$))',
+            r"(?:\*\*?\s*)?(?:Fix_Action|SQL\s*Fix)(?:\s*\*\*?)?\s*:?\s*([\s\S]+?)(?=(?:\*\*?\s*)?(?:Query_Rewrite|Explanation|$))",
             diagnosis,
-            re.IGNORECASE
+            re.IGNORECASE,
         )
         fix_action = fix_match.group(1).strip() if fix_match else ""
 
         # 提取Query_Rewrite (匹配 Query_Rewrite: yes/no)
         is_rewrite_match = re.search(
-            r'(?:\*\*?\s*)?Query_Rewrite(?:\s*\*\*?)?\s*:?\s*(yes|no)',
+            r"(?:\*\*?\s*)?Query_Rewrite(?:\s*\*\*?)?\s*:?\s*(yes|no)",
             diagnosis,
-            re.IGNORECASE
+            re.IGNORECASE,
         )
-        is_rewrite = is_rewrite_match.group(1).strip().lower() if is_rewrite_match else "no"
+        is_rewrite = (
+            is_rewrite_match.group(1).strip().lower() if is_rewrite_match else "no"
+        )
 
         # 清理 markdown 符号
         for var_name in ["explanation", "fix_action", "is_rewrite"]:
@@ -293,7 +303,7 @@ class TestPromptManager:
             locals()[var_name] = val
 
         return explanation, fix_action, is_rewrite
-            
+
     @staticmethod
     def extract_fix_action(fix_action: str) -> Tuple[str, str]:
         """提取修复动作和主SQL"""
@@ -301,7 +311,13 @@ class TestPromptManager:
         sql_start = None
         for idx, line in enumerate(lines):
             l = line.lstrip().upper()
-            if l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or l.startswith("UPDATE") or l.startswith("DELETE"):
+            if (
+                l.startswith("WITH")
+                or l.startswith("SELECT")
+                or l.startswith("INSERT")
+                or l.startswith("UPDATE")
+                or l.startswith("DELETE")
+            ):
                 sql_start = idx
                 break
         if sql_start is not None:
@@ -310,26 +326,42 @@ class TestPromptManager:
             return fix_part, sql_part
         else:
             return fix_action.strip(), ""
-            
-    async def call_fix_agent(self, query_info, db_info, root_cause, action_space_apis, historical_cases, inspirations):
+
+    async def call_fix_agent(
+        self,
+        query_info,
+        db_info,
+        root_cause,
+        action_space_apis,
+        historical_cases,
+        inspirations,
+    ):
         """调用修复Agent"""
         if not self.agent:
             await self.initialize()
-            
-        prompt = self._build_prompt(query_info, db_info, root_cause, historical_cases, inspirations)
+
+        prompt = self._build_prompt(
+            query_info, db_info, root_cause, historical_cases, inspirations
+        )
         print(f"prompt: {prompt}")
 
         result = await Runner.run(starting_agent=self.agent, input=prompt)
         print(f"claude result: {result.final_output}")
         return result.final_output.strip()
-        
-    async def evaluate_action(self, fix_action: str, rewrite_sql: str, query_info: QueryInfo, max_retry: int = 5):
+
+    async def evaluate_action(
+        self,
+        fix_action: str,
+        rewrite_sql: str,
+        query_info: QueryInfo,
+        max_retry: int = 5,
+    ):
         """评估修复动作"""
         # 检查修复SQL能否执行
         success = False
         retry_count = 0
         err = ""
-        
+
         while not success and retry_count < max_retry:
             try:
                 self.execute_sql_and_time(fix_action, timeout=500)
@@ -340,7 +372,7 @@ class TestPromptManager:
             except Exception as e:
                 err = str(e)
                 print(f"修复动作执行失败: {e}")
-                
+
                 # # 尝试修复SQL
                 # prompt = f"""
                 # You have been given a non-executable SQL statement and the exact database error:
@@ -358,17 +390,27 @@ class TestPromptManager:
                 # fix_action = result.final_output
                 # print(f"new_fix_action: {fix_action}")
                 retry_count += 1
-                
+
         if not success:
-            return {"status": -1, "msg": f"SQL修复失败: {fix_action}, 错误: {err}", "action": fix_action, "new_time": -1}
-            
+            return {
+                "status": -1,
+                "msg": f"SQL修复失败: {fix_action}, 错误: {err}",
+                "action": fix_action,
+                "new_time": -1,
+            }
+
         # 如果有重写SQL，检查结果一致性
         if rewrite_sql:
             # 使用PostgresDB的结果比较功能
             match = self.postgres_db.compare_sql_results(query_info.query, rewrite_sql)
             if not match:
-                return {"status": -1, "msg": "修复后结果仍不一致", "action": rewrite_sql, "new_time": -1}
-            
+                return {
+                    "status": -1,
+                    "msg": "修复后结果仍不一致",
+                    "action": rewrite_sql,
+                    "new_time": -1,
+                }
+
         # 执行优化后的SQL并计时
         try:
             if rewrite_sql:
@@ -376,27 +418,51 @@ class TestPromptManager:
             else:
                 new_time = self.execute_sql_and_time(query_info.query, timeout=300)
         except Exception as e:
-            return {"status": -1, "msg": f"优化后SQL执行失败: {e}", "action": fix_action, "new_time": -1}
-            
+            return {
+                "status": -1,
+                "msg": f"优化后SQL执行失败: {e}",
+                "action": fix_action,
+                "new_time": -1,
+            }
+
         old_time = query_info.execution_time
-        
+
         # 性能对比
         if (old_time - new_time) / old_time > 0.1:
-            return {"status": 1, "msg": f"修复成功，性能提升，耗时由{old_time:.4f}s降至{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": rewrite_sql, "new_time": new_time}
+            return {
+                "status": 1,
+                "msg": f"修复成功，性能提升，耗时由{old_time:.4f}s降至{new_time:.4f}s",
+                "fix_action": fix_action,
+                "rewrite_sql": rewrite_sql,
+                "new_time": new_time,
+            }
         else:
-            return {"status": 0, "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s", "fix_action": fix_action, "rewrite_sql": rewrite_sql, "new_time": new_time}
-            
-    async def process_sql_file(self, sql_file: str, root_cause: str, action_space_apis: str, historical_cases: str = "", inspirations: str = ""):
+            return {
+                "status": 0,
+                "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s",
+                "fix_action": fix_action,
+                "rewrite_sql": rewrite_sql,
+                "new_time": new_time,
+            }
+
+    async def process_sql_file(
+        self,
+        sql_file: str,
+        root_cause: str,
+        action_space_apis: str,
+        historical_cases: str = "",
+        inspirations: str = "",
+    ):
         """处理单个SQL文件"""
         print(f"处理: {sql_file}")
-        
+
         # 读取SQL
         sql = self.read_sql_file(sql_file)
-        
+
         # 使用PostgresDB进行压测获取相关数据
         print("开始压测获取查询信息...")
         result = self.postgres_db.run_sql_and_collect_all(sql, duration=300)
-        
+
         # 创建QueryInfo对象
         query_info = QueryInfo(
             query_id=0,
@@ -404,28 +470,37 @@ class TestPromptManager:
             plan_json=result["plan_json"],
             internal_metrics=result["internal_metrics"],
             external_metrics=result["external_metrics"],
-            execution_time=result["duration"]
+            execution_time=result["duration"],
         )
-        
+
         print(f"优化前执行时间: {query_info.execution_time:.4f}秒")
-        
+
         # 获取数据库信息
         db_info = self.get_database_info()
-        
+
         # 调用修复Agent
         try:
-            fix_result = await self.call_fix_agent(query_info, db_info, root_cause, action_space_apis, historical_cases, inspirations)
-            explanation, fix_action, query_rewrite = self.parse_action_result(fix_result)
+            fix_result = await self.call_fix_agent(
+                query_info,
+                db_info,
+                root_cause,
+                action_space_apis,
+                historical_cases,
+                inspirations,
+            )
+            explanation, fix_action, query_rewrite = self.parse_action_result(
+                fix_result
+            )
             print(f"解释: {explanation}")
             print(f"修复动作: {fix_action}")
             print(f"是否重写SQL: {query_rewrite}")
-            
+
             # 提取索引名和knob名
             index_names = self.extract_index_names(fix_action)
             knob_names = self.extract_knob_names(fix_action)
             print(f"索引名: {index_names}")
             print(f"knob名: {knob_names}")
-            
+
             # 处理重写SQL
             rewrite_sql = ""
             if query_rewrite == "yes":
@@ -435,20 +510,22 @@ class TestPromptManager:
             else:
                 print(f"修复动作: {fix_action}")
             print(f"是否重写SQL: {query_rewrite}")
-            
+
             # 评估修复动作
             result = await self.evaluate_action(fix_action, rewrite_sql, query_info)
-            
+
             # 撤销修复动作
             self.rollback_action(index_names, knob_names)
-            
+
             return result
-            
+
         except Exception as e:
             print(f"大模型修复失败: {e}")
             return None
 
-    def _build_prompt(self, query_info, db_info, root_cause, historical_cases, inspirations):
+    def _build_prompt(
+        self, query_info, db_info, root_cause, historical_cases, inspirations
+    ):
         """构建修复提示模板"""
         return f"""
         As an SQL optimization expert, your task is to diagnose and fix the following slow SQL query.
@@ -578,10 +655,11 @@ class TestPromptManager:
         - Do not output any extra sections, comments, or steps.
         """
 
+
 async def main():
     """主函数"""
     sql_dir = "/root/DREAM/data/slow_queries/TPC-H"
-    
+
     sql_num = "01.sql"
 
     # issue_types = {
@@ -597,12 +675,14 @@ async def main():
 
     historical_cases = ""
     inspirations = ""
-    
+
     async with TestPromptManager() as manager:
         sql_file = os.path.join(sql_dir, sql_num)
-        
-        result = await manager.process_sql_file(sql_file, root_cause, action_space_apis, historical_cases, inspirations)
-        
+
+        result = await manager.process_sql_file(
+            sql_file, root_cause, action_space_apis, historical_cases, inspirations
+        )
+
         if result:
             if result["status"] == 1:
                 print(f"修复成功: {result['msg']}")
@@ -611,7 +691,8 @@ async def main():
             else:
                 print(f"修复失败: {result['msg']}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     start_time = time.time()
     asyncio.run(main())
     end_time = time.time()

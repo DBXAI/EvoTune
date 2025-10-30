@@ -1,27 +1,26 @@
-import argparse
-import sys
 import os
+import sys
+from pathlib import Path
+
 from agents import Agent, Runner
 from agents._config import set_default_openai_api
-
-import openai
-from pathlib import Path
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent)
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from config.base_config import API_SETTINGS
 
- # 设置大模型API
-os.environ['OPENAI_API_KEY'] = ""
-os.environ['OPENAI_BASE_URL'] = ""
+# 设置大模型API
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["OPENAI_BASE_URL"] = ""
 set_default_openai_api("chat_completions")
+
 
 def delete_all_loggers():
     """清理和重置所有日志记录器"""
     import logging
+
     loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
     for logger in loggers:
         handlers = logger.handlers[:]
@@ -29,6 +28,7 @@ def delete_all_loggers():
             logger.removeHandler(handler)
         logger.propagate = True
         logger.setLevel(logging.CRITICAL)
+
 
 def read_prompt() -> str:
     prompt = """As a database performance diagnosis expert, your task is to identify the **most likely root cause(s) and diagnosis confidence** of the following slow SQL query.
@@ -89,10 +89,12 @@ def read_prompt() -> str:
     """
     return prompt
 
+
 def get_root_cause_llm_instructions():
     """Get instructions for the root cause diagnosis LLM."""
     return """You are a database slow SQL root cause diagnosis expert.
     Only output the allowed root cause label(s) and their confidence in json format, nothing else."""
+
 
 def run_llm(prompt_text) -> str:
     # Lazy import after path setup
@@ -117,5 +119,3 @@ def main():
 if __name__ == "__main__":
     delete_all_loggers()
     main()
-
-

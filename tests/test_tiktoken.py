@@ -1,5 +1,6 @@
 import tiktoken
 
+
 def count_tokens(text: str, model: str = "gpt-4"):
     """
     计算文本在指定模型下的 token 数量
@@ -11,6 +12,7 @@ def count_tokens(text: str, model: str = "gpt-4"):
     encoding = tiktoken.encoding_for_model(model)
     tokens = encoding.encode(text)
     return len(tokens)
+
 
 if __name__ == "__main__":
     # 在这里粘贴你要统计的文本
@@ -119,8 +121,8 @@ SET hash_mem_multiplier = 4.0;
     - If adding indexes or changing knobs, provide the exact SQL or command.
     - Do not output any extra sections, comments, or steps.
 """
-    
+
     model_name = "gpt-4o-mini"  # 也可以改成 "gpt-3.5-turbo" 或 "gpt-4o"
     token_count = count_tokens(sample_text, model_name)
-    
+
     print(f"模型 {model_name} 下的 token 数: {token_count}")

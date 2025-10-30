@@ -1,6 +1,7 @@
-from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 
 @dataclass
 class QueryInfo:
@@ -12,11 +13,13 @@ class QueryInfo:
     execution_time: float
     is_rewrite: bool
 
+
 @dataclass
 class AnomalyInfo:
     kpis: Dict[str, List[float]]
     kpi_descriptions: Dict[str, str]
     log_info: Dict[str, Any]
+
 
 @dataclass
 class ActionResult:
@@ -27,6 +30,7 @@ class ActionResult:
     timestamp: datetime
     details: Optional[Dict[str, Any]] = None
 
+
 @dataclass
 class CaseInfo:
     query_info: QueryInfo
@@ -35,4 +39,4 @@ class CaseInfo:
     actions_taken: List[ActionResult]
     result_metrics: Dict[str, float]
     confidence: float
-    status: str 
+    status: str

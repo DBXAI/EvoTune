@@ -3,12 +3,13 @@ Prompt generation functions for database optimization system.
 This module contains all prompt generation functions extracted from action_manager.py and planner.py.
 """
 
-from typing import List, Dict, Any
 
 def fmt_cases(cases):
     lines = []
     for i, case in enumerate(cases, 1):
-        lines.append(f"\n    Case {i}:\n    SQL: {case.get('query_info').get('query')}\n    Execution Plan: {case.get('query_info').get('plan_json')}\n    Origin Execution Runtime: {case.get('query_info').get('execution_time')}s\n    Root Causes: {case.get('root_causes')}\n    Fix_Actions: {case.get('fix_action')}\n    Improve: {case.get('approve_time')}")
+        lines.append(
+            f"\n    Case {i}:\n    SQL: {case.get('query_info').get('query')}\n    Execution Plan: {case.get('query_info').get('plan_json')}\n    Origin Execution Runtime: {case.get('query_info').get('execution_time')}s\n    Root Causes: {case.get('root_causes')}\n    Fix_Actions: {case.get('fix_action')}\n    Improve: {case.get('approve_time')}"
+        )
     return "\n".join(lines)
     # try:
     #     return "\n".join([
@@ -17,19 +18,22 @@ def fmt_cases(cases):
     # except Exception:
     #     return str(cases)
 
-def build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives):
+
+def build_action_prompt(
+    root_cause, base_info, action_space, mode, positives, negatives
+):
     """
     Format a prompt that feeds the LLM with all necessary context and enforces
     a consistent two-part output: Explanation + SQL Fix.
     """
-    query_info = base_info.get('query_info')
-    db_info = base_info.get('database_info', {})
+    query_info = base_info.get("query_info")
+    db_info = base_info.get("database_info", {})
 
     positives_text = fmt_cases(positives)
     negatives_text = fmt_cases(negatives)
 
     # 模式提示
-    if mode == 'exploit':
+    if mode == "exploit":
         mode_instruction = """You are now in **EXPLOIT mode**. Refer to the following Positive Cases and Negative Cases, which are derived from historical fixes under the same root cause. 
     - Positive Cases represent effective fixes. Treat their Fix_Actions as **examples of optimization patterns**, You must **not copy them directly or merely reorder them**. Instead, propose **new fix_actions** that explore additional possibilities. 
     - Negative Cases represent ineffective fixes. Reflect on which actions led to no improvement or performance degradation, and avoid adopting these fix_actions in your solution.
@@ -106,6 +110,7 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     - If adding indexes or changing knobs, provide the exact SQL or command.
     - Do not output any extra sections, comments, or steps."""
 
+
 def build_fix_prompt(fix_action, err):
     """Build prompt for fixing non-executable SQL statements."""
     return f"""You have been given a non-executable SQL statement and the exact database error:
@@ -118,6 +123,7 @@ def build_fix_prompt(fix_action, err):
     3) If multiple statements are required, output them in execution order, each terminated by a semicolon and a newline.
     -- Output (strict) --
     <paste only the corrected fix action statement(s) here, exactly as SQL, nothing else>"""
+
 
 def build_rewrite_prompt(origin_sql, rewrite_sql):
     """Build prompt for rewriting SQL to match reference output."""
@@ -136,7 +142,10 @@ def build_rewrite_prompt(origin_sql, rewrite_sql):
     — Output Format —
     <paste only the revised SQL here, exactly as SQL, nothing else>"""
 
-def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence, tuning_history=None, timeout=300):
+
+def build_root_cause_diagnosis_prompt(
+    query_info, root_causes, state_confidence, tuning_history=None, timeout=300
+):
     """Build prompt for LLM-based root cause diagnosis with per-label confidence map.
 
     tuning_history: Optional list summarizing per-root-cause success/failure counts, e.g.,
@@ -163,7 +172,7 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
         history_text = "{" + history_text + "}"
     else:
         history_text = "No previous tuning attempts recorded."
-        
+
     return f"""As a database performance diagnosis expert, your task is to identify the **most likely root cause(s) and diagnosis confidence** of the following slow SQL query.
 
     ## Context
@@ -221,14 +230,16 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
     }}"""
 
 
-def build_action_space_prompt(root_causes, db, knob_config, current_knob_values, query_info=None):
+def build_action_space_prompt(
+    root_causes, db, knob_config, current_knob_values, query_info=None
+):
     """Build action space prompt based on root causes."""
     # 根因
     root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
 
     # 根据根因构建操作空间prompt
     action_space_prompt = ""
-    
+
     # 索引相关
     if "missing indexes" in root_causes:
         current_indexes = db.get_indexes() if db else []
@@ -240,33 +251,37 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
     - Avoid generating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
     - Do not conflict with the existing indexes in the database: {current_indexes}
     """
-    
+
     # Knob相关
     if "inappropriate query knobs" in root_causes:
-        system_knobs_specs = knob_config.get('system_knobs')
-        current_values = current_knob_values.get('system_knobs')
-        
+        system_knobs_specs = knob_config.get("system_knobs")
+        current_values = current_knob_values.get("system_knobs")
+
         knob_lines = []
         for knob_name, spec in system_knobs_specs.items():
             current_val = current_values.get(knob_name)
-            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
-        
+            knob_lines.append(
+                f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}"
+            )
+
         action_space_prompt += f"""
     • Knob Space:  
     - Knob Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
     {knob_lines}
     """
-    
+
     # 执行计划/优化器相关
     if "suboptimal plan optimizer" in root_causes:
-        query_knobs_specs = knob_config.get('query_knobs')
-        current_values = current_knob_values.get('query_knobs')
-        
+        query_knobs_specs = knob_config.get("query_knobs")
+        current_values = current_knob_values.get("query_knobs")
+
         knob_lines = []
         for knob_name, spec in query_knobs_specs.items():
             current_val = current_values.get(knob_name)
-            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
-        
+            knob_lines.append(
+                f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}"
+            )
+
         action_space_prompt += f"""
     • Plan Optimizer Space: 
     - Plan Optimizer Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
@@ -276,9 +291,10 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
     # SQL 可读性/重写相关
     if "poorly written queries" in root_causes:
         from .action.diagnose_tools import SQLRuleMatcher
+
         matcher = SQLRuleMatcher()
         rule_descriptions = matcher.get_rule_descriptions(query_info.query)
-        
+
         action_space_prompt += f"""
     • Query Rewrite Space: 
     - Query Rewrite need to generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query while improving performance.
@@ -326,8 +342,8 @@ def get_root_cause_llm_instructions():
 
 def build_simple_diagnosis_prompt(query_info, base_info):
     """Build prompt for simple LLM-based diagnosis without root cause prediction."""
-    db_info = base_info.get('database_info', {})
-    
+    db_info = base_info.get("database_info", {})
+
     return f"""As an SQL optimization expert, your task is to diagnose and fix the following slow SQL query.
     You need to analyze the query and provide a direct fix without root cause prediction.
 
