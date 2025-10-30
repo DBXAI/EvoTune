@@ -10,6 +10,7 @@ Source code for the DREAM framework, proposed in "From Anomalies to Actions: An 
 # Clone repository
 git clone https://github.com/HarneyHong/DREAM.git
 cd DREAM
+git submodule update --init --recursive src/agent/plan/RCRank
 
 # Create conda environment
 conda create -n DREAM python=3.10
