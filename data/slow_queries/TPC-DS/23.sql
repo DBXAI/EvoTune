@@ -24,7 +24,7 @@ WITH frequent_ss_items
                  WHERE  ss_customer_sk = c_customer_sk
                         AND ss_sold_date_sk = d_date_sk
                         AND d_year IN ( 1998, 1998 + 1, 1998 + 2, 1998 + 3 )
-                 GROUP  BY c_customer_sk)),
+                 GROUP  BY c_customer_sk) AS customer_sales),
      best_ss_customer
      AS (SELECT c_customer_sk,
                 Sum(ss_quantity * ss_sales_price) ssales
@@ -56,7 +56,7 @@ FROM   (SELECT cs_quantity * cs_list_price sales
                AND ws_item_sk IN (SELECT item_sk
                                   FROM   frequent_ss_items)
                AND ws_bill_customer_sk IN (SELECT c_customer_sk
-                                           FROM   best_ss_customer)) LIMIT 100;
+                                           FROM   best_ss_customer)) AS sales_subq LIMIT 100;
 WITH frequent_ss_items
      AS (SELECT Substr(i_item_desc, 1, 30) itemdesc,
                 i_item_sk                  item_sk,
@@ -82,7 +82,7 @@ WITH frequent_ss_items
                  WHERE  ss_customer_sk = c_customer_sk
                         AND ss_sold_date_sk = d_date_sk
                         AND d_year IN ( 1998, 1998 + 1, 1998 + 2, 1998 + 3 )
-                 GROUP  BY c_customer_sk)),
+                 GROUP  BY c_customer_sk) AS customer_sales),
      best_ss_customer
      AS (SELECT c_customer_sk,
                 Sum(ss_quantity * ss_sales_price) ssales
@@ -128,7 +128,7 @@ FROM   (SELECT c_last_name,
                                            FROM   best_ss_customer)
                AND ws_bill_customer_sk = c_customer_sk
         GROUP  BY c_last_name,
-                  c_first_name)
+                  c_first_name) AS customer_sales
 ORDER  BY c_last_name,
           c_first_name,
           sales

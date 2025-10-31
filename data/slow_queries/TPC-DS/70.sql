@@ -32,9 +32,9 @@ WHERE  d1.d_month_seq BETWEEN 1200 AND 1200 + 11
                                GROUP  BY s_state) tmp1
                        WHERE  ranking <= 5)
 GROUP  BY rollup( s_state, s_county )
-ORDER  BY lochierarchy DESC,
+ORDER  BY (Grouping(s_state) + Grouping(s_county)) DESC,
           CASE
-            WHEN lochierarchy = 0 THEN s_state
+            WHEN (Grouping(s_state) + Grouping(s_county)) = 0 THEN s_state
           END,
           rank_within_parent
 LIMIT 100;

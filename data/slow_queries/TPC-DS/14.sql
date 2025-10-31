@@ -30,7 +30,7 @@ WITH cross_items
                         date_dim d3
                  WHERE  ws_item_sk = iws.i_item_sk
                         AND ws_sold_date_sk = d3.d_date_sk
-                        AND d3.d_year BETWEEN 1999 AND 1999 + 2)
+                        AND d3.d_year BETWEEN 1999 AND 1999 + 2) x
          WHERE  i_brand_id = brand_id
                 AND i_class_id = class_id
                 AND i_category_id = category_id),

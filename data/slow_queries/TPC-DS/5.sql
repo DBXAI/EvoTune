@@ -21,7 +21,7 @@ WITH ssr AS
                                 Cast(0 AS DECIMAL(7,2)) AS profit,
                                 sr_return_amt           AS return_amt,
                                 sr_net_loss             AS net_loss
-                         FROM   store_returns ) salesreturns,
+                         FROM   store_returns ) AS salesreturns,
                   date_dim,
                   store
          WHERE    date_sk = d_date_sk
@@ -50,7 +50,7 @@ WITH ssr AS
                                 cast(0 AS decimal(7,2)) AS profit,
                                 cr_return_amount        AS return_amt,
                                 cr_net_loss             AS net_loss
-                         FROM   catalog_returns ) salesreturns,
+                         FROM   catalog_returns ) AS salesreturns,
                   date_dim,
                   catalog_page
          WHERE    date_sk = d_date_sk
@@ -83,7 +83,7 @@ WITH ssr AS
                          LEFT OUTER JOIN web_sales
                          ON              (
                                                          wr_item_sk = ws_item_sk
-                                         AND             wr_order_number = ws_order_number) ) salesreturns,
+                                         AND             wr_order_number = ws_order_number) ) AS salesreturns,
                   date_dim,
                   web_site
          WHERE    date_sk = d_date_sk

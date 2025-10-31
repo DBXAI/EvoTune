@@ -1,30 +1,39 @@
 
+SELECT   item_id ,
+         item_desc ,
+         category ,
+         class ,
+         current_price ,
+         itemrevenue,
+         itemrevenue*100/sum(itemrevenue) OVER (partition BY class) AS revenueratio
+FROM(
 SELECT
-         i_item_id ,
-         i_item_desc ,
-         i_category ,
-         i_class ,
-         i_current_price ,
-         Sum(ws_ext_sales_price)                                                              AS itemrevenue ,
-         Sum(ws_ext_sales_price)*100/Sum(Sum(ws_ext_sales_price)) OVER (partition BY i_class) AS revenueratio
-FROM     web_sales ,
-         item ,
-         date_dim
-WHERE    ws_item_sk = i_item_sk
-AND      i_category IN ('Home',
+         i.i_item_id item_id,
+         i.i_item_desc item_desc,
+         i.i_category category,
+         i.i_class class,
+         i.i_current_price current_price,
+         Sum(w.ws_ext_sales_price) AS itemrevenue
+FROM     web_sales w,
+         item i,
+         date_dim d
+WHERE    w.ws_item_sk = i.i_item_sk
+AND      i.i_category IN ('Home',
                         'Men',
                         'Women')
-AND      ws_sold_date_sk = d_date_sk
-AND      d_date BETWEEN Cast('2000-05-11' AS DATE) AND      (
+AND      w.ws_sold_date_sk = d.d_date_sk
+AND      d.d_date BETWEEN Cast('2000-05-11' AS DATE) AND      (
                   Cast('2000-05-11' AS DATE) + INTERVAL '30' day)
-GROUP BY i_item_id ,
-         i_item_desc ,
-         i_category ,
-         i_class ,
-         i_current_price
-ORDER BY i_category ,
-         i_class ,
-         i_item_id ,
-         i_item_desc ,
+GROUP BY i.i_item_id ,
+         i.i_item_desc ,
+         i.i_category ,
+         i.i_class ,
+         i.i_current_price
+) subq
+ORDER BY category ,
+         class ,
+         item_id ,
+         item_desc ,
          revenueratio
-LIMIT 100;
+LIMIT 100
+;

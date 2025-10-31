@@ -1,41 +1,49 @@
 
 WITH v1
-     AS (SELECT i_category,
-                i_brand,
-                cc_name,
-                d_year,
-                d_moy,
-                Sum(cs_sales_price)                                    sum_sales
-                ,
-                Avg(Sum(cs_sales_price))
+     AS (
+SELECT          category,
+                brand,
+                name,
+                dyear,
+                dmoy,
+                sum_sales,
+                Avg(sum_sales)
                   OVER (
-                    partition BY i_category, i_brand, cc_name, d_year)
+                    partition BY category, brand, name, dyear)
                 avg_monthly_sales
                    ,
                 Rank()
                   OVER (
-                    partition BY i_category, i_brand, cc_name
-                    ORDER BY d_year, d_moy)                            rn
-         FROM   item,
-                catalog_sales,
-                date_dim,
-                call_center
-         WHERE  cs_item_sk = i_item_sk
-                AND cs_sold_date_sk = d_date_sk
-                AND cc_call_center_sk = cs_call_center_sk
-                AND ( d_year = 2000
-                       OR ( d_year = 2000 - 1
-                            AND d_moy = 12 )
-                       OR ( d_year = 2000 + 1
-                            AND d_moy = 1 ) )
-         GROUP  BY i_category,
-                   i_brand,
-                   cc_name,
-                   d_year,
-                   d_moy),
+                    partition BY category, brand, name
+                    ORDER BY dyear, dmoy)                            rn
+FROM(
+SELECT i.i_category category,
+                i.i_brand brand,
+                cc.cc_name name,
+                d.d_year dyear,
+                d.d_moy dmoy,
+                Sum(cs.cs_sales_price) sum_sales
+         FROM   item i,
+                catalog_sales cs,
+                date_dim d,
+                call_center cc
+         WHERE  cs.cs_item_sk = i.i_item_sk
+                AND cs.cs_sold_date_sk = d.d_date_sk
+                AND cc.cc_call_center_sk = cs.cs_call_center_sk
+                AND ( d.d_year = 2000
+                       OR ( d.d_year = 2000 - 1
+                            AND d.d_moy = 12 )
+                       OR ( d.d_year = 2000 + 1
+                            AND d.d_moy = 1 ) )
+         GROUP  BY i.i_category,
+                   i.i_brand,
+                   cc.cc_name,
+                   d.d_year,
+                   d.d_moy) AS sales_data
+),
      v2
-     AS (SELECT v1.i_brand,
-                v1.d_year,
+     AS (SELECT v1.brand,
+                v1.dyear,
                 v1.avg_monthly_sales,
                 v1.sum_sales,
                 v1_lag.sum_sales  psum,
@@ -43,17 +51,17 @@ WITH v1
          FROM   v1,
                 v1 v1_lag,
                 v1 v1_lead
-         WHERE  v1.i_category = v1_lag.i_category
-                AND v1.i_category = v1_lead.i_category
-                AND v1.i_brand = v1_lag.i_brand
-                AND v1.i_brand = v1_lead.i_brand
-                AND v1. cc_name = v1_lag. cc_name
-                AND v1. cc_name = v1_lead. cc_name
+         WHERE  v1.category = v1_lag.category
+                AND v1.category = v1_lead.category
+                AND v1.brand = v1_lag.brand
+                AND v1.brand = v1_lead.brand
+                AND v1.name = v1_lag.name
+                AND v1.name = v1_lead.name
                 AND v1.rn = v1_lag.rn + 1
                 AND v1.rn = v1_lead.rn - 1)
 SELECT *
 FROM   v2
-WHERE  d_year = 2000
+WHERE  dyear = 2000
        AND avg_monthly_sales > 0
        AND CASE
              WHEN avg_monthly_sales > 0 THEN Abs(sum_sales - avg_monthly_sales)
@@ -63,4 +71,4 @@ WHERE  d_year = 2000
            END > 0.1
 ORDER  BY sum_sales - avg_monthly_sales,
           3
-LIMIT 100;
+LIMIT 10;

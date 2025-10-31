@@ -1,5 +1,5 @@
 
-select top 100 *
+SELECT *
 from (select i_category
             ,i_class
             ,i_brand

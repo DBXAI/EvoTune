@@ -4,11 +4,11 @@ WITH wscs
                 sales_price
          FROM   (SELECT ws_sold_date_sk    sold_date_sk,
                         ws_ext_sales_price sales_price
-                 FROM   web_sales)
-         UNION ALL
-         (SELECT cs_sold_date_sk    sold_date_sk,
-                 cs_ext_sales_price sales_price
-          FROM   catalog_sales)),
+                 FROM   web_sales
+                 UNION ALL
+                 SELECT cs_sold_date_sk    sold_date_sk,
+                        cs_ext_sales_price sales_price
+                 FROM   catalog_sales) ws),
      wswscs
      AS (SELECT d_week_seq,
                 Sum(CASE

@@ -1,28 +1,39 @@
 
-SELECT i_item_id,
-       i_item_desc,
-       i_category,
-       i_class,
-       i_current_price,
-       Sum(ss_ext_sales_price)                                   AS itemrevenue,
-       Sum(ss_ext_sales_price) * 100 / Sum(Sum(ss_ext_sales_price))
+SELECT
+       item_id,
+       item_desc,
+       category,
+       class,
+       current_price,
+       itemrevenue,
+       itemrevenue * 100 / Sum(itemrevenue)
                                          OVER (
-                                           PARTITION BY i_class) AS revenueratio
-FROM   store_sales,
-       item,
-       date_dim
-WHERE  ss_item_sk = i_item_sk
-       AND i_category IN ( 'Men', 'Home', 'Electronics' )
-       AND ss_sold_date_sk = d_date_sk
-       AND d_date BETWEEN CAST('2000-05-18' AS DATE) AND (
+                                           PARTITION BY class) AS revenueratio
+FROM
+(
+SELECT i.i_item_id as item_id,
+       i.i_item_desc as item_desc,
+       i.i_category as category,
+       i.i_class as class,
+       i.i_current_price as current_price,
+       Sum(s.ss_ext_sales_price) AS itemrevenue
+FROM   store_sales s,
+       item i,
+       date_dim d
+WHERE  s.ss_item_sk = i.i_item_sk
+       AND i.i_category IN ( 'Men', 'Home', 'Electronics' )
+       AND s.ss_sold_date_sk = d.d_date_sk
+       AND d.d_date BETWEEN CAST('2000-05-18' AS DATE) AND (
                           CAST('2000-05-18' AS DATE) + INTERVAL '30' DAY )
-GROUP  BY i_item_id,
-          i_item_desc,
-          i_category,
-          i_class,
-          i_current_price
-ORDER  BY i_category,
-          i_class,
-          i_item_id,
-          i_item_desc,
-          revenueratio;
+GROUP  BY i.i_item_id,
+          i.i_item_desc,
+          i.i_category,
+          i.i_class,
+          i.i_current_price
+) AS subq
+ORDER  BY category,
+          class,
+          item_id,
+          item_desc,
+          revenueratio
+;
