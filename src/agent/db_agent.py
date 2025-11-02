@@ -209,7 +209,7 @@ class DBAgent:
 
             # 检查是否超时
             if elapsed_time >= duration * 3600:
-                logger.info(f"达到超时时间 {duration}s，停止优化")
+                logger.info(f"达到超时时间 {duration}h，停止优化")
                 break
 
             round_idx += 1

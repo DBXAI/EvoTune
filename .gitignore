@@ -22,6 +22,8 @@ config/ablation_experiments_config.json
 src/ablation_main.py
 src/agent/ablation_db_agent.py
 ablation.md
+src/agent/memory/experience/**
+src/agent/memory/model/**
 # test_sql_gen/data/hint/**
 # test_sql_gen/data/hint_normal/**
 # test_sql_gen/data/hint+index/**

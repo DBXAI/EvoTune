@@ -1,3 +1,4 @@
+import os
 import random
 from collections import deque
 from dataclasses import dataclass
@@ -28,7 +29,6 @@ class SoftQRetriever:
         self.temperature = 1.0
 
         # 经验池参数
-        self.experience_pool_size = 10000
         self.batch_size = 2
         self.learning_rate = 1e-4
 
@@ -38,8 +38,8 @@ class SoftQRetriever:
         # 初始化网络
         self._init_networks()
 
-        # 经验池
-        self.experience_pool = deque(maxlen=self.experience_pool_size)
+        # 经验池（不限制大小，因为经验会持久化到文件）
+        self.experience_pool = deque()
 
         # 优化器
         self.optimizer = torch.optim.Adam(
@@ -222,3 +222,17 @@ class SoftQRetriever:
         # 定期更新目标网络
         if self.update_count % 10 == 0:
             self.target_network.load_state_dict(self.network.state_dict())
+
+    def save_model(self, save_path):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        torch.save(self.network.state_dict(), save_path)
+        print(f"SoftQRetriever model saved to: {save_path}")
+
+    def load_model(self, load_path):
+        state_dict = torch.load(load_path, map_location=self.device)
+
+        self.network.load_state_dict(state_dict)
+        self.target_network.load_state_dict(state_dict)
+
+        print(f"SoftQRetriever model loaded from: {load_path}")

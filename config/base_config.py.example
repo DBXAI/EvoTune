@@ -116,7 +116,11 @@ MEMORY_MANAGER_CONFIG = {
     "model_output_dir": "/root/DREAM/src/agent/plan/model_res",
     "bce_weight": 0.7,
     "contrastive_weight": 0.3,
-    "enable_finetune": True
+    "enable_finetune": True,
+    "retrieval_mode": "dynamic",
+    "enable_save_samples": False,
+    "samples_save_path": "data/train_data/retriever_samples.jsonl",
+    "retriever_model_path": "src/agent/memory/model/soft_q_retriever.pt"
 }
 
 # Agent配置

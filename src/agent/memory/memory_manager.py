@@ -2,6 +2,7 @@ import itertools
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -55,6 +56,18 @@ class MemoryManager:
         self.bce_weight = config.get("bce_weight")
         self.contrastive_weight = config.get("contrastive_weight")
 
+        self.bert_model_path = config.get("bert_model_path")
+
+        # 检索模式配置：static（静态）或 dynamic（动态）
+        self.retrieval_mode = config.get("retrieval_mode", "dynamic")
+
+        # 样本保存配置
+        self.enable_save_samples = config.get("enable_save_samples", False)
+        self.samples_save_path = config.get("samples_save_path")
+
+        # Retriever 模型保存/加载路径
+        self.retriever_model_path = config.get("retriever_model_path")
+
         self.root_cause_types = [
             "missing indexes",
             "inappropriate query knobs",
@@ -69,6 +82,10 @@ class MemoryManager:
 
         # 初始化软Q检索器
         self.retriever = SoftQRetriever(memory_manager=self)
+
+        # load the saved retriever model
+        if os.path.exists(self.retriever_model_path):
+            self.retriever.load_model(self.retriever_model_path)
 
         self._init_database()
         self.load()
@@ -610,6 +627,21 @@ class MemoryManager:
                     self.archive.remove(case.id)
 
     def retrieve_cases(self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"):
+        """
+        统一的案例检索接口，根据配置的 retrieval_mode 选择使用静态或动态检索
+        """
+        if self.retrieval_mode == "static":
+            return self.retrieve_static_cases(
+                query_info, root_causes, pos_n, neg_n, mode
+            )
+        else:
+            return self.retrieve_dynamic_cases(
+                query_info, root_causes, pos_n, neg_n, mode
+            )
+
+    def retrieve_dynamic_cases(
+        self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"
+    ):
         # 获取所有候选案例
         all_cases = list(self.cases.values())
         if not all_cases:
@@ -660,81 +692,84 @@ class MemoryManager:
             "negative": negative_cases,
         }
 
-    # def retrieve_cases(self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"):
-    #     """
-    #     使用传统的 islands 构造样本池并按标签输出：
-    #     - exploitation pool: 目标根因对应的岛
-    #     - exploration pool: 其他所有岛合并
-    #     Positive/Negative 划分依据 case_info.label（缺失时回退到 approve_time>0 视为正例）。
-    #     Positive 返回规则：至少包含同 SQL 与不同 SQL 的 approve_time 最大各 1，其余按提升降序填充至 pos_n。
-    #     Negative 返回规则：从负例池随机采样最多 neg_n 个。
-    #     返回：{"mode": str, "positive": [case_info], "negative": [case_info]}
-    #     """
-    #     query_text = query_info.query.lower().strip()
-    #     target_root = self._normalize_root_causes(root_causes)
+    def retrieve_static_cases(
+        self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"
+    ):
+        """
+        使用传统的 islands 构造样本池并按标签输出：
+        - exploitation pool: 目标根因对应的岛
+        - exploration pool: 其他所有岛合并
+        Positive/Negative 划分依据 case_info.label（缺失时回退到 approve_time>0 视为正例）。
+        Positive 返回规则：至少包含同 SQL 与不同 SQL 的 approve_time 最大各 1，其余按提升降序填充至 pos_n。
+        Negative 返回规则：从负例池随机采样最多 neg_n 个。
+        返回：{"mode": str, "positive": [case_info], "negative": [case_info]}
+        """
+        query_text = query_info.query.lower().strip()
+        target_root = self._normalize_root_causes(root_causes)
 
-    #     target_island_ids = list(self.islands.get(target_root, set()))
-    #     other_island_ids = []
-    #     for island_key, ids in self.islands.items():
-    #         if island_key != target_root:
-    #             other_island_ids.extend(list(ids))
+        target_island_ids = list(self.islands.get(target_root, set()))
+        other_island_ids = []
+        for island_key, ids in self.islands.items():
+            if island_key != target_root:
+                other_island_ids.extend(list(ids))
 
-    #     # exploitation pool
-    #     exploit_pool = self.ids_to_cases(target_island_ids)
-    #     explore_pool = self.ids_to_cases(other_island_ids)
+        # exploitation pool
+        exploit_pool = self.ids_to_cases(target_island_ids)
+        explore_pool = self.ids_to_cases(other_island_ids)
 
-    #     # ε-greedy mode
-    #     chosen_pool = explore_pool if mode == "explore" else exploit_pool
+        # ε-greedy mode
+        chosen_pool = explore_pool if mode == "explore" else exploit_pool
 
-    #     # in exploit pool, prioritize same SQL cases
-    #     def split_by_sql(cases):
-    #         same_sql_list = []
-    #         diff_sql_list = []
-    #         for c in cases:
-    #             stored_query = c.case_info.get("query_info").get("query")
-    #             if stored_query.lower().strip() == query_text:
-    #                 same_sql_list.append(c)
-    #             else:
-    #                 diff_sql_list.append(c)
-    #         return same_sql_list, diff_sql_list
+        # in exploit pool, prioritize same SQL cases
+        def split_by_sql(cases):
+            same_sql_list = []
+            diff_sql_list = []
+            for c in cases:
+                stored_query = c.case_info.get("query_info").get("query")
+                if stored_query.lower().strip() == query_text:
+                    same_sql_list.append(c)
+                else:
+                    diff_sql_list.append(c)
+            return same_sql_list, diff_sql_list
 
-    #     # split by label/approve_time
-    #     same_sql_pool, diff_sql_pool = split_by_sql(chosen_pool)
+        # split by label/approve_time
+        same_sql_pool, diff_sql_pool = split_by_sql(chosen_pool)
 
-    #     # positive pool and negative pool
-    #     pos_same = [c for c in same_sql_pool if c.case_info.get("label") == "positive"]
-    #     pos_diff = [c for c in diff_sql_pool if c.case_info.get("label") == "positive"]
-    #     neg_all = [c for c in chosen_pool if c.case_info.get("label") != "positive"]
+        # positive pool and negative pool
+        pos_same = [c for c in same_sql_pool if c.case_info.get("label") == "positive"]
+        pos_diff = [c for c in diff_sql_pool if c.case_info.get("label") == "positive"]
+        neg_all = [c for c in chosen_pool if c.case_info.get("label") != "positive"]
 
-    #     selected_pos = []
-    #     best_same = self.best_by_approve(pos_same)
-    #     if best_same is not None:
-    #         selected_pos.append(best_same)
-    #     best_diff = self.best_by_approve(pos_diff)
-    #     if best_diff is not None:
-    #         selected_pos.append(best_diff)
+        selected_pos = []
+        best_same = self.best_by_approve(pos_same)
+        if best_same is not None:
+            selected_pos.append(best_same)
+        best_diff = self.best_by_approve(pos_diff)
+        if best_diff is not None:
+            selected_pos.append(best_diff)
 
-    #     # remaining positive cases are sorted by approve_time
-    #     remaining_pos = [c for c in (pos_same + pos_diff) if c not in selected_pos]
-    #     remaining_pos_sorted = sorted(
-    #         remaining_pos,
-    #         key=lambda c: c.case_info.get("approve_time") or c.metrics.get("approve_time", 0.0),
-    #         reverse=True,
-    #     )
-    #     selected_pos.extend(remaining_pos_sorted)
-    #     selected_pos = selected_pos[:max(1, pos_n)]
+        # remaining positive cases are sorted by approve_time
+        remaining_pos = [c for c in (pos_same + pos_diff) if c not in selected_pos]
+        remaining_pos_sorted = sorted(
+            remaining_pos,
+            key=lambda c: c.case_info.get("approve_time")
+            or c.metrics.get("approve_time", 0.0),
+            reverse=True,
+        )
+        selected_pos.extend(remaining_pos_sorted)
+        selected_pos = selected_pos[: max(1, pos_n)]
 
-    #     # negative cases are sampled randomly
-    #     if len(neg_all) > neg_n:
-    #         selected_neg = random.sample(neg_all, neg_n)
-    #     else:
-    #         selected_neg = neg_all
+        # negative cases are sampled randomly
+        if len(neg_all) > neg_n:
+            selected_neg = random.sample(neg_all, neg_n)
+        else:
+            selected_neg = neg_all
 
-    #     # export case_info
-    #     pos_infos = [c.case_info for c in selected_pos]
-    #     neg_infos = [c.case_info for c in selected_neg]
+        # export case_info
+        pos_infos = [c.case_info for c in selected_pos]
+        neg_infos = [c.case_info for c in selected_neg]
 
-    #     return {"mode": mode, "positive": pos_infos, "negative": neg_infos}
+        return {"mode": mode, "positive": pos_infos, "negative": neg_infos}
 
     def retrieve_embedding(self, query_info, top_n=5, metric="cosine", case_ids=None):
         query_emb = np.array(self.build_sql_embedding(query_info))
@@ -831,7 +866,7 @@ class MemoryManager:
         from transformers import BertModel, BertTokenizer
 
         if not hasattr(self, "_bert_tokenizer"):
-            bert_path = "agent/plan/RCRank/bert-base-uncased"
+            bert_path = self.bert_model_path
             self._bert_tokenizer = BertTokenizer.from_pretrained(bert_path)
             self._bert_model = BertModel.from_pretrained(bert_path)
             self._bert_model.eval()
@@ -916,3 +951,20 @@ class MemoryManager:
                 return case.case_info.get("root_causes")
 
         return None
+
+    def save_experience(self, query_info, case_info, reward):
+        """保存单条经验到文件（JSONL格式，追加模式）"""
+
+        if not self.samples_save_path:
+            return
+
+        os.makedirs(os.path.dirname(self.samples_save_path), exist_ok=True)
+
+        exp_dict = {
+            "query_info": query_info,
+            "case_info": case_info,
+            "reward": reward,
+        }
+
+        with open(self.samples_save_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(exp_dict, ensure_ascii=False) + "\n")

@@ -207,10 +207,23 @@ class ActionManager:
             fix_action, rewrite_sql, query_info
         )
 
-        # 建立经验池 - 根据评估结果更新软Q反馈
-        self._update_soft_q_feedback_after_evaluation(
-            query_info, fix_action, root_cause, evaluation_result, positives, negatives
-        )
+        reward = evaluation_result.get("status", 0)
+        case = positives + negatives
+
+        # 保存经验（与检索模式无关，仅根据enable_save_samples判断）
+        if self.memory_manager.enable_save_samples and case:
+            for case_info in case:
+                self.memory_manager.save_experience(
+                    query_info.__dict__, case_info, reward
+                )
+            
+        # 只在动态检索模式下更新经验池和网络
+        if self.memory_manager.retrieval_mode == "dynamic" and case:
+            for case_info in case:
+                self.memory_manager.retriever.add_experience(
+                    query_info.__dict__, case_info, reward
+                )
+            self.memory_manager.retriever.update_network()
 
         return evaluation_result
 
@@ -404,10 +417,18 @@ class ActionManager:
         return result
 
     async def check_sql_rewrite(self, origin_sql, rewrite_sql):
+
+        qed_match = self.db.check_sql_equivalence(origin_sql, rewrite_sql)
+        print(f"QED equivalence check: {qed_match}")
+
+        if qed_match:
+            return rewrite_sql
+
         retry_count = 0
         max_retry = 5
         match = self.db.compare_sql_results(origin_sql, rewrite_sql)
-        print(f"match: {match}")
+        print(f"Result set comparison match: {match}")
+
         while not match and retry_count < max_retry:
             prompt = build_rewrite_prompt(origin_sql, rewrite_sql)
             result = await Runner.run(starting_agent=self.fixAgent, input=prompt)
@@ -416,7 +437,12 @@ class ActionManager:
             rewrite_sql = new_rewrite_sql
             retry_count += 1
             match = self.db.compare_sql_results(origin_sql, rewrite_sql)
-            print(f"match: {match}")
+            print(f"Result set comparison match: {match}")
+
+        if not match:
+            print("Failed to rewrite SQL, return original SQL")
+            return origin_sql
+
         return rewrite_sql
 
     async def action_space_collect(self, root_causes, query_info=None):
@@ -533,11 +559,13 @@ class ActionManager:
             return []
 
         failed_rules = set()
+        # 使用当前查询作为原始查询（同SQL案例的原始查询应该是相同的）
+        original_query = query_info.query
+        
         for case in same_sql_cases:
             case_label = case.case_info.get("label")
             if case_label == "negative":
-                # 还得修改
-                # original_query = case.case_info.get("query_info").get("query")
+                # 获取历史案例中的改写后查询
                 rewritten_query = case.case_info.get("query_info").get("query")
 
                 from agent.action.diagnose_tools import SQLRuleMatcher
@@ -907,26 +935,3 @@ class ActionManager:
             return fix_part, sql_part
         else:
             return fix_action.strip(), ""
-
-    def _update_soft_q_feedback_after_evaluation(
-        self,
-        query_info,
-        fix_action,
-        root_cause,
-        evaluation_result,
-        positives,
-        negatives,
-    ):
-        # 根据评估结果确定奖励
-        reward = evaluation_result.get("status", 0)
-
-        case = positives + negatives
-
-        for case_info in case:
-            # 直接调用soft_q_retriever的方法
-            self.memory_manager.retriever.add_experience(
-                query_info.__dict__, case_info, reward
-            )
-
-        # 直接调用soft_q_retriever的训练方法
-        self.memory_manager.retriever.update_network()
