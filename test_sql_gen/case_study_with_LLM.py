@@ -149,9 +149,7 @@ Query_Rewrite:
 
 def extract_index_names(sql):
     """从多条CREATE INDEX语句中提取所有索引名"""
-    return re.findall(
-        r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE
-    )
+    return re.findall(r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE)
 
 
 def extract_knob_names(sql):
@@ -196,9 +194,7 @@ async def call_fix_agent(slow_sql, sql_plan):
         model="gpt-4.1",
         instructions="You are an SQL optimization expert, able to provide precise fixes for slow SQL.",
     )
-    prompt = FIX_PROMPT_TEMPLATE.format(
-        SLOW_SQL=slow_sql, SCHEMA=TPCH_SCHEMA, SQL_PLAN=sql_plan
-    )
+    prompt = FIX_PROMPT_TEMPLATE.format(SLOW_SQL=slow_sql, SCHEMA=TPCH_SCHEMA, SQL_PLAN=sql_plan)
     result = await Runner.run(starting_agent=fixAgent, input=prompt)
     return result.final_output.strip()
 
@@ -262,13 +258,7 @@ def extract_fix_action(fix_action: str):
     sql_start = None
     for idx, line in enumerate(lines):
         l = line.lstrip().upper()
-        if (
-            l.startswith("WITH")
-            or l.startswith("SELECT")
-            or l.startswith("INSERT")
-            or l.startswith("UPDATE")
-            or l.startswith("DELETE")
-        ):
+        if l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or l.startswith("UPDATE") or l.startswith("DELETE"):
             sql_start = idx
             break
     if sql_start is not None:

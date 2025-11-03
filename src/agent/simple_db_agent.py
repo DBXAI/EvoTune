@@ -86,9 +86,7 @@ class SimpleDBAgent:
 
             if self.db:
                 try:
-                    if hasattr(self.db, "cleanup") and callable(
-                        getattr(self.db, "cleanup")
-                    ):
+                    if hasattr(self.db, "cleanup") and callable(getattr(self.db, "cleanup")):
                         await self.db.cleanup()
                     elif hasattr(self.db, "close"):
                         self.db.close()
@@ -104,21 +102,15 @@ class SimpleDBAgent:
 
     def parse_action_result(self, diagnosis):
         # Extract Explanation
-        explanation_match = re.search(
-            r"Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)", diagnosis, re.IGNORECASE
-        )
+        explanation_match = re.search(r"Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)", diagnosis, re.IGNORECASE)
         explanation = explanation_match.group(1).strip() if explanation_match else ""
 
         # Extract FIX_ACTION
-        fix_match = re.search(
-            r"Fix_Action:\s*([\s\S]+?)Query_Rewrite:", diagnosis, re.IGNORECASE
-        )
+        fix_match = re.search(r"Fix_Action:\s*([\s\S]+?)Query_Rewrite:", diagnosis, re.IGNORECASE)
         fix_action = fix_match.group(1).strip() if fix_match else ""
 
         # Extract Query_Rewrite
-        is_rewrite_match = re.search(
-            r"Query_Rewrite:\s*(yes|no)", diagnosis, re.IGNORECASE
-        )
+        is_rewrite_match = re.search(r"Query_Rewrite:\s*(yes|no)", diagnosis, re.IGNORECASE)
         is_rewrite = is_rewrite_match.group(1).strip() if is_rewrite_match else ""
 
         return explanation, fix_action, is_rewrite
@@ -129,13 +121,7 @@ class SimpleDBAgent:
 
         for idx, line in enumerate(lines):
             l = line.lstrip().upper()
-            if (
-                l.startswith("WITH")
-                or l.startswith("SELECT")
-                or l.startswith("INSERT")
-                or l.startswith("UPDATE")
-                or l.startswith("DELETE")
-            ):
+            if l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or l.startswith("UPDATE") or l.startswith("DELETE"):
                 sql_start = idx
                 break
 
@@ -249,12 +235,8 @@ class SimpleDBAgent:
                     pre_fix_action = best_sql_actions[query_id]
                     success, _, _, _ = self.db.execute(pre_fix_action)
                     if success:
-                        pre_index_names = self.action_manager.extract_index_names(
-                            pre_fix_action
-                        )
-                        pre_knob_names = self.action_manager.extract_knob_names(
-                            pre_fix_action
-                        )
+                        pre_index_names = self.action_manager.extract_index_names(pre_fix_action)
+                        pre_knob_names = self.action_manager.extract_knob_names(pre_fix_action)
                         pre_applied = True
 
                 # Collect query execution information
@@ -286,9 +268,7 @@ class SimpleDBAgent:
                 fix_action, rewrite_sql = self.extract_fix_action(action_result)
 
                 # Validate action
-                evaluation_result = await self.action_manager.evaluate_action(
-                    fix_action, rewrite_sql, query_info
-                )
+                evaluation_result = await self.action_manager.evaluate_action(fix_action, rewrite_sql, query_info)
 
                 # Get final fix content
                 fix_action = evaluation_result.get("fix_action")
@@ -318,9 +298,7 @@ class SimpleDBAgent:
                     logger.info(f"SQL {query_id} fix successful")
                     new_time = evaluation_result.get("new_time")
                 else:
-                    logger.info(
-                        f"SQL {query_id} fix ineffective, recording negative case"
-                    )
+                    logger.info(f"SQL {query_id} fix ineffective, recording negative case")
                     new_time = evaluation_result.get("new_time", old_time)
 
                 # Update best records only if improvement achieved
@@ -342,24 +320,14 @@ class SimpleDBAgent:
                     self.action_manager.rollback_action(pre_index_names, pre_knob_names)
 
             round_end = time.time()
-            logger.info(
-                f"Round {round_idx} optimization time: {round_end - round_start:.4f}s"
-            )
+            logger.info(f"Round {round_idx} optimization time: {round_end - round_start:.4f}s")
             round_total_time = sum([t for t in round_sql_times.values()])
-            logger.info(
-                f"Round {round_idx} workload total execution time: {round_total_time:.4f}s"
-            )
+            logger.info(f"Round {round_idx} workload total execution time: {round_total_time:.4f}s")
             logger.info(f"Round {round_idx} SQL execution times: {round_sql_times}")
 
-            logger.info(
-                f"Up to round {round_idx}, best SQL execution times: {best_sql_times}"
-            )
-            logger.info(
-                f"Up to round {round_idx}, workload best total execution time: {sum(best_sql_times.values())}"
-            )
-            logger.info(
-                f"Up to round {round_idx}, best SQL fix actions: {best_sql_actions}"
-            )
+            logger.info(f"Up to round {round_idx}, best SQL execution times: {best_sql_times}")
+            logger.info(f"Up to round {round_idx}, workload best total execution time: {sum(best_sql_times.values())}")
+            logger.info(f"Up to round {round_idx}, best SQL fix actions: {best_sql_actions}")
 
         # Output final results
         final_time = time.time()
@@ -368,8 +336,6 @@ class SimpleDBAgent:
         logger.info(f"Total time: {total_elapsed:.2f}s (timeout limit: {duration}s)")
         logger.info(f"Completed rounds: {round_idx}")
         logger.info(f"Best SQL execution times: {best_sql_times}")
-        logger.info(
-            f"Workload best total execution time: {sum(best_sql_times.values()):.4f}s"
-        )
+        logger.info(f"Workload best total execution time: {sum(best_sql_times.values()):.4f}s")
         logger.info(f"Best SQL fix actions: {best_sql_actions}")
         logger.info(f"Diagnosis process ended")

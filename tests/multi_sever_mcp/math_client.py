@@ -32,10 +32,7 @@ def print_optimized_result(agent_response):
     final_answer = None  # 最终答案
 
     for message in messages:
-        if (
-            hasattr(message, "additional_kwargs")
-            and "tool_calls" in message.additional_kwargs
-        ):
+        if hasattr(message, "additional_kwargs") and "tool_calls" in message.additional_kwargs:
             # 提取工具调用信息
             tool_calls = message.additional_kwargs["tool_calls"]
             for tool_call in tool_calls:

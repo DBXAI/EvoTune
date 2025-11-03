@@ -187,9 +187,7 @@ class TestPromptManager:
     @staticmethod
     def extract_index_names(sql: str) -> List[str]:
         """从多条CREATE INDEX语句中提取所有索引名"""
-        return re.findall(
-            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE
-        )
+        return re.findall(r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE)
 
     @staticmethod
     def extract_knob_names(sql: str) -> List[str]:
@@ -292,9 +290,7 @@ class TestPromptManager:
             diagnosis,
             re.IGNORECASE,
         )
-        is_rewrite = (
-            is_rewrite_match.group(1).strip().lower() if is_rewrite_match else "no"
-        )
+        is_rewrite = is_rewrite_match.group(1).strip().lower() if is_rewrite_match else "no"
 
         # 清理 markdown 符号
         for var_name in ["explanation", "fix_action", "is_rewrite"]:
@@ -311,13 +307,7 @@ class TestPromptManager:
         sql_start = None
         for idx, line in enumerate(lines):
             l = line.lstrip().upper()
-            if (
-                l.startswith("WITH")
-                or l.startswith("SELECT")
-                or l.startswith("INSERT")
-                or l.startswith("UPDATE")
-                or l.startswith("DELETE")
-            ):
+            if l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or l.startswith("UPDATE") or l.startswith("DELETE"):
                 sql_start = idx
                 break
         if sql_start is not None:
@@ -340,9 +330,7 @@ class TestPromptManager:
         if not self.agent:
             await self.initialize()
 
-        prompt = self._build_prompt(
-            query_info, db_info, root_cause, historical_cases, inspirations
-        )
+        prompt = self._build_prompt(query_info, db_info, root_cause, historical_cases, inspirations)
         print(f"prompt: {prompt}")
 
         result = await Runner.run(starting_agent=self.agent, input=prompt)
@@ -488,9 +476,7 @@ class TestPromptManager:
                 historical_cases,
                 inspirations,
             )
-            explanation, fix_action, query_rewrite = self.parse_action_result(
-                fix_result
-            )
+            explanation, fix_action, query_rewrite = self.parse_action_result(fix_result)
             print(f"解释: {explanation}")
             print(f"修复动作: {fix_action}")
             print(f"是否重写SQL: {query_rewrite}")
@@ -523,9 +509,7 @@ class TestPromptManager:
             print(f"大模型修复失败: {e}")
             return None
 
-    def _build_prompt(
-        self, query_info, db_info, root_cause, historical_cases, inspirations
-    ):
+    def _build_prompt(self, query_info, db_info, root_cause, historical_cases, inspirations):
         """构建修复提示模板"""
         return f"""
         As an SQL optimization expert, your task is to diagnose and fix the following slow SQL query.
@@ -679,9 +663,7 @@ async def main():
     async with TestPromptManager() as manager:
         sql_file = os.path.join(sql_dir, sql_num)
 
-        result = await manager.process_sql_file(
-            sql_file, root_cause, action_space_apis, historical_cases, inspirations
-        )
+        result = await manager.process_sql_file(sql_file, root_cause, action_space_apis, historical_cases, inspirations)
 
         if result:
             if result["status"] == 1:

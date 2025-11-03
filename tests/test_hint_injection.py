@@ -81,9 +81,7 @@ def test_hint_injection():
 
     # 测试用例3: EXPLAIN 语句
     sql3 = "EXPLAIN SELECT * FROM users WHERE id = 1;"
-    expected3 = (
-        "/*+ Set(enable_hashjoin off) */ EXPLAIN SELECT * FROM users WHERE id = 1;"
-    )
+    expected3 = "/*+ Set(enable_hashjoin off) */ EXPLAIN SELECT * FROM users WHERE id = 1;"
     result3 = _inject_hint_into_sql(hint, sql3)
     print(f"测试3 - EXPLAIN语句:")
     print(f"  输入: {sql3}")
@@ -94,9 +92,7 @@ def test_hint_injection():
 
     # 测试用例4: 子查询中的 SELECT（不应该被注入）
     sql4 = "SELECT * FROM (SELECT id FROM users) AS sub;"
-    expected4 = (
-        "/*+ Set(enable_hashjoin off) */ SELECT * FROM (SELECT id FROM users) AS sub;"
-    )
+    expected4 = "/*+ Set(enable_hashjoin off) */ SELECT * FROM (SELECT id FROM users) AS sub;"
     result4 = _inject_hint_into_sql(hint, sql4)
     print(f"测试4 - 子查询:")
     print(f"  输入: {sql4}")

@@ -42,9 +42,7 @@ class SoftQRetriever:
         self.experience_pool = deque()
 
         # 优化器
-        self.optimizer = torch.optim.Adam(
-            self.network.parameters(), lr=self.learning_rate
-        )
+        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.learning_rate)
 
         # 统计信息
         self.total_experiences = 0
@@ -53,9 +51,7 @@ class SoftQRetriever:
     def _init_networks(self):
         # 主网络：两层MLP + Sigmoid（输出0-1之间的概率）
         self.network = nn.Sequential(
-            nn.Linear(
-                self.embedding_dim, self.hidden_dim
-            ),  # query_emb(32) + case_emb(64+32) + root_causes(4) + approve_time(1) = 133
+            nn.Linear(self.embedding_dim, self.hidden_dim),  # query_emb(32) + case_emb(64+32) + root_causes(4) + approve_time(1) = 133
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
@@ -127,13 +123,9 @@ class SoftQRetriever:
         root_cause_vector = self._encode_root_causes(root_causes)
 
         approve_time = case_info.get("approve_time", 0.0)
-        approve_time_tensor = torch.tensor([approve_time], dtype=torch.float32).to(
-            self.device
-        )
+        approve_time_tensor = torch.tensor([approve_time], dtype=torch.float32).to(self.device)
 
-        features = torch.cat(
-            [query_embedding, case_embedding, root_cause_vector, approve_time_tensor]
-        )
+        features = torch.cat([query_embedding, case_embedding, root_cause_vector, approve_time_tensor])
 
         return features
 
@@ -173,9 +165,7 @@ class SoftQRetriever:
         return result
 
     def add_experience(self, query_info, case_info, reward):
-        experience = Experience(
-            query_info=query_info, case_info=case_info, reward=reward
-        )
+        experience = Experience(query_info=query_info, case_info=case_info, reward=reward)
 
         self.experience_pool.append(experience)
         self.total_experiences += 1

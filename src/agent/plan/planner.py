@@ -35,17 +35,7 @@ class Planner:
         self.root_cause_model = self.agent_config.get("root_cause_llm_model")
 
     def encode_plan(self, query_plan):
-        df = pd.DataFrame(
-            [
-                {
-                    "plan_json": (
-                        json.dumps({"Plan": query_plan})
-                        if isinstance(query_plan, dict)
-                        else query_plan
-                    )
-                }
-            ]
-        )
+        df = pd.DataFrame([{"plan_json": (json.dumps({"Plan": query_plan}) if isinstance(query_plan, dict) else query_plan)}])
 
         plan_encoder = PlanEncoder(df=df, encoding=self.encoding)
         encoded_df = plan_encoder.df
@@ -55,9 +45,7 @@ class Planner:
     def model_predict(self, query_info):
         query, plan, timeseries, log = self._build_prediction_input(query_info)
 
-        pred_label_opt, pred_label = self.predictor.predict(
-            query=query, plan=plan, timeseries=timeseries, log=log
-        )
+        pred_label_opt, pred_label = self.predictor.predict(query=query, plan=plan, timeseries=timeseries, log=log)
 
         result = self._extract_top_root_cause(pred_label, pred_label_opt)
         result["pred_label_opt"] = pred_label_opt.cpu().numpy()
@@ -73,9 +61,7 @@ class Planner:
             input=prompt,
         ).final_output.strip()
 
-    def llm_predict(
-        self, query_info, root_causes, state_confidence, tuning_history=None
-    ):
+    def llm_predict(self, query_info, root_causes, state_confidence, tuning_history=None):
         # ε-greedy retrieval structure: {"positive", "negative"}
         # retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
         # positives = retrieval.get('positive', [])
@@ -87,7 +73,7 @@ class Planner:
             state_confidence=state_confidence,
             tuning_history=tuning_history,
         )
-        print("prompt: ", prompt)
+        # print("prompt: ", prompt)
 
         output = self.diagnosis_agent(prompt)
         print("output: ", output)
@@ -110,9 +96,7 @@ class Planner:
     def parse_and_validate(self, json_text):
         try:
             data = json.loads(json_text)
-            reported_pred = [
-                str(x).lower().strip() for x in data.get("predicted_root_causes", [])
-            ]
+            reported_pred = [str(x).lower().strip() for x in data.get("predicted_root_causes", [])]
             items = data.get("root_causes", [])
 
             derived_pred = []
@@ -201,16 +185,12 @@ class Planner:
                 "poorly written queries",
             ]
             confidence = np.array(pred_opt).reshape(-1)
-            state["confidence"] = {
-                labels[i]: float(confidence[i]) for i in range(confidence.shape[0])
-            }
+            state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
 
         # 将当前根因和置信度传给LLM
         # 构建按根因聚合的历史成功/失败计数
         tuning_history = []
-        union_keys = set(state.get("attempts", {}).keys()) | set(
-            state.get("successes", {}).keys()
-        )
+        union_keys = set(state.get("attempts", {}).keys()) | set(state.get("successes", {}).keys())
         for k in union_keys:
             # 归一化为 frozenset 或单元素集合
             label = list(k)

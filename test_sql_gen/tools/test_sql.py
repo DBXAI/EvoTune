@@ -17,9 +17,7 @@ from psycopg2 import errors
 def test_sql_files(sql_dir):
     # 连接到PostgreSQL数据库
     try:
-        conn = psycopg2.connect(
-            "postgresql://postgres:postgres@localhost:5432/tpch100G"
-        )
+        conn = psycopg2.connect("postgresql://postgres:postgres@localhost:5432/tpch100G")
         conn.autocommit = False  # 确保手动控制事务
         cursor = conn.cursor()
         print("成功连接到PostgreSQL数据库")
@@ -101,9 +99,7 @@ def test_sql_files(sql_dir):
 
                 if len(results) == 0:
                     empty_results.append(file_name)
-                    print(
-                        f"⚠ {file_name} - 执行成功但结果为空 (耗时: {execution_time:.4f}秒)"
-                    )
+                    print(f"⚠ {file_name} - 执行成功但结果为空 (耗时: {execution_time:.4f}秒)")
                 else:
                     print(f"✓ {file_name} - 执行成功 (耗时: {execution_time:.4f}秒)")
 
@@ -259,9 +255,7 @@ def compare_sql_performance(origin_dir, rewritten_dir):
             improve = origin_time - rewritten_time
             improve_percent = (improve / origin_time * 100) if origin_time > 0 else 0
             print(f"\n⏱️ {file_name} 性能提升: {improve:.4f}秒 ({improve_percent:.2f}%)")
-            results.append(
-                (file_name, origin_time, rewritten_time, improve, improve_percent)
-            )
+            results.append((file_name, origin_time, rewritten_time, improve, improve_percent))
         else:
             print(f"\n⚠️ {file_name} 有SQL执行失败，无法比较性能")
 
@@ -271,9 +265,7 @@ def compare_sql_performance(origin_dir, rewritten_dir):
     # 汇总输出
     print("\n===== 性能对比汇总 =====")
     for file_name, origin_time, rewritten_time, improve, improve_percent in results:
-        print(
-            f"{file_name}: 原始={origin_time:.4f}s, 改写={rewritten_time:.4f}s, 提升={improve:.4f}s ({improve_percent:.2f}%)"
-        )
+        print(f"{file_name}: 原始={origin_time:.4f}s, 改写={rewritten_time:.4f}s, 提升={improve:.4f}s ({improve_percent:.2f}%)")
     print(f"\n共对比成功: {len(results)} 条SQL")
 
 

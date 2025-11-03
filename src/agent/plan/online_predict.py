@@ -116,9 +116,7 @@ class RCRankPredictor:
 
         # load pre-trained model
         print(f"Loading model from {self.model_path}")
-        self.model.load_state_dict(
-            torch.load(self.model_path, map_location=self.device)
-        )
+        self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
         self.model.eval()
 
     def _compute_statistics(self, train_data_path):
@@ -166,9 +164,7 @@ class RCRankPredictor:
             if len(timeseries.shape) == 2:
                 timeseries = timeseries.unsqueeze(0)  # add batch dimension
             # standardize
-            timeseries = (timeseries - self.timeseries_train_mean.unsqueeze(1)) / (
-                self.timeseries_train_std.unsqueeze(1) + 1e-6
-            )
+            timeseries = (timeseries - self.timeseries_train_mean.unsqueeze(1)) / (self.timeseries_train_std.unsqueeze(1) + 1e-6)
             timeseries = timeseries.to(self.device)
 
             log = torch.tensor(log)

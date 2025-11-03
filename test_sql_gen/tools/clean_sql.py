@@ -82,11 +82,7 @@ def filter_by_time_diff(input_file, output_file, threshold=1.0):
     """
     with open(input_file, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        rows = [
-            row
-            for row in reader
-            if abs(float(row["before_time"]) - float(row["after_time"])) >= threshold
-        ]
+        rows = [row for row in reader if abs(float(row["before_time"]) - float(row["after_time"])) >= threshold]
         fieldnames = reader.fieldnames
     with open(output_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -96,9 +92,7 @@ def filter_by_time_diff(input_file, output_file, threshold=1.0):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="SQL清洗工具：查重、去重、批量删除/复制SQL文件"
-    )
+    parser = argparse.ArgumentParser(description="SQL清洗工具：查重、去重、批量删除/复制SQL文件")
     parser.add_argument(
         "--mode",
         required=True,

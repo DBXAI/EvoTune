@@ -102,15 +102,9 @@ def analyze_duration_distribution(csv_path):
 def main():
     parser = argparse.ArgumentParser(description="慢SQL根因与执行时间统计工具")
     parser.add_argument("--csv_path", type=str, required=True, help="CSV文件路径")
-    parser.add_argument(
-        "--analyze_query", action="store_true", help="是否分析query列中是否包含SELECT"
-    )
-    parser.add_argument(
-        "--analyze_root_cause", action="store_true", help="统计根因分布"
-    )
-    parser.add_argument(
-        "--analyze_duration", action="store_true", help="统计根因下SQL执行时间分布"
-    )
+    parser.add_argument("--analyze_query", action="store_true", help="是否分析query列中是否包含SELECT")
+    parser.add_argument("--analyze_root_cause", action="store_true", help="统计根因分布")
+    parser.add_argument("--analyze_duration", action="store_true", help="统计根因下SQL执行时间分布")
     args = parser.parse_args()
 
     if args.analyze_root_cause or args.analyze_query:

@@ -108,9 +108,7 @@ async def start_servers():
         await server.connect()
         return server
 
-    pg_server, math_server, weather_server = await asyncio.gather(
-        start_postgres(), start_math(), start_weather()
-    )
+    pg_server, math_server, weather_server = await asyncio.gather(start_postgres(), start_math(), start_weather())
     return pg_server, math_server, weather_server
 
 

@@ -7,9 +7,7 @@ This module contains all prompt generation functions extracted from action_manag
 def fmt_cases(cases):
     lines = []
     for i, case in enumerate(cases, 1):
-        lines.append(
-            f"\n    Case {i}:\n    SQL: {case.get('query_info').get('query')}\n    Execution Plan: {case.get('query_info').get('plan_json')}\n    Origin Execution Runtime: {case.get('query_info').get('execution_time')}s\n    Root Causes: {case.get('root_causes')}\n    Fix_Actions: {case.get('fix_action')}\n    Improve: {case.get('approve_time')}"
-        )
+        lines.append(f"\n    Case {i}:\n    SQL: {case.get('query_info').get('query')}\n    Execution Plan: {case.get('query_info').get('plan_json')}\n    Origin Execution Runtime: {case.get('query_info').get('execution_time')}s\n    Root Causes: {case.get('root_causes')}\n    Fix_Actions: {case.get('fix_action')}\n    Improve: {case.get('approve_time')}")
     return "\n".join(lines)
     # try:
     #     return "\n".join([
@@ -19,9 +17,7 @@ def fmt_cases(cases):
     #     return str(cases)
 
 
-def build_action_prompt(
-    root_cause, base_info, action_space, mode, positives, negatives
-):
+def build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives):
     """
     Format a prompt that feeds the LLM with all necessary context and enforces
     a consistent two-part output: Explanation + SQL Fix.
@@ -98,7 +94,7 @@ def build_action_prompt(
     <concise technical reason why the root cause is causing the slowdown now>
 
     Fix_Action:
-    <your fix SQL or optimization action here>
+    <your fix action here, do not include any other text, if no fix action is needed, output an empty string>
 
     Query_Rewrite:
     <yes or no>
@@ -143,9 +139,7 @@ def build_rewrite_prompt(origin_sql, rewrite_sql):
     <paste only the revised SQL here, exactly as SQL, nothing else>"""
 
 
-def build_root_cause_diagnosis_prompt(
-    query_info, root_causes, state_confidence, tuning_history=None, timeout=300
-):
+def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence, tuning_history=None, timeout=300):
     """Build prompt for LLM-based root cause diagnosis with per-label confidence map.
 
     tuning_history: Optional list summarizing per-root-cause success/failure counts, e.g.,
@@ -230,9 +224,7 @@ def build_root_cause_diagnosis_prompt(
     }}"""
 
 
-def build_action_space_prompt(
-    root_causes, db, knob_config, current_knob_values, query_info=None
-):
+def build_action_space_prompt(root_causes, db, knob_config, current_knob_values, query_info=None):
     """Build action space prompt based on root causes."""
     # 根因
     root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
@@ -260,9 +252,7 @@ def build_action_space_prompt(
         knob_lines = []
         for knob_name, spec in system_knobs_specs.items():
             current_val = current_values.get(knob_name)
-            knob_lines.append(
-                f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}"
-            )
+            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
 
         action_space_prompt += f"""
     • Knob Space:  
@@ -278,9 +268,7 @@ def build_action_space_prompt(
         knob_lines = []
         for knob_name, spec in query_knobs_specs.items():
             current_val = current_values.get(knob_name)
-            knob_lines.append(
-                f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}"
-            )
+            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
 
         action_space_prompt += f"""
     • Plan Optimizer Space: 

@@ -75,9 +75,7 @@ def test_prompt_integration():
             def __init__(self, query):
                 self.query = query
 
-        query_info = MockQueryInfo(
-            "SELECT * FROM table1 UNION ALL SELECT * FROM table2 ORDER BY col1"
-        )
+        query_info = MockQueryInfo("SELECT * FROM table1 UNION ALL SELECT * FROM table2 ORDER BY col1")
         root_causes = ["poorly written queries"]
 
         action_space_prompt = build_action_space_prompt(

@@ -28,18 +28,8 @@ url_mysql = (
     + "&api_key=839b4262-5b2a-4226-a967-37d2c7fa8213"
 )
 
-url_think = (
-    smithery.create_smithery_url(
-        "wss://server.smithery.ai/@PhillipRt/think-mcp-server/ws", {}
-    )
-    + "&api_key=839b4262-5b2a-4226-a967-37d2c7fa8213"
-)
-url_search = (
-    smithery.create_smithery_url(
-        "wss://server.smithery.ai/@chuanmingliu/mcp-webresearch/ws", {}
-    )
-    + "&api_key=839b4262-5b2a-4226-a967-37d2c7fa8213"
-)
+url_think = smithery.create_smithery_url("wss://server.smithery.ai/@PhillipRt/think-mcp-server/ws", {}) + "&api_key=839b4262-5b2a-4226-a967-37d2c7fa8213"
+url_search = smithery.create_smithery_url("wss://server.smithery.ai/@chuanmingliu/mcp-webresearch/ws", {}) + "&api_key=839b4262-5b2a-4226-a967-37d2c7fa8213"
 
 
 # 初始化 DeepSeek 大模型客户端
@@ -61,10 +51,7 @@ def print_optimized_result(agent_response):
     final_answer = None  # 最终答案
 
     for message in messages:
-        if (
-            hasattr(message, "additional_kwargs")
-            and "tool_calls" in message.additional_kwargs
-        ):
+        if hasattr(message, "additional_kwargs") and "tool_calls" in message.additional_kwargs:
             # 提取工具调用信息
             tool_calls = message.additional_kwargs["tool_calls"]
             for tool_call in tool_calls:

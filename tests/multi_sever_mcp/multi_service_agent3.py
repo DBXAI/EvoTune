@@ -74,15 +74,11 @@ class ServerConfig:
 
     @classmethod
     def from_dict(cls, config):
-        server_type = (
-            MCPServerStdio if config["server_type"] == "stdio" else MCPServerSse
-        )
+        server_type = MCPServerStdio if config["server_type"] == "stdio" else MCPServerSse
         # 处理相对路径
         if "cwd" in config["params"] and config["params"]["cwd"] == ".":
             config["params"]["cwd"] = os.path.dirname(os.path.abspath(__file__))
-        return cls(
-            name=config["name"], server_type=server_type, params=config["params"]
-        )
+        return cls(name=config["name"], server_type=server_type, params=config["params"])
 
 
 class MultiServerManager:
@@ -94,9 +90,7 @@ class MultiServerManager:
     async def manage_servers(self):
         try:
             for config in self.configs:
-                self.servers[config.name] = await config.server_type(
-                    name=config.name, params=config.params
-                ).__aenter__()
+                self.servers[config.name] = await config.server_type(name=config.name, params=config.params).__aenter__()
             yield list(self.servers.values())
         finally:
             for server in self.servers.values():
@@ -105,16 +99,11 @@ class MultiServerManager:
 
 async def main():
     # 读取配置文件
-    config_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "mcp_config.yaml"
-    )
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_config.yaml")
     with open(config_path, "r", encoding="utf-8") as f:
         config_data = yaml.safe_load(f)
 
-    configs = [
-        ServerConfig.from_dict(service_config)
-        for service_config in config_data["services"]
-    ]
+    configs = [ServerConfig.from_dict(service_config) for service_config in config_data["services"]]
 
     manager = MultiServerManager(configs)
     async with manager.manage_servers() as servers:

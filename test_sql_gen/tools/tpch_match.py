@@ -10,9 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # 使用方法
 # python tpch_match.py
 
-DB_URL = os.getenv(
-    "TPCH_DB_URL", "postgresql://postgres:postgres@localhost:5432/tpch10G"
-)
+DB_URL = os.getenv("TPCH_DB_URL", "postgresql://postgres:postgres@localhost:5432/tpch10G")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 
 
@@ -37,9 +35,7 @@ def decimal_default(obj):
 
 
 def compare_results(new_result, old_result):
-    return json.dumps(
-        new_result, ensure_ascii=False, indent=2, default=decimal_default
-    ) == json.dumps(old_result, ensure_ascii=False, indent=2, default=decimal_default)
+    return json.dumps(new_result, ensure_ascii=False, indent=2, default=decimal_default) == json.dumps(old_result, ensure_ascii=False, indent=2, default=decimal_default)
 
 
 def main(query_file, output_file):
@@ -65,17 +61,9 @@ def main(query_file, output_file):
     else:
         print("结果不一致！")
         print("新结果:")
-        print(
-            json.dumps(
-                new_result, ensure_ascii=False, indent=2, default=decimal_default
-            )
-        )
+        print(json.dumps(new_result, ensure_ascii=False, indent=2, default=decimal_default))
         print("旧结果:")
-        print(
-            json.dumps(
-                old_result, ensure_ascii=False, indent=2, default=decimal_default
-            )
-        )
+        print(json.dumps(old_result, ensure_ascii=False, indent=2, default=decimal_default))
 
 
 if __name__ == "__main__":

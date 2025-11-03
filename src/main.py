@@ -51,9 +51,7 @@ from agent.db_agent import DBAgent
 
 def parse_args():
     parser = argparse.ArgumentParser(description="慢查询诊断工具")
-    parser.add_argument(
-        "--data_path", type=str, required=True, help="慢查询数据文件路径"
-    )
+    parser.add_argument("--data_path", type=str, required=True, help="慢查询数据文件路径")
     parser.add_argument("--order", type=str, required=True, help="慢查询执行顺序")
     parser.add_argument("--duration", type=int, default=30, help="调优时间")
     parser.add_argument("--config", type=str, required=True, help="配置文件路径")
@@ -64,7 +62,9 @@ def parse_args():
 async def main():
     # cd /root/DREAM/src
     # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --duration 10
-    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --duration 1 --config /root/DREAM/config/base_config.json
+    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --duration 1 --config /root/DREAM/config/tpch_config.json
+    # python main.py --data_path /root/DREAM/data/slow_queries/TPC-DS --order qorder.txt --duration 1 --config /root/DREAM/config/tpcds_config.json
+    # python main.py --data_path /root/DREAM/data/slow_queries/JOB --order qorder.txt --duration 1 --config /root/DREAM/config/job_config.json
     logger = logging.getLogger(__name__)
 
     args = parse_args()
@@ -83,9 +83,7 @@ async def main():
             slow_query_path=args.data_path,
             order=args.order,
             duration=args.duration,
-            no_improvement_threshold=configs["AGENT_CONFIG"][
-                "no_improvement_threshold"
-            ],
+            no_improvement_threshold=configs["AGENT_CONFIG"]["no_improvement_threshold"],
             epsilon=configs["AGENT_CONFIG"]["epsilon"],
         )
 

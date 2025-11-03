@@ -58,7 +58,7 @@ cp base_config.json.example base_config.json
   python train_retriever_offline.py \
       --samples_path experience/retriever_samples.jsonl \
       --model_save_path model/soft_q_retriever.pt \
-      --config_path ../../config/base_config.json \
+      --config_path ../../../config/base_config.json \
       --epochs 10 \
       --batch_size 32 \
       --learning_rate 0.0001

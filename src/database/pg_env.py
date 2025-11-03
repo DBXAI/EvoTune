@@ -47,9 +47,7 @@ class PostgresDB:
     def connect(self):
         """建立并返回一个数据库连接"""
         if self.connection is None or self.connection.closed:
-            self.connection = psycopg.connect(
-                self.conn_str, autocommit=True, prepare_threshold=None
-            )
+            self.connection = psycopg.connect(self.conn_str, autocommit=True, prepare_threshold=None)
         return self.connection
 
     def execute(self, sql, conn=None, timeout=None):
@@ -269,9 +267,7 @@ class PostgresDB:
 
     def start_db(self):
         if not all([self.postgres_path, self.postgres_data, self.log_path]):
-            raise ValueError(
-                "postgres_path, postgres_data, and log_path must be configured to start the database."
-            )
+            raise ValueError("postgres_path, postgres_data, and log_path must be configured to start the database.")
         pg_ctl_cmd = [
             f"{self.postgres_path}/pg_ctl",
             "-D",
@@ -307,9 +303,7 @@ class PostgresDB:
 
     def shutdown_db(self):
         if not all([self.postgres_path, self.postgres_data]):
-            raise ValueError(
-                "postgres_path and postgres_data must be configured to shut down the database."
-            )
+            raise ValueError("postgres_path and postgres_data must be configured to shut down the database.")
         pg_ctl_cmd = [
             f"{self.postgres_path}/pg_ctl",
             "stop",
@@ -402,14 +396,7 @@ class PostgresDB:
 
                 # 2. 找到第一个可 EXPLAIN 的查询语句（WITH/SELECT/INSERT/UPDATE/DELETE）
                 for stmt in statements:
-                    if (
-                        stmt.upper().startswith("WITH")
-                        or stmt.upper().startswith("SELECT")
-                        or stmt.upper().startswith("/*+")
-                        or stmt.upper().startswith("INSERT")
-                        or stmt.upper().startswith("UPDATE")
-                        or stmt.upper().startswith("DELETE")
-                    ):
+                    if stmt.upper().startswith("WITH") or stmt.upper().startswith("SELECT") or stmt.upper().startswith("/*+") or stmt.upper().startswith("INSERT") or stmt.upper().startswith("UPDATE") or stmt.upper().startswith("DELETE"):
                         try:
                             plan_sql = f"EXPLAIN (FORMAT JSON) {stmt}"
                             plan_result = self.fetch_results(plan_sql)
@@ -468,9 +455,7 @@ class PostgresDB:
                 try:
                     # 只采集当前数据库
                     if table == "pg_stat_database":
-                        cursor.execute(
-                            f"SELECT * FROM {table} WHERE datname = current_database()"
-                        )
+                        cursor.execute(f"SELECT * FROM {table} WHERE datname = current_database()")
                     else:
                         cursor.execute(f"SELECT * FROM {table}")
                     records = cursor.fetchall()
@@ -539,9 +524,7 @@ class PostgresDB:
                         v_before = row_before.get(k, 0)
                         v_after = row_after.get(k, 0)
                         try:
-                            sum_row[k] += (v_after if v_after is not None else 0) - (
-                                v_before if v_before is not None else 0
-                            )
+                            sum_row[k] += (v_after if v_after is not None else 0) - (v_before if v_before is not None else 0)
                         except Exception:
                             pass
                 diff[table] = sum_row
@@ -556,9 +539,7 @@ class PostgresDB:
                         v_before = row_before.get(k, 0)
                         v_after = row_after.get(k, 0)
                         try:
-                            row_diff[k] = (v_after if v_after is not None else 0) - (
-                                v_before if v_before is not None else 0
-                            )
+                            row_diff[k] = (v_after if v_after is not None else 0) - (v_before if v_before is not None else 0)
                         except Exception:
                             row_diff[k] = None
                     for id_key in ["relname", "datname", "table_name"]:
@@ -624,9 +605,7 @@ class PostgresDB:
 
         schema_info = self.fetch_schema_info()
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".sql", delete=False, dir="/tmp", encoding="utf-8"
-        ) as temp_file:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False, dir="/tmp", encoding="utf-8") as temp_file:
             temp_sql_path = temp_file.name
 
             # CREATE TABLE SQL
@@ -672,9 +651,7 @@ class PostgresDB:
                 "qed-parser",
                 temp_sql_path,
             ]
-            parser_retcode, parser_stdout, parser_stderr = local["nix"][parser_cmd].run(
-                retcode=None
-            )
+            parser_retcode, parser_stdout, parser_stderr = local["nix"][parser_cmd].run(retcode=None)
 
             if not os.path.exists(temp_json_path):
                 print("No JSON file generated by qed-parser")
@@ -689,13 +666,9 @@ class PostgresDB:
                 "qed-prover",
                 temp_json_path,
             ]
-            prover_retcode, prover_stdout, prover_stderr = local["nix"][prover_cmd].run(
-                retcode=None
-            )
+            prover_retcode, prover_stdout, prover_stderr = local["nix"][prover_cmd].run(retcode=None)
 
-            result_file_path = (
-                temp_result_path if os.path.exists(temp_result_path) else None
-            )
+            result_file_path = temp_result_path if os.path.exists(temp_result_path) else None
             if result_file_path:
                 with open(result_file_path, "r") as f:
                     content = f.read().strip()
@@ -704,9 +677,7 @@ class PostgresDB:
                         return True
                     if result_json.get("panicked", False):
                         if prover_retcode != 0:
-                            print(
-                                f"QED prover panicked but result file exists (return code: {prover_retcode})"
-                            )
+                            print(f"QED prover panicked but result file exists (return code: {prover_retcode})")
                         return False
                     return False
 

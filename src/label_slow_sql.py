@@ -62,9 +62,7 @@ async def label_slow_sqls():
                 try:
                     kpis_list = json.loads(query_info["query_kpis"])
                 except Exception as e:
-                    print(
-                        f"timeseries 解析失败: {query_info['query_kpis']}, error: {e}"
-                    )
+                    print(f"timeseries 解析失败: {query_info['query_kpis']}, error: {e}")
                     kpis_list = [[0.0], [0.0], [0.0], [0.0]]
 
                 metrics = {
@@ -117,18 +115,14 @@ async def label_slow_sqls():
 
                 # action_manager生成修复SQL
                 historical_data = []
-                action_results = await agent.action_manager.analyze_and_act(
-                    analysis_result, query, anomaly, historical_data
-                )
+                action_results = await agent.action_manager.analyze_and_act(analysis_result, query, anomaly, historical_data)
                 diagnosis = action_results.get("diagnosis", "")
                 sql_fixes = agent.extract_sql_fix(diagnosis)
                 if not sql_fixes:
                     time_ratio = 0.0  # 无法修复，优化率为0
                 else:
                     # 评估修复效果
-                    evaluation = await agent.planner.evaluate_action(
-                        sql_fixes, cause, query, simulation_mode=True
-                    )
+                    evaluation = await agent.planner.evaluate_action(sql_fixes, cause, query, simulation_mode=True)
                     msg = evaluation[1]
                     print(f"msg: {msg}")
                     import re
@@ -153,12 +147,8 @@ async def label_slow_sqls():
                         time_ratio = 0.0
                 time_ratios.append(round(time_ratio, 4))
             # 立即写入一条记录
-            writer.writerow(
-                {"query": sql_row["query"], "opt_rate_label": str(time_ratios)}
-            )
-            print(
-                f"已写入: query={sql_row['query'][:50]}..., opt_rate_label={time_ratios}"
-            )
+            writer.writerow({"query": sql_row["query"], "opt_rate_label": str(time_ratios)})
+            print(f"已写入: query={sql_row['query'][:50]}..., opt_rate_label={time_ratios}")
     await agent.cleanup()
 
 

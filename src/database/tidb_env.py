@@ -53,12 +53,7 @@ class TiDB:
             for proc in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
                     cmdline = proc.info["cmdline"]
-                    if (
-                        cmdline
-                        and "tiup" in cmdline
-                        and "playground" in cmdline
-                        and "DREAM" in cmdline
-                    ):
+                    if cmdline and "tiup" in cmdline and "playground" in cmdline and "DREAM" in cmdline:
                         return True
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -180,9 +175,7 @@ class TiDB:
             results = cursor.fetchall()
 
             if as_json:
-                return json.dumps(
-                    results, indent=4, ensure_ascii=False, default=self._decimal_default
-                )
+                return json.dumps(results, indent=4, ensure_ascii=False, default=self._decimal_default)
 
             # if only one column, return single column result
             if results and len(results[0]) == 1:

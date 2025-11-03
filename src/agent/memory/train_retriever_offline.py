@@ -50,7 +50,14 @@ def load_samples(samples_path):
     return samples
 
 
-def train_retriever_from_samples(samples_path, model_save_path, memory_manager_config, epochs=10, batch_size=32, learning_rate=1e-4):
+def train_retriever_from_samples(
+    samples_path,
+    model_save_path,
+    memory_manager_config,
+    epochs=10,
+    batch_size=32,
+    learning_rate=1e-4,
+):
     """
     Train retriever from sample file
 
@@ -168,8 +175,18 @@ def train_retriever_from_samples(samples_path, model_save_path, memory_manager_c
 
 def main():
     parser = argparse.ArgumentParser(description="Offline training for Soft Q Retriever")
-    parser.add_argument("--samples_path", type=str, required=True, help="Path to sample file (JSONL format)")
-    parser.add_argument("--model_save_path", type=str, required=True, help="Path to save the trained model")
+    parser.add_argument(
+        "--samples_path",
+        type=str,
+        required=True,
+        help="Path to sample file (JSONL format)",
+    )
+    parser.add_argument(
+        "--model_save_path",
+        type=str,
+        required=True,
+        help="Path to save the trained model",
+    )
     parser.add_argument("--config_path", type=str, required=True, help="Path to configuration file")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")

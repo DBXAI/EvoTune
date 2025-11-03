@@ -23,11 +23,7 @@ from sqlparse.tokens import Comparison as TComparison
 from sqlparse.tokens import Keyword, Literal, Name, Whitespace, Wildcard
 
 # 添加项目根目录到Python路径
-sys.path.append(
-    os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 import jpype as jp
 
@@ -39,9 +35,7 @@ mcp = FastMCP("db_diagnosis")
 
 class SQLRuleMatcher:
     def __init__(self):
-        self.rules_file = (
-            "/root/DREAM/src/agent/action/calcite_rewrite_rules_abbreviated.jsonl"
-        )
+        self.rules_file = "/root/DREAM/src/agent/action/calcite_rewrite_rules_abbreviated.jsonl"
         self.rules = self._load_rules()
 
     def _load_rules(self):
@@ -63,19 +57,13 @@ class SQLRuleMatcher:
         return bool(re.search(r"\bOVER\s*\(", sql, re.IGNORECASE))
 
     def _has_distinct_aggregates(self, sql):
-        return bool(
-            re.search(
-                r"\b(COUNT|SUM|MIN|MAX|AVG)\s*\(\s*DISTINCT\b", sql, re.IGNORECASE
-            )
-        )
+        return bool(re.search(r"\b(COUNT|SUM|MIN|MAX|AVG)\s*\(\s*DISTINCT\b", sql, re.IGNORECASE))
 
     def _has_subqueries(self, sql):
         return bool(re.search(r"\(\s*SELECT\b", sql, re.IGNORECASE))
 
     def _has_joins(self, sql):
-        return bool(
-            re.search(r"\b(INNER|LEFT|RIGHT|FULL)\s+JOIN\b", sql, re.IGNORECASE)
-        )
+        return bool(re.search(r"\b(INNER|LEFT|RIGHT|FULL)\s+JOIN\b", sql, re.IGNORECASE))
 
     def _has_where_clauses(self, sql):
         return bool(re.search(r"\bWHERE\b", sql, re.IGNORECASE))
@@ -102,14 +90,10 @@ class SQLRuleMatcher:
         applicable_rules = []
 
         if self._has_union_all(sql) and self._has_order_by(sql):
-            applicable_rules.extend(
-                self._get_rules_by_pattern(["SORT_UNION_TRANSPOSE", "UNION"])
-            )
+            applicable_rules.extend(self._get_rules_by_pattern(["SORT_UNION_TRANSPOSE", "UNION"]))
 
         if self._has_subqueries(sql) and self._has_where_clauses(sql):
-            applicable_rules.extend(
-                self._get_rules_by_pattern(["FILTER_MERGE", "FILTER_SUB_QUERY"])
-            )
+            applicable_rules.extend(self._get_rules_by_pattern(["FILTER_MERGE", "FILTER_SUB_QUERY"]))
 
         if self._has_joins(sql):
             applicable_rules.extend(self._get_rules_by_pattern(["JOIN"]))
@@ -118,26 +102,16 @@ class SQLRuleMatcher:
             applicable_rules.extend(self._get_rules_by_pattern(["JOIN_CONDITION_PUSH"]))
 
         if self._has_distinct_aggregates(sql):
-            applicable_rules.extend(
-                self._get_rules_by_pattern(["AGGREGATE_EXPAND_DISTINCT"])
-            )
+            applicable_rules.extend(self._get_rules_by_pattern(["AGGREGATE_EXPAND_DISTINCT"]))
 
         if self._has_window_functions(sql):
-            applicable_rules.extend(
-                self._get_rules_by_pattern(["PROJECT_WINDOW_TRANSPOSE", "WINDOW"])
-            )
+            applicable_rules.extend(self._get_rules_by_pattern(["PROJECT_WINDOW_TRANSPOSE", "WINDOW"]))
 
         if self._has_redundant_projections(sql):
-            applicable_rules.extend(
-                self._get_rules_by_pattern(["PROJECT_REMOVE", "PROJECT_MERGE"])
-            )
+            applicable_rules.extend(self._get_rules_by_pattern(["PROJECT_REMOVE", "PROJECT_MERGE"]))
 
         if self._has_constant_expressions(sql):
-            applicable_rules.extend(
-                self._get_rules_by_pattern(
-                    ["SORT_REMOVE_CONSTANT", "REDUCE_EXPRESSIONS"]
-                )
-            )
+            applicable_rules.extend(self._get_rules_by_pattern(["SORT_REMOVE_CONSTANT", "REDUCE_EXPRESSIONS"]))
 
         if self._has_group_by(sql):
             applicable_rules.extend(self._get_rules_by_pattern(["AGGREGATE"]))
@@ -165,15 +139,11 @@ class SQLRuleMatcher:
         applicable_rules = self.match_rules(sql)
 
         if not applicable_rules:
-            return (
-                "    - No specific rewrite rules identified for this query structure."
-            )
+            return "    - No specific rewrite rules identified for this query structure."
 
         descriptions = []
         for rule in applicable_rules:
-            descriptions.append(
-                f'    - "{rule["name"]}": {rule["conditions"]} → {rule["transformations"]}'
-            )
+            descriptions.append(f'    - "{rule["name"]}": {rule["conditions"]} → {rule["transformations"]}')
 
         return "\n".join(descriptions)
 
@@ -201,9 +171,7 @@ class SQLRuleMatcher:
 
         elif "PROJECT_CORRELATE_TRANSPOSE" in rule_name:
             # 检查相关子查询的投影下推
-            return self._check_correlated_subquery_projection(
-                original_query, rewritten_query
-            )
+            return self._check_correlated_subquery_projection(original_query, rewritten_query)
 
         elif "FILTER_MERGE" in rule_name:
             # 检查WHERE条件合并
@@ -215,15 +183,11 @@ class SQLRuleMatcher:
 
         elif "AGGREGATE_EXPAND_DISTINCT_AGGREGATES" in rule_name:
             # 检查DISTINCT聚合展开
-            return self._check_distinct_aggregate_expansion(
-                original_query, rewritten_query
-            )
+            return self._check_distinct_aggregate_expansion(original_query, rewritten_query)
 
         elif "AGGREGATE_UNION_TRANSPOSE" in rule_name:
             # 检查聚合下推到UNION
-            return self._check_aggregate_union_transpose(
-                original_query, rewritten_query
-            )
+            return self._check_aggregate_union_transpose(original_query, rewritten_query)
 
         elif "JOIN_CONDITION_PUSH" in rule_name:
             # 检查JOIN条件下推
@@ -231,9 +195,7 @@ class SQLRuleMatcher:
 
         elif "SORT_REMOVE_CONSTANT_KEYS" in rule_name:
             # 检查ORDER BY常量键移除
-            return self._check_order_by_constant_removal(
-                original_query, rewritten_query
-            )
+            return self._check_order_by_constant_removal(original_query, rewritten_query)
 
         elif "AGGREGATE_JOIN_REMOVE" in rule_name:
             # 检查不必要的JOIN移除
@@ -241,9 +203,7 @@ class SQLRuleMatcher:
 
         elif "PROJECT_WINDOW_TRANSPOSE" in rule_name:
             # 检查窗口函数投影转置
-            return self._check_window_projection_transpose(
-                original_query, rewritten_query
-            )
+            return self._check_window_projection_transpose(original_query, rewritten_query)
 
         elif "FILTER_VALUES_MERGE" in rule_name:
             # 检查VALUES子句过滤合并
@@ -267,9 +227,7 @@ class SQLRuleMatcher:
 
         elif "PROJECT_REMOVE" in rule_name:
             # 检查冗余投影移除
-            return self._check_redundant_projection_removal(
-                original_query, rewritten_query
-            )
+            return self._check_redundant_projection_removal(original_query, rewritten_query)
 
         elif "JOIN_TO_CORRELATE" in rule_name:
             # 检查JOIN转换为相关子查询
@@ -296,12 +254,7 @@ class SQLRuleMatcher:
     def _check_correlated_subquery_projection(self, original_query, rewritten_query):
         """检查相关子查询的投影下推"""
         # 检查是否从相关子查询中提取了投影
-        return (
-            "select" in original_query.lower()
-            and "select" in rewritten_query.lower()
-            and "exists" in original_query.lower()
-            or "in " in original_query.lower()
-        )
+        return "select" in original_query.lower() and "select" in rewritten_query.lower() and "exists" in original_query.lower() or "in " in original_query.lower()
 
     def _check_where_merge(self, original_query, rewritten_query):
         """检查WHERE条件合并"""
@@ -325,11 +278,7 @@ class SQLRuleMatcher:
         rewritten_lower = rewritten_query.lower()
 
         # 检查DISTINCT是否被移除，GROUP BY是否被添加
-        return (
-            "distinct" in original_lower
-            and "distinct" not in rewritten_lower
-            and "group by" in rewritten_lower
-        )
+        return "distinct" in original_lower and "distinct" not in rewritten_lower and "group by" in rewritten_lower
 
     def _check_aggregate_union_transpose(self, original_query, rewritten_query):
         """检查聚合下推到UNION"""
@@ -358,12 +307,8 @@ class SQLRuleMatcher:
         # 检查ORDER BY子句是否被简化
         if "order by" in original_lower and "order by" in rewritten_lower:
             # 简单的启发式：如果ORDER BY子句变短了，可能移除了常量
-            original_order_by = original_query[
-                original_query.lower().find("order by") :
-            ]
-            rewritten_order_by = rewritten_query[
-                rewritten_query.lower().find("order by") :
-            ]
+            original_order_by = original_query[original_query.lower().find("order by") :]
+            rewritten_order_by = rewritten_query[rewritten_query.lower().find("order by") :]
             return len(rewritten_order_by) < len(original_order_by)
         return False
 
@@ -383,12 +328,7 @@ class SQLRuleMatcher:
         rewritten_lower = rewritten_query.lower()
 
         # 检查窗口函数是否被分离到子查询中
-        return (
-            "over(" in original_lower
-            and "over(" in rewritten_lower
-            and "select" in original_lower
-            and "select" in rewritten_lower
-        )
+        return "over(" in original_lower and "over(" in rewritten_lower and "select" in original_lower and "select" in rewritten_lower
 
     def _check_values_filter_merge(self, original_query, rewritten_query):
         """检查VALUES子句过滤合并"""
@@ -422,11 +362,7 @@ class SQLRuleMatcher:
         rewritten_lower = rewritten_query.lower()
 
         # 检查UNION是否被转换为DISTINCT
-        return (
-            "union" in original_lower
-            and "distinct" in rewritten_lower
-            and "union" not in rewritten_lower
-        )
+        return "union" in original_lower and "distinct" in rewritten_lower and "union" not in rewritten_lower
 
     def _check_redundant_sort_removal(self, original_query, rewritten_query):
         """检查冗余ORDER BY移除"""
@@ -452,9 +388,7 @@ class SQLRuleMatcher:
         rewritten_lower = rewritten_query.lower()
 
         # 检查JOIN是否被转换为EXISTS或IN
-        return "join" in original_lower and (
-            "exists" in rewritten_lower or " in " in rewritten_lower
-        )
+        return "join" in original_lower and ("exists" in rewritten_lower or " in " in rewritten_lower)
 
     def _check_intersect_to_distinct(self, original_query, rewritten_query):
         """检查INTERSECT转换为DISTINCT"""
@@ -462,11 +396,7 @@ class SQLRuleMatcher:
         rewritten_lower = rewritten_query.lower()
 
         # 检查INTERSECT是否被转换为GROUP BY + COUNT
-        return (
-            "intersect" in original_lower
-            and "group by" in rewritten_lower
-            and "count" in rewritten_lower
-        )
+        return "intersect" in original_lower and "group by" in rewritten_lower and "count" in rewritten_lower
 
 
 def clean_sql(sql):
@@ -684,9 +614,7 @@ def find_duplicate_subqueries(sql):
     duplicates = []
 
     for sq in subqueries:
-        normalized = sqlparse.format(
-            sq, keyword_case="upper", strip_comments=True
-        ).strip()
+        normalized = sqlparse.format(sq, keyword_case="upper", strip_comments=True).strip()
         if normalized in seen:
             duplicates.append(normalized)
         else:
@@ -874,9 +802,7 @@ async def plan_info_collect(query, postgres_config):
         """
         result = postgres_db.fetch_results(column_stats_sql)
         if result:
-            tablename, attname, null_frac, n_distinct, mc_vals, mc_freqs, histogram = (
-                result[0]
-            )
+            tablename, attname, null_frac, n_distinct, mc_vals, mc_freqs, histogram = result[0]
             column_stats_info[column] = {
                 "tablename": tablename,
                 "attname": attname,
@@ -972,13 +898,7 @@ async def rewrite_action_space(sql, postgres_config):
     classpath_file = os.path.join(query_rewrite_dir, "classpath.txt")
     with open(classpath_file, "r") as f:
         classpath = f.readline().strip().split(":")
-    classpath.extend(
-        [
-            os.path.join(local_lib_dir, jar)
-            for jar in os.listdir(local_lib_dir)
-            if jar.endswith(".jar")
-        ]
-    )
+    classpath.extend([os.path.join(local_lib_dir, jar) for jar in os.listdir(local_lib_dir) if jar.endswith(".jar")])
     if not jp.isJVMStarted():
         jp.startJVM("-Xss4M", jvmpath=jp.getDefaultJVMPath(), classpath=classpath)
 
@@ -1019,24 +939,10 @@ async def rewrite_action_space(sql, postgres_config):
             user,
             passwd,
         )
-    schema = root_schema.add(
-        dbname, JdbcSchema.create(root_schema, dbname, data_source, None, None)
-    )
-    parserConfig = (
-        SqlParser.configBuilder()
-        .setConformance(SqlConformanceEnum.BABEL)
-        .setParserFactory(SqlBabelParserImpl.FACTORY)
-        .setCaseSensitive(False)
-        .build()
-    )
+    schema = root_schema.add(dbname, JdbcSchema.create(root_schema, dbname, data_source, None, None))
+    parserConfig = SqlParser.configBuilder().setConformance(SqlConformanceEnum.BABEL).setParserFactory(SqlBabelParserImpl.FACTORY).setCaseSensitive(False).build()
     converterConfig = SqlToRelConverter.config().withExpand(True)
-    config = (
-        Frameworks.newConfigBuilder()
-        .defaultSchema(schema)
-        .parserConfig(parserConfig)
-        .sqlToRelConverterConfig(converterConfig)
-        .build()
-    )
+    config = Frameworks.newConfigBuilder().defaultSchema(schema).parserConfig(parserConfig).sqlToRelConverterConfig(converterConfig).build()
     planner = Frameworks.getPlanner(config)
     dialect = PostgresqlSqlDialect.DEFAULT
 
@@ -1177,9 +1083,7 @@ async def update_statistics(query):
     # execute ANALYZE for each table
     with engine.connect() as conn:
         DEAD_TUPLE_RATIO_THRESHOLD = 0.1  # dead tuple ratio >10% suggest VACUUM
-        MOD_SINCE_ANALYZE_THRESHOLD = (
-            1000  # modified rows since last ANALYZE >1000 suggest ANALYZE
-        )
+        MOD_SINCE_ANALYZE_THRESHOLD = 1000  # modified rows since last ANALYZE >1000 suggest ANALYZE
 
         for table in tables:
             # get the statistics from pg_stat_all_tables
@@ -1206,9 +1110,7 @@ async def update_statistics(query):
             if not stats:
                 continue
 
-            n_live, n_dead, n_mod, last_vac, last_auto_vac, last_an, last_auto_an = (
-                stats
-            )
+            n_live, n_dead, n_mod, last_vac, last_auto_vac, last_an, last_auto_an = stats
             dead_pct = (n_dead / (n_live + n_dead)) if (n_live + n_dead) > 0 else 0
 
             result["tables_checked"].append(
@@ -1226,10 +1128,7 @@ async def update_statistics(query):
             )
 
             # whether to VACUUM and ANALYZE
-            if (
-                dead_pct > DEAD_TUPLE_RATIO_THRESHOLD
-                and n_mod > MOD_SINCE_ANALYZE_THRESHOLD
-            ):
+            if dead_pct > DEAD_TUPLE_RATIO_THRESHOLD and n_mod > MOD_SINCE_ANALYZE_THRESHOLD:
                 result["vacuum_commands"].append(f"VACUUM ANALYZE {table};")
 
             # whether to VACUUM
@@ -1323,9 +1222,7 @@ async def join_order_optimization(query):
         join_analysis = []
         for join in join_conditions:
             # 提取连接列
-            join_cols = re.findall(
-                r"(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)", join["condition"]
-            )
+            join_cols = re.findall(r"(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)", join["condition"])
 
             for left_table, left_col, right_table, right_col in join_cols:
                 # 获取连接列的选择性
@@ -1375,35 +1272,24 @@ async def join_order_optimization(query):
             optimized_query = f"{select_clause}\nFROM {sorted_tables[0]['table']} t1\n"
 
             for i, join in enumerate(join_conditions):
-                optimized_query += (
-                    f"JOIN {join['table']} t{i+2} ON {join['condition']}\n"
-                )
+                optimized_query += f"JOIN {join['table']} t{i+2} ON {join['condition']}\n"
 
             if where_clause:
                 optimized_query += where_clause
 
             # 保留原查询的GROUP BY, ORDER BY, LIMIT等子句
-            remaining_clauses = re.search(
-                r"(?:GROUP|ORDER|LIMIT).+$", query, re.IGNORECASE
-            )
+            remaining_clauses = re.search(r"(?:GROUP|ORDER|LIMIT).+$", query, re.IGNORECASE)
             if remaining_clauses:
                 optimized_query += "\n" + remaining_clauses.group(0)
 
             result["optimized_query"] = clean_sql(optimized_query)
 
             # 估算成本降低
-            original_cost = conn.execute(
-                text(f"EXPLAIN (FORMAT JSON) {query}")
-            ).scalar()
-            optimized_cost = conn.execute(
-                text(f"EXPLAIN (FORMAT JSON) {result['optimized_query']}")
-            ).scalar()
+            original_cost = conn.execute(text(f"EXPLAIN (FORMAT JSON) {query}")).scalar()
+            optimized_cost = conn.execute(text(f"EXPLAIN (FORMAT JSON) {result['optimized_query']}")).scalar()
 
             if original_cost and optimized_cost:
-                cost_reduction = (
-                    (float(original_cost) - float(optimized_cost))
-                    / float(original_cost)
-                ) * 100
+                cost_reduction = ((float(original_cost) - float(optimized_cost)) / float(original_cost)) * 100
                 result["estimated_cost_reduction"] = f"{cost_reduction:.1f}%"
 
         # 5. 添加优化建议
@@ -1418,9 +1304,7 @@ async def join_order_optimization(query):
         # 检查连接列的选择性
         for analysis in join_analysis:
             if analysis["selectivity"] and analysis["selectivity"] < 0.1:
-                hints.append(
-                    f"表 {analysis['table']} 的连接列 {analysis['column']} 具有高选择性，适合早期过滤"
-                )
+                hints.append(f"表 {analysis['table']} 的连接列 {analysis['column']} 具有高选择性，适合早期过滤")
 
         result["optimization_hints"] = hints
 
@@ -1472,17 +1356,13 @@ async def optimize_index(query):
         join_columns = []
 
         # 提取WHERE子句中的列
-        where_match = re.search(
-            r"WHERE\s+(.+?)(?=(GROUP|ORDER|LIMIT|$))", query, re.IGNORECASE
-        )
+        where_match = re.search(r"WHERE\s+(.+?)(?=(GROUP|ORDER|LIMIT|$))", query, re.IGNORECASE)
         if where_match:
             where_conditions = where_match.group(1)
             where_columns = re.findall(r"(\w+)\s*[=<>]", where_conditions)
 
         # 提取JOIN条件中的列
-        join_match = re.search(
-            r"JOIN.+?ON\s+(.+?)(?=(WHERE|GROUP|ORDER|LIMIT|$))", query, re.IGNORECASE
-        )
+        join_match = re.search(r"JOIN.+?ON\s+(.+?)(?=(WHERE|GROUP|ORDER|LIMIT|$))", query, re.IGNORECASE)
         if join_match:
             join_conditions = join_match.group(1)
             join_columns = re.findall(r"(\w+)\s*=", join_conditions)
@@ -1496,9 +1376,7 @@ async def optimize_index(query):
                 index_name = f"idx_{table}_{col}"
                 create_stmt = f"CREATE INDEX {index_name} ON {table} ({col});"
                 result["create_index_statements"].append(create_stmt)
-                table_info["recommended_indexes"].append(
-                    {"name": index_name, "columns": [col]}
-                )
+                table_info["recommended_indexes"].append({"name": index_name, "columns": [col]})
 
         # 检查是否有可能需要删除的索引
         used_columns = set(needed_columns)
@@ -1539,9 +1417,7 @@ async def optimize_repeatedly_subqueries(query):
     for token in parsed.tokens:
         if isinstance(token, sqlparse.sql.Token) and token.ttype is None:
             # 提取所有子查询
-            matches = re.finditer(
-                r"\(SELECT[^()]*(?:\([^()]*\)[^()]*)*\)", str(token), re.IGNORECASE
-            )
+            matches = re.finditer(r"\(SELECT[^()]*(?:\([^()]*\)[^()]*)*\)", str(token), re.IGNORECASE)
             for match in matches:
                 subqueries.append(match.group())
 
@@ -1550,9 +1426,7 @@ async def optimize_repeatedly_subqueries(query):
     for sq in subqueries:
         subquery_count[sq] += 1
 
-    repeated_subqueries = {
-        sq: count for sq, count in subquery_count.items() if count > 1
-    }
+    repeated_subqueries = {sq: count for sq, count in subquery_count.items() if count > 1}
 
     if not repeated_subqueries:
         result["explanation"] = "未发现重复执行的子查询"
@@ -1570,13 +1444,9 @@ async def optimize_repeatedly_subqueries(query):
         if "WHERE" in optimized_query:
             try:
                 # 提取子查询的选择列
-                subquery_cols = re.search(
-                    r"SELECT\s+(.*?)\s+FROM", subquery, re.IGNORECASE
-                ).group(1)
+                subquery_cols = re.search(r"SELECT\s+(.*?)\s+FROM", subquery, re.IGNORECASE).group(1)
                 # 提取子查询的表名
-                subquery_table = re.search(
-                    r"FROM\s+(.*?)(?:\s+WHERE|\s*$)", subquery, re.IGNORECASE
-                ).group(1)
+                subquery_table = re.search(r"FROM\s+(.*?)(?:\s+WHERE|\s*$)", subquery, re.IGNORECASE).group(1)
 
                 # 构建JOIN查询
                 join_condition = re.search(
@@ -1597,9 +1467,7 @@ async def optimize_repeatedly_subqueries(query):
         optimized_query = new_query
 
     result["optimized_query"] = clean_sql(optimized_query)
-    result["explanation"] = (
-        f"发现{len(repeated_subqueries)}个重复执行的子查询，已使用CTE优化。"
-    )
+    result["explanation"] = f"发现{len(repeated_subqueries)}个重复执行的子查询，已使用CTE优化。"
 
     return result
 
@@ -1716,9 +1584,7 @@ async def rewrite_query(query):
     cleaned_query = clean_sql(query)
     parsed = sqlparse.parse(cleaned_query)[0]
     query_info = {
-        "has_select_star": bool(
-            re.search(r"SELECT\s+\*", cleaned_query, re.IGNORECASE)
-        ),
+        "has_select_star": bool(re.search(r"SELECT\s+\*", cleaned_query, re.IGNORECASE)),
         "has_order_by": bool(re.search(r"ORDER\s+BY", cleaned_query, re.IGNORECASE)),
         "has_limit": bool(re.search(r"LIMIT", cleaned_query, re.IGNORECASE)),
         "has_subquery": bool(re.search(r"\(SELECT", cleaned_query, re.IGNORECASE)),
@@ -1743,9 +1609,7 @@ async def rewrite_query(query):
                 flags=re.IGNORECASE,
             )
         triggered_rules.append("避免使用SELECT *，建议显式指定列名")
-        rewrite_rules.append(
-            {"rule": "no_select_star", "desc": "避免SELECT *，提升查询效率和可维护性"}
-        )
+        rewrite_rules.append({"rule": "no_select_star", "desc": "避免SELECT *，提升查询效率和可维护性"})
 
     # 规则2：ORDER BY无LIMIT时建议加LIMIT防止全表排序
     if query_info["has_order_by"] and not query_info["has_limit"]:
@@ -1761,24 +1625,18 @@ async def rewrite_query(query):
     # 规则3：子查询可尝试用JOIN重写（这里只做标记，实际需复杂分析）
     if query_info["has_subquery"]:
         triggered_rules.append("存在子查询，部分场景可尝试用JOIN重写提升性能")
-        rewrite_rules.append(
-            {"rule": "subquery_to_join", "desc": "子查询可尝试用JOIN重写，提升性能"}
-        )
+        rewrite_rules.append({"rule": "subquery_to_join", "desc": "子查询可尝试用JOIN重写，提升性能"})
         # 不自动改写，仅给出建议
 
     # 规则4：GROUP BY无索引建议加索引（这里只做标记）
     if query_info["has_group_by"]:
         triggered_rules.append("GROUP BY字段建议加索引")
-        rewrite_rules.append(
-            {"rule": "group_by_index", "desc": "GROUP BY字段建议加索引，提升分组效率"}
-        )
+        rewrite_rules.append({"rule": "group_by_index", "desc": "GROUP BY字段建议加索引，提升分组效率"})
 
     # 规则5：DISTINCT建议评估是否必要
     if query_info["has_distinct"]:
         triggered_rules.append("DISTINCT操作建议评估是否必要，避免不必要的去重开销")
-        rewrite_rules.append(
-            {"rule": "distinct_check", "desc": "DISTINCT建议评估是否必要，避免性能损耗"}
-        )
+        rewrite_rules.append({"rule": "distinct_check", "desc": "DISTINCT建议评估是否必要，避免性能损耗"})
 
     # 3. 返回结果
     return {

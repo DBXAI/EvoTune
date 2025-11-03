@@ -116,12 +116,8 @@ class ResourceMonitor:
                 self.mem_virtual_usage_seq.append(0.0)
             else:
                 try:
-                    mem_physical = self.process.memory_info()[0] / (
-                        1024.0 * 1024.0 * 1024.0
-                    )
-                    mem_virtual = self.process.memory_info()[1] / (
-                        1024.0 * 1024.0 * 1024.0
-                    )
+                    mem_physical = self.process.memory_info()[0] / (1024.0 * 1024.0 * 1024.0)
+                    mem_virtual = self.process.memory_info()[1] / (1024.0 * 1024.0 * 1024.0)
                     self.mem_physical_usage_seq.append(mem_physical)
                     self.mem_virtual_usage_seq.append(mem_virtual)
                 except (
@@ -189,12 +185,8 @@ class ResourceMonitor:
                 net1 = psutil.net_io_counters()
                 time.sleep(self.interval)
                 net2 = psutil.net_io_counters()
-                self.net_recv_seq.append(
-                    (net2.bytes_recv - net1.bytes_recv) / (1024.0 * 1024.0)
-                )
-                self.net_sent_seq.append(
-                    (net2.bytes_sent - net1.bytes_sent) / (1024.0 * 1024.0)
-                )
+                self.net_recv_seq.append((net2.bytes_recv - net1.bytes_recv) / (1024.0 * 1024.0))
+                self.net_sent_seq.append((net2.bytes_sent - net1.bytes_sent) / (1024.0 * 1024.0))
             except (
                 psutil.NoSuchProcess,
                 psutil.AccessDenied,

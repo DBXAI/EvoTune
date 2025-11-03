@@ -56,21 +56,11 @@ from agent.simple_db_agent import SimpleDBAgent
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Simplified Database Query Optimization Tool"
-    )
-    parser.add_argument(
-        "--data_path", type=str, required=True, help="Path to slow query data files"
-    )
-    parser.add_argument(
-        "--order", type=str, required=True, help="Query execution order file"
-    )
-    parser.add_argument(
-        "--duration", type=int, default=1, help="Optimization duration in hours"
-    )
-    parser.add_argument(
-        "--config", type=str, required=True, help="Configuration file path"
-    )
+    parser = argparse.ArgumentParser(description="Simplified Database Query Optimization Tool")
+    parser.add_argument("--data_path", type=str, required=True, help="Path to slow query data files")
+    parser.add_argument("--order", type=str, required=True, help="Query execution order file")
+    parser.add_argument("--duration", type=int, default=1, help="Optimization duration in hours")
+    parser.add_argument("--config", type=str, required=True, help="Configuration file path")
     parser.add_argument(
         "--no_improvement_threshold",
         type=int,

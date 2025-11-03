@@ -77,6 +77,10 @@ class MemoryManager:
         # 假设有15种root cause，支持多根因组合
         self.island_keys = self._generate_island_keys(self.root_cause_types)
         self.islands = {key: set() for key in self.island_keys}
+        
+        # 为 "normal" 根因也创建 island
+        normal_island_key = self._normalize_root_causes(["normal"])
+        self.islands[normal_island_key] = set()
 
         self._rcrank_predictor = predictor
 
@@ -145,22 +149,16 @@ class MemoryManager:
         # use the hybrid loss (BCE + supervised contrastive learning) to finetune the RCRank model
         os.makedirs(output_dir, exist_ok=True)
 
-        train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(
-            csv_path, batch_size=batch_size, device=device
-        )
+        train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(csv_path, batch_size=batch_size, device=device)
 
         if not hasattr(self, "_rcrank_predictor") or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
 
-            self._rcrank_predictor = RCRankPredictor(
-                device=device, train_data_path=csv_path
-            )
+            self._rcrank_predictor = RCRankPredictor(device=device, train_data_path=csv_path)
         predictor = self._rcrank_predictor
         model = predictor.model.to(device)
         model.train()
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=1e-4
-        )  # 重要参数 尝试 1e-4 或 3e-4
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)  # 重要参数 尝试 1e-4 或 3e-4
         temperature = 0.07
 
         # BCE loss function
@@ -182,9 +180,7 @@ class MemoryManager:
             logits = torch.div(torch.matmul(emb, emb.T), temperature)  # [B, B]
 
             # 掩码：排除自身
-            self_mask = torch.eye(
-                logits.size(0), dtype=torch.bool, device=logits.device
-            )
+            self_mask = torch.eye(logits.size(0), dtype=torch.bool, device=logits.device)
 
             # 构建正负样本掩码
             batch_size = emb.size(0)
@@ -197,34 +193,18 @@ class MemoryManager:
                         continue
 
                     # 正样本：两个都是positive cases且共享根因
-                    if (
-                        case_labels[i] == "positive"
-                        and case_labels[j] == "positive"
-                        and (labels[i] @ labels[j]) > 0
-                    ):
+                    if case_labels[i] == "positive" and case_labels[j] == "positive" and (labels[i] @ labels[j]) > 0:
                         pos_mask[i, j] = True
 
                     # 负样本：一个是positive一个是negative，或者都是negative
-                    elif (
-                        (case_labels[i] == "positive" and case_labels[j] == "negative")
-                        or (
-                            case_labels[i] == "negative"
-                            and case_labels[j] == "positive"
-                        )
-                        or (
-                            case_labels[i] == "negative"
-                            and case_labels[j] == "negative"
-                        )
-                    ):
+                    elif (case_labels[i] == "positive" and case_labels[j] == "negative") or (case_labels[i] == "negative" and case_labels[j] == "positive") or (case_labels[i] == "negative" and case_labels[j] == "negative"):
                         neg_mask[i, j] = True
 
             # 分母掩码：排除自身
             logits_mask = ~self_mask
 
             # 稳定化
-            logits_max, _ = torch.max(
-                logits.masked_fill(~logits_mask, float("-inf")), dim=1, keepdim=True
-            )
+            logits_max, _ = torch.max(logits.masked_fill(~logits_mask, float("-inf")), dim=1, keepdim=True)
             logits = logits - logits_max.detach()
             exp_logits = torch.exp(logits) * logits_mask.float()
 
@@ -235,9 +215,7 @@ class MemoryManager:
                 if pos_mask[i].any():
                     pos_logits = logits[i][pos_mask[i]]
                     pos_exp_logits = exp_logits[i][pos_mask[i]]
-                    pos_loss += -torch.log(
-                        pos_exp_logits.sum() / exp_logits[i].sum() + 1e-12
-                    )
+                    pos_loss += -torch.log(pos_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
                     pos_count += 1
 
             # 计算负样本损失（推远错误根因）
@@ -248,9 +226,7 @@ class MemoryManager:
                     neg_logits = logits[i][neg_mask[i]]
                     neg_exp_logits = exp_logits[i][neg_mask[i]]
                     # 负样本损失：希望负样本的相似度尽可能小
-                    neg_loss += torch.log(
-                        neg_exp_logits.sum() / exp_logits[i].sum() + 1e-12
-                    )
+                    neg_loss += torch.log(neg_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
                     neg_count += 1
 
             # 组合损失
@@ -260,11 +236,7 @@ class MemoryManager:
             if neg_count > 0:
                 total_loss += neg_loss / neg_count
 
-            return (
-                total_loss
-                if total_loss > 0
-                else torch.tensor(0.0, device=emb.device, requires_grad=True)
-            )
+            return total_loss if total_loss > 0 else torch.tensor(0.0, device=emb.device, requires_grad=True)
 
         def hybrid_loss(
             emb,
@@ -279,9 +251,7 @@ class MemoryManager:
             混合损失：L_total = λ₁ * L_BCE + λ₂ * L_Enhanced_Contrastive
             """
             # 1. BCE分类损失（只对positive cases计算，negative cases标签是错误的）
-            positive_mask = torch.tensor(
-                [label == "positive" for label in case_labels], device=pred_label.device
-            )
+            positive_mask = torch.tensor([label == "positive" for label in case_labels], device=pred_label.device)
             if positive_mask.any():
                 # 只对positive cases计算BCE损失
                 positive_pred = pred_label[positive_mask]
@@ -289,14 +259,10 @@ class MemoryManager:
                 bce_loss = bce_loss_fn(positive_pred, positive_labels)
             else:
                 # 如果没有positive cases，BCE损失为0
-                bce_loss = torch.tensor(
-                    0.0, device=pred_label.device, requires_grad=True
-                )
+                bce_loss = torch.tensor(0.0, device=pred_label.device, requires_grad=True)
 
             # 2. 增强监督对比学习损失（拉近正确根因，推远错误根因）
-            contrastive_loss = enhanced_supcon_loss(
-                emb, labels, case_labels, temperature
-            )
+            contrastive_loss = enhanced_supcon_loss(emb, labels, case_labels, temperature)
 
             # 3. 加权组合
             total_loss = bce_weight * bce_loss + contrastive_weight * contrastive_loss
@@ -367,14 +333,9 @@ class MemoryManager:
             # 记录训练日志
             avg_total_loss = epoch_total_loss / max(1, len(train_dataloader))
             avg_bce_loss = epoch_bce_loss / max(1, len(train_dataloader))
-            avg_contrastive_loss = epoch_contrastive_loss / max(
-                1, len(train_dataloader)
-            )
+            avg_contrastive_loss = epoch_contrastive_loss / max(1, len(train_dataloader))
 
-            print(
-                f"Hybrid finetune epoch {epoch_idx}: total_loss={avg_total_loss:.6f}, "
-                f"bce_loss={avg_bce_loss:.6f}, contrastive_loss={avg_contrastive_loss:.6f}"
-            )
+            print(f"Hybrid finetune epoch {epoch_idx}: total_loss={avg_total_loss:.6f}, " f"bce_loss={avg_bce_loss:.6f}, contrastive_loss={avg_contrastive_loss:.6f}")
 
         # 4) 保存权重
         best_path = os.path.join(output_dir, "best_model.pt")
@@ -385,9 +346,7 @@ class MemoryManager:
         if not hasattr(self, "_rcrank_predictor") or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
 
-            self._rcrank_predictor = RCRankPredictor(
-                model_path=model_path, train_data_path=stats_data_path, device=device
-            )
+            self._rcrank_predictor = RCRankPredictor(model_path=model_path, train_data_path=stats_data_path, device=device)
             return
 
         predictor = self._rcrank_predictor
@@ -434,12 +393,7 @@ class MemoryManager:
     def _generate_island_keys(self, root_cause_types):
         keys = []
         for i in range(1, len(root_cause_types) + 1):
-            keys.extend(
-                [
-                    frozenset(pair)
-                    for pair in itertools.combinations(root_cause_types, i)
-                ]
-            )
+            keys.extend([frozenset(pair) for pair in itertools.combinations(root_cause_types, i)])
         return keys
 
     def add_case(self, case):
@@ -528,14 +482,8 @@ class MemoryManager:
                         island_key = self._normalize_root_causes(root_causes)
                         self.islands[island_key].add(cid)
 
-                positive_cases = [
-                    c
-                    for c in self.cases.values()
-                    if c.case_info.get("label") == "positive"
-                ]
-                positive_cases.sort(
-                    key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True
-                )
+                positive_cases = [c for c in self.cases.values() if c.case_info.get("label") == "positive"]
+                positive_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
                 self.archive = set([c.id for c in positive_cases[: self.archive_size]])
             self._last_finetune_count = len(self.cases)
             # self._last_finetune_count = 0
@@ -568,9 +516,7 @@ class MemoryManager:
         return "-".join(str(c) for c in coords)
 
     def _is_better(self, case1, case2):
-        return case1.metrics.get("approve_time", 0.0) > case2.metrics.get(
-            "approve_time", 0.0
-        )
+        return case1.metrics.get("approve_time", 0.0) > case2.metrics.get("approve_time", 0.0)
 
     # select the best case by approve_time
     def best_by_approve(self, cases):
@@ -578,8 +524,7 @@ class MemoryManager:
             return None
         return max(
             cases,
-            key=lambda c: c.case_info.get("approve_time")
-            or c.metrics.get("approve_time", 0.0),
+            key=lambda c: c.case_info.get("approve_time") or c.metrics.get("approve_time", 0.0),
         )
 
     def _update_archive(self, case):
@@ -591,9 +536,7 @@ class MemoryManager:
             self.archive.add(case.id)
             return
         archive_cases = [self.cases[aid] for aid in self.archive]
-        worst_case = min(
-            archive_cases, key=lambda c: c.metrics.get("approve_time", 0.0)
-        )
+        worst_case = min(archive_cases, key=lambda c: c.metrics.get("approve_time", 0.0))
         if self._is_better(case, worst_case):
             self.archive.remove(worst_case.id)
             self.archive.add(case.id)
@@ -603,20 +546,14 @@ class MemoryManager:
         if case.case_info.get("label") != "positive":
             return
 
-        if self.best_case_id is None or self._is_better(
-            case, self.cases[self.best_case_id]
-        ):
+        if self.best_case_id is None or self._is_better(case, self.cases[self.best_case_id]):
             self.best_case_id = case.id
 
     def _enforce_archive_limit(self):
         if len(self.archive) > self.archive_size:
             # sort by approve_time
-            archive_cases = [
-                self.cases[case_id] for case_id in self.archive if case_id in self.cases
-            ]
-            sorted_archive_cases = sorted(
-                archive_cases, key=lambda c: c.metrics.get("approve_time")
-            )
+            archive_cases = [self.cases[case_id] for case_id in self.archive if case_id in self.cases]
+            sorted_archive_cases = sorted(archive_cases, key=lambda c: c.metrics.get("approve_time"))
 
             # remove the worst cases
             to_remove_count = len(self.archive) - self.archive_size
@@ -631,17 +568,11 @@ class MemoryManager:
         统一的案例检索接口，根据配置的 retrieval_mode 选择使用静态或动态检索
         """
         if self.retrieval_mode == "static":
-            return self.retrieve_static_cases(
-                query_info, root_causes, pos_n, neg_n, mode
-            )
+            return self.retrieve_static_cases(query_info, root_causes, pos_n, neg_n, mode)
         else:
-            return self.retrieve_dynamic_cases(
-                query_info, root_causes, pos_n, neg_n, mode
-            )
+            return self.retrieve_dynamic_cases(query_info, root_causes, pos_n, neg_n, mode)
 
-    def retrieve_dynamic_cases(
-        self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"
-    ):
+    def retrieve_dynamic_cases(self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"):
         # 获取所有候选案例
         all_cases = list(self.cases.values())
         if not all_cases:
@@ -668,9 +599,7 @@ class MemoryManager:
             return {"mode": mode, "positive": [], "negative": []}
 
         # 使用Soft Q Learning检索器选择案例
-        selected_cases = self.retriever.select_cases(
-            query_info.__dict__, candidate_cases, root_causes, top_k=pos_n + neg_n
-        )
+        selected_cases = self.retriever.select_cases(query_info.__dict__, candidate_cases, root_causes, top_k=pos_n + neg_n)
 
         # 按标签分类
         positive_cases = []
@@ -692,9 +621,7 @@ class MemoryManager:
             "negative": negative_cases,
         }
 
-    def retrieve_static_cases(
-        self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"
-    ):
+    def retrieve_static_cases(self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"):
         """
         使用传统的 islands 构造样本池并按标签输出：
         - exploitation pool: 目标根因对应的岛
@@ -752,8 +679,7 @@ class MemoryManager:
         remaining_pos = [c for c in (pos_same + pos_diff) if c not in selected_pos]
         remaining_pos_sorted = sorted(
             remaining_pos,
-            key=lambda c: c.case_info.get("approve_time")
-            or c.metrics.get("approve_time", 0.0),
+            key=lambda c: c.case_info.get("approve_time") or c.metrics.get("approve_time", 0.0),
             reverse=True,
         )
         selected_pos.extend(remaining_pos_sorted)
@@ -787,9 +713,7 @@ class MemoryManager:
                 continue
             case_emb = np.array(case.sql_embedding)
             if metric == "cosine":
-                sim = np.dot(query_emb, case_emb) / (
-                    norm(query_emb) * norm(case_emb) + 1e-8
-                )
+                sim = np.dot(query_emb, case_emb) / (norm(query_emb) * norm(case_emb) + 1e-8)
             elif metric == "euclidean":
                 sim = -norm(query_emb - case_emb)
             else:
@@ -818,24 +742,12 @@ class MemoryManager:
         query = query_info.query
         query_plan = query_info.plan_json
 
-        df = pd.DataFrame(
-            [
-                {
-                    "plan_json": (
-                        json.dumps({"Plan": query_plan})
-                        if isinstance(query_plan, dict)
-                        else query_plan
-                    )
-                }
-            ]
-        )
+        df = pd.DataFrame([{"plan_json": (json.dumps({"Plan": query_plan}) if isinstance(query_plan, dict) else query_plan)}])
         plan_encoder = PlanEncoder(df=df, encoding=encoding)
         encoded_df = plan_encoder.df
         plan_tensor = encoded_df["json_plan_tensor"].iloc[0]
 
-        sql = predictor.tokenizer(
-            query, return_tensors="pt", padding=True, truncation=True, max_length=512
-        ).to(predictor.device)
+        sql = predictor.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512).to(predictor.device)
 
         plan = {
             "x": plan_tensor["x"].to(predictor.device).to(torch.float32),
@@ -847,9 +759,7 @@ class MemoryManager:
         timeseries = torch.tensor(query_info.external_metrics)
         if len(timeseries.shape) == 2:
             timeseries = timeseries.unsqueeze(0)
-        timeseries = (timeseries - predictor.timeseries_train_mean.unsqueeze(1)) / (
-            predictor.timeseries_train_std.unsqueeze(1) + 1e-6
-        )
+        timeseries = (timeseries - predictor.timeseries_train_mean.unsqueeze(1)) / (predictor.timeseries_train_std.unsqueeze(1) + 1e-6)
         timeseries = timeseries.to(predictor.device)
 
         log = torch.tensor(query_info.internal_metrics)
@@ -873,9 +783,7 @@ class MemoryManager:
         tokenizer = self._bert_tokenizer
         model = self._bert_model
 
-        inputs = tokenizer(
-            action, return_tensors="pt", padding=True, truncation=True, max_length=128
-        )
+        inputs = tokenizer(action, return_tensors="pt", padding=True, truncation=True, max_length=128)
         with torch.no_grad():
             outputs = model(**inputs)
             cls_emb = outputs.last_hidden_state[:, 0, :]  # [CLS] vector, 768维
@@ -912,9 +820,7 @@ class MemoryManager:
         declared = self._normalize_root_causes(case.case_info.get("root_causes"))
         raw_info = case.case_info.get("query_info")
         query_info = QueryInfo(**raw_info)
-        inferred = self._infer_root_causes_from_action(
-            case.case_info.get("fix_action"), query_info
-        )
+        inferred = self._infer_root_causes_from_action(case.case_info.get("fix_action"), query_info)
 
         if inferred and (inferred != declared):
             case.case_info["root_causes"] = list(inferred)
@@ -922,7 +828,6 @@ class MemoryManager:
         key = self._normalize_root_causes(case.case_info.get("root_causes"))
         if key not in self.islands:
             self.islands[key] = set()
-            self.island_generations[key] = 0
 
     def explore_root_from_archive(self, query_info, exclude_roots):
         """
@@ -939,14 +844,10 @@ class MemoryManager:
         if not archive_cases:
             return None
 
-        similar_cases = self.retrieve_embedding(
-            query_info, top_n=len(archive_cases), case_ids=list(self.archive)
-        )
+        similar_cases = self.retrieve_embedding(query_info, top_n=len(archive_cases), case_ids=list(self.archive))
 
         for case in similar_cases:
-            case_root_str = str(
-                self._normalize_root_causes(case.case_info.get("root_causes"))
-            )
+            case_root_str = str(self._normalize_root_causes(case.case_info.get("root_causes")))
             if case_root_str not in exclude_roots:
                 return case.case_info.get("root_causes")
 

@@ -5,18 +5,8 @@ import smithery
 from mcp.client.websocket import websocket_client
 
 # Create Smithery URLs for both servers
-think_url = (
-    smithery.create_smithery_url(
-        "wss://server.smithery.ai/@PhillipRt/think-mcp-server/ws", {}
-    )
-    + "&api_key=839b4262-5b2a-4226-a967-37d2c7fa8213"
-)
-postgresql_url = (
-    smithery.create_smithery_url(
-        "wss://server.smithery.ai/@HenkDz/postgresql-mcp-server/ws", {}
-    )
-    + "&api_key=your-smithery-api-key"
-)
+think_url = smithery.create_smithery_url("wss://server.smithery.ai/@PhillipRt/think-mcp-server/ws", {}) + "&api_key=839b4262-5b2a-4226-a967-37d2c7fa8213"
+postgresql_url = smithery.create_smithery_url("wss://server.smithery.ai/@HenkDz/postgresql-mcp-server/ws", {}) + "&api_key=your-smithery-api-key"
 
 
 async def test_server(url, server_name):
@@ -33,12 +23,8 @@ async def test_server(url, server_name):
                 print("\nInput Schema:")
                 print(f"  Required parameters: {tool.inputSchema.get('required', [])}")
                 print("  Properties:")
-                for prop_name, prop_info in tool.inputSchema.get(
-                    "properties", {}
-                ).items():
-                    print(
-                        f"    - {prop_name}: {prop_info.get('type')} ({prop_info.get('description')})"
-                    )
+                for prop_name, prop_info in tool.inputSchema.get("properties", {}).items():
+                    print(f"    - {prop_name}: {prop_info.get('type')} ({prop_info.get('description')})")
 
 
 async def main():

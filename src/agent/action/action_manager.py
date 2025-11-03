@@ -49,14 +49,10 @@ class ServerConfig:
 
     @classmethod
     def from_dict(cls, config):
-        server_type = (
-            MCPServerStdio if config["server_type"] == "stdio" else MCPServerSse
-        )
+        server_type = MCPServerStdio if config["server_type"] == "stdio" else MCPServerSse
         if "cwd" in config["params"] and config["params"]["cwd"] == ".":
             config["params"]["cwd"] = os.path.dirname(os.path.abspath(__file__))
-        return cls(
-            name=config["name"], server_type=server_type, params=config["params"]
-        )
+        return cls(name=config["name"], server_type=server_type, params=config["params"])
 
 
 class MultiServerManager:
@@ -68,9 +64,7 @@ class MultiServerManager:
     async def manage_servers(self):
         try:
             for config in self.configs:
-                server = await config.server_type(
-                    name=config.name, params=config.params
-                ).__aenter__()
+                server = await config.server_type(name=config.name, params=config.params).__aenter__()
                 self.servers[config.name] = server
             yield list(self.servers.values())
         except Exception as e:
@@ -149,15 +143,10 @@ class ActionManager:
         with open(self.config_path, "r", encoding="utf-8") as f:
             config_data = yaml.safe_load(f)
 
-        configs = [
-            ServerConfig.from_dict(service_config)
-            for service_config in config_data["services"]
-        ]
+        configs = [ServerConfig.from_dict(service_config) for service_config in config_data["services"]]
         self.server_manager = MultiServerManager(configs)
 
-        self._servers = await self.exit_stack.enter_async_context(
-            self.server_manager.manage_servers()
-        )
+        self._servers = await self.exit_stack.enter_async_context(self.server_manager.manage_servers())
 
         self.agent = Agent(
             name="DBDiagnosticAgent",
@@ -188,24 +177,18 @@ class ActionManager:
         postgres_config = self.configs.get("POSTGRES_CONFIG")
         base_info = diagnose_tools.base_information_collect(query_info, postgres_config)
 
-        retrieval = self.memory_manager.retrieve_cases(
-            query_info, root_cause, mode=mode
-        )
+        retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
         positives = retrieval.get("positive", [])
         negatives = retrieval.get("negative", [])
         action_space = await self.action_space_collect(root_cause, query_info)
 
-        action_result = await self.action_generate(
-            root_cause, base_info, action_space, mode, positives, negatives
-        )
+        action_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
 
         # 提取fix action和rewrite sql
         fix_action, rewrite_sql = self.extract_fix_action(action_result)
 
         # 进行action验证
-        evaluation_result = await self.evaluate_action(
-            fix_action, rewrite_sql, query_info
-        )
+        evaluation_result = await self.evaluate_action(fix_action, rewrite_sql, query_info)
 
         reward = evaluation_result.get("status", 0)
         case = positives + negatives
@@ -213,25 +196,19 @@ class ActionManager:
         # 保存经验（与检索模式无关，仅根据enable_save_samples判断）
         if self.memory_manager.enable_save_samples and case:
             for case_info in case:
-                self.memory_manager.save_experience(
-                    query_info.__dict__, case_info, reward
-                )
-            
+                self.memory_manager.save_experience(query_info.__dict__, case_info, reward)
+
         # 只在动态检索模式下更新经验池和网络
         if self.memory_manager.retrieval_mode == "dynamic" and case:
             for case_info in case:
-                self.memory_manager.retriever.add_experience(
-                    query_info.__dict__, case_info, reward
-                )
+                self.memory_manager.retriever.add_experience(query_info.__dict__, case_info, reward)
             self.memory_manager.retriever.update_network()
 
         return evaluation_result
 
     @staticmethod
     def extract_index_names(sql):
-        return re.findall(
-            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE
-        )
+        return re.findall(r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w_]+)", sql, re.IGNORECASE)
 
     @staticmethod
     def extract_knob_names(sql):
@@ -269,9 +246,9 @@ class ActionManager:
         3. 检测修复操作是否带来性能提升
         """
         # 在执行前对 fix_action / rewrite_sql 进行预处理，得到最终 fix_action 与初始 fix_sql
-        fix_action, fix_sql = await self.derive_fix_action_and_sql(
-            fix_action, rewrite_sql, query_info.query
-        )
+        fix_action, fix_sql = await self.derive_fix_action_and_sql(fix_action, rewrite_sql, query_info.query)
+
+        print(f"execute fix_action")
 
         # 1. 检查修复SQL能否执行（如有 DDL/SET 等修复，需先执行）
         if fix_action != "":
@@ -279,6 +256,8 @@ class ActionManager:
         else:
             success = True
             err = ""
+        print(f"execute fix_action done")
+
         retry_count = 0
         max_retry = 5
         while not success and retry_count < max_retry:
@@ -286,12 +265,8 @@ class ActionManager:
             result = await Runner.run(starting_agent=self.fixAgent, input=prompt)
             new_fix_action = result.final_output
             print(f"new_fix_action: {new_fix_action}")
-            new_fix_action, new_fix_sql = await self.derive_fix_action_and_sql(
-                new_fix_action, rewrite_sql, query_info.query
-            )
-            success, _, _, err = self.db.execute(
-                new_fix_action, timeout=self.fix_timeout
-            )
+            new_fix_action, new_fix_sql = await self.derive_fix_action_and_sql(new_fix_action, rewrite_sql, query_info.query)
+            success, _, _, err = self.db.execute(new_fix_action, timeout=self.fix_timeout)
             fix_action = new_fix_action
             fix_sql = new_fix_sql
             retry_count += 1
@@ -306,8 +281,10 @@ class ActionManager:
 
         old_time = query_info.execution_time
 
+        print(f"execute performance test")
         # 执行性能测试
         success, _, new_time, err = self.db.execute(fix_sql, timeout=self.sql_timeout)
+        print(f"execute performance test done")
 
         if fix_action != "":
             index_names = self.extract_index_names(fix_action)
@@ -315,11 +292,7 @@ class ActionManager:
             self.rollback_action(index_names, knob_names)
 
         if not success:
-            if (
-                err
-                and isinstance(err, str)
-                and ("timeout" in err.lower() or "querycanceled" in err)
-            ):
+            if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):
                 return {
                     "status": 0,
                     "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s",
@@ -359,9 +332,7 @@ class ActionManager:
         if match:
             hint = match.group(0).strip()
             # remove the hint from fix_action
-            clean_fix_action = (
-                fix_action[: match.start()] + fix_action[match.end() :]
-            ).strip()
+            clean_fix_action = (fix_action[: match.start()] + fix_action[match.end() :]).strip()
             if rewrite_sql != "":
                 rewrite_sql = await self.check_sql_rewrite(origin_sql, rewrite_sql)
                 target_sql = rewrite_sql
@@ -417,7 +388,7 @@ class ActionManager:
         return result
 
     async def check_sql_rewrite(self, origin_sql, rewrite_sql):
-
+        print(f"start QED check")
         qed_match = self.db.check_sql_equivalence(origin_sql, rewrite_sql)
         print(f"QED equivalence check: {qed_match}")
 
@@ -452,9 +423,7 @@ class ActionManager:
         knob_config = self.configs.get("KNOB_CONFIG")
         current_knob_values = self.db.get_current_knob_values(knob_config)
 
-        base_action_space = build_action_space_prompt(
-            root_causes, self.db, knob_config, current_knob_values, query_info
-        )
+        base_action_space = build_action_space_prompt(root_causes, self.db, knob_config, current_knob_values, query_info)
 
         # Action Pruning: 基于历史同根因案例避免无效操作
         pruning_guidance = self.action_pruning(root_causes, query_info)
@@ -463,9 +432,7 @@ class ActionManager:
         refinement_guidance = self.action_refinement(root_causes, query_info)
 
         # 整合pruning和refinement指导到action space
-        enhanced_action_space = self._integrate_pruning_and_refinement(
-            base_action_space, pruning_guidance, refinement_guidance
-        )
+        enhanced_action_space = self._integrate_pruning_and_refinement(base_action_space, pruning_guidance, refinement_guidance)
 
         return enhanced_action_space
 
@@ -477,14 +444,10 @@ class ActionManager:
             return ""
 
         pruning_guidance = []
-        pruning_guidance.append(
-            "• Action Pruning: Based on historical failure cases with the same root cause, the following discrete operations have been proven ineffective, please avoid using them:"
-        )
+        pruning_guidance.append("• Action Pruning: Based on historical failure cases with the same root cause, the following discrete operations have been proven ineffective, please avoid using them:")
 
         if has_index_root:
-            failed_index_actions = self._get_failed_index_actions(
-                root_causes, query_info
-            )
+            failed_index_actions = self._get_failed_index_actions(root_causes, query_info)
             if failed_index_actions:
                 pruning_guidance.append("The ineffective indexes:")
                 for index_name in sorted(failed_index_actions):
@@ -539,9 +502,7 @@ class ActionManager:
         return failed_index_actions
 
     def _get_applicable_rewrite_rules(self, query_info):
-        target_root = self.memory_manager._normalize_root_causes(
-            ["poorly written queries"]
-        )
+        target_root = self.memory_manager._normalize_root_causes(["poorly written queries"])
         target_island_ids = list(self.memory_manager.islands.get(target_root, set()))
 
         if not target_island_ids:
@@ -561,7 +522,7 @@ class ActionManager:
         failed_rules = set()
         # 使用当前查询作为原始查询（同SQL案例的原始查询应该是相同的）
         original_query = query_info.query
-        
+
         for case in same_sql_cases:
             case_label = case.case_info.get("label")
             if case_label == "negative":
@@ -574,9 +535,7 @@ class ActionManager:
 
                 applicable_rules = rule_matcher.match_rules(original_query)
                 for rule in applicable_rules:
-                    if rule_matcher._rule_used_in_rewrite(
-                        rule, original_query, rewritten_query
-                    ):
+                    if rule_matcher._rule_used_in_rewrite(rule, original_query, rewritten_query):
                         failed_rules.add(rule["name"])
 
         failed_rule_info = []
@@ -598,9 +557,7 @@ class ActionManager:
             return ""
 
         refinement_guidance = []
-        refinement_guidance.append(
-            "• Action Refinement: Based on historical success cases with the same root cause, the following continuous operations have been proven effective, suggest prioritizing exploration:"
-        )
+        refinement_guidance.append("• Action Refinement: Based on historical success cases with the same root cause, the following continuous operations have been proven effective, suggest prioritizing exploration:")
 
         if has_knob_root:
             knob_guidance = self._get_knob_refinement_guidance(root_causes, query_info)
@@ -628,9 +585,7 @@ class ActionManager:
         # 过滤出同根因的相似案例
         similar_same_root_cases = []
         for case in similar_cases:
-            case_root = self.memory_manager._normalize_root_causes(
-                case.case_info.get("root_causes")
-            )
+            case_root = self.memory_manager._normalize_root_causes(case.case_info.get("root_causes"))
             if case_root == target_root:
                 similar_same_root_cases.append(case)
 
@@ -654,9 +609,7 @@ class ActionManager:
             return ""
 
         guidance = []
-        guidance.append(
-            "\n• Knob Tuning Space Refinement: Based on historical successful cases, the following knob value ranges are recommended for exploration:"
-        )
+        guidance.append("\n• Knob Tuning Space Refinement: Based on historical successful cases, the following knob value ranges are recommended for exploration:")
 
         for knob_name in knob_data.keys():
             values = knob_data[knob_name]["values"]
@@ -668,9 +621,7 @@ class ActionManager:
             min_value = min(values)
             max_value = max(values)
 
-            guidance.append(
-                f"- Knob '{knob_name}': Recommended range [{min_value}, {max_value}],  Based on {len(values)} successful historical cases"
-            )
+            guidance.append(f"- Knob '{knob_name}': Recommended range [{min_value}, {max_value}],  Based on {len(values)} successful historical cases")
 
         if len(guidance) <= 1:  # 只有标题，没有具体建议
             return ""
@@ -708,15 +659,11 @@ class ActionManager:
                 positive_hints.append((hint_key, hint_stats))
 
         if positive_hints:
-            guidance.append(
-                "\n• Query Hint Refinement: Based on historical hint usage data, the following hints have shown positive performance impact:"
-            )
+            guidance.append("\n• Query Hint Refinement: Based on historical hint usage data, the following hints have shown positive performance impact:")
             positive_hints.sort(key=lambda x: x[1]["avg_improvement"], reverse=True)
 
             for hint_key, hint_stats in positive_hints:
-                guidance.append(
-                    f"- Hint '{hint_key}': Average improvement {hint_stats['avg_improvement']:.1f}%"
-                )
+                guidance.append(f"- Hint '{hint_key}': Average improvement {hint_stats['avg_improvement']:.1f}%")
 
         return "\n".join(guidance)
 
@@ -771,9 +718,7 @@ class ActionManager:
 
                 hint_data[hint_key]["improvements"].append(performance_improvement)
                 hint_data[hint_key]["usage_count"] += 1
-                hint_data[hint_key]["avg_improvement"] = sum(
-                    hint_data[hint_key]["improvements"]
-                ) / len(hint_data[hint_key]["improvements"])
+                hint_data[hint_key]["avg_improvement"] = sum(hint_data[hint_key]["improvements"]) / len(hint_data[hint_key]["improvements"])
 
         return hint_data
 
@@ -814,9 +759,7 @@ class ActionManager:
 
         return hints
 
-    def _integrate_pruning_and_refinement(
-        self, base_action_space, pruning_guidance, refinement_guidance
-    ):
+    def _integrate_pruning_and_refinement(self, base_action_space, pruning_guidance, refinement_guidance):
         """
         将pruning和refinement指导整合到action space中
         """
@@ -868,14 +811,10 @@ class ActionManager:
         except:
             return "insufficient data", None
 
-    async def action_generate(
-        self, root_cause, base_info, action_space, mode, positives, negatives
-    ):
-        prompt = build_action_prompt(
-            root_cause, base_info, action_space, mode, positives, negatives
-        )
-        print(f"prompt: {prompt}")
-        print(f"prompt已生成")
+    async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
+        prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)
+        # print(f"prompt: {prompt}")
+        # print(f"prompt已生成")
         result = await Runner.run(starting_agent=self.agent, input=prompt)
         return result.final_output
 
@@ -894,21 +833,15 @@ class ActionManager:
 
     def parse_action_result(self, diagnosis):
         # extract Explanation
-        explanation_match = re.search(
-            r"Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)", diagnosis, re.IGNORECASE
-        )
+        explanation_match = re.search(r"Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)", diagnosis, re.IGNORECASE)
         explanation = explanation_match.group(1).strip() if explanation_match else ""
 
         # extract FIX_ACTION
-        fix_match = re.search(
-            r"Fix_Action:\s*([\s\S]+?)Query_Rewrite:", diagnosis, re.IGNORECASE
-        )
+        fix_match = re.search(r"Fix_Action:\s*([\s\S]+?)Query_Rewrite:", diagnosis, re.IGNORECASE)
         fix_action = fix_match.group(1).strip() if fix_match else ""
 
         # extract Query_Rewrite
-        is_rewrite_match = re.search(
-            r"Query_Rewrite:\s*(yes|no)", diagnosis, re.IGNORECASE
-        )
+        is_rewrite_match = re.search(r"Query_Rewrite:\s*(yes|no)", diagnosis, re.IGNORECASE)
         is_rewrite = is_rewrite_match.group(1).strip() if is_rewrite_match else ""
 
         return explanation, fix_action, is_rewrite
@@ -919,13 +852,7 @@ class ActionManager:
 
         for idx, line in enumerate(lines):
             l = line.lstrip().upper()
-            if (
-                l.startswith("WITH")
-                or l.startswith("SELECT")
-                or l.startswith("INSERT")
-                or l.startswith("UPDATE")
-                or l.startswith("DELETE")
-            ):
+            if l.startswith("WITH") or l.startswith("SELECT") or l.startswith("INSERT") or l.startswith("UPDATE") or l.startswith("DELETE"):
                 sql_start = idx
                 break
 

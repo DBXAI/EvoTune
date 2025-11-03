@@ -5,7 +5,7 @@
     "password": "postgres",
     "host": "localhost",
     "port": 5432,
-    "dbname": "tpch10G",
+    "dbname": "tpcds50G",
     "workload_type": "OLAP",
     "postgres_path": "/usr/lib/postgresql/14/bin",
     "postgres_data": "/usr/lib/postgresql/14/data",
@@ -69,7 +69,7 @@
     "openai": {
       "api_key": "",
       "base_url": "",
-      "model": "gpt-4o-mini"
+      "model": "gpt-4.1"
     },
     "anthropic": {
       "api_key": "",
@@ -92,7 +92,7 @@
     "num_classes": 4
   },
   "MEMORY_MANAGER_CONFIG": {
-    "db_path": "/root/DREAM/src/memory_results",
+    "db_path": "/root/DREAM/src/memory_results_tpcds",
     "archive_size": 20,
     "finetune_threshold": 220,
     "finetune_epochs": 50,
@@ -118,3 +118,4 @@
     "action_server_config": "/root/DREAM/src/agent/action/action_server_config.yaml"
   }
 }
+
