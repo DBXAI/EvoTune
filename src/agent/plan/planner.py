@@ -7,7 +7,6 @@ rcrank_path = os.path.join(current_dir, "RCRank")
 if rcrank_path not in sys.path:
     sys.path.append(rcrank_path)
 
-
 import json
 
 import numpy as np
