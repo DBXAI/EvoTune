@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import logging
 import os
 import random
@@ -242,6 +243,10 @@ class DBAgent:
                     result = self.db.run_sql_and_collect_all(collected_sql)
                 except Exception as e:
                     logger.error(f"SQL {query_id} 执行SQL收集数据时发生异常: {e}", exc_info=True)
+                    database_config = self.configs.get("DATABASE_CONFIG", {})
+                    timeout_time = database_config.get("query_timeout")
+                    round_sql_times[query_id] = timeout_time
+                    round_sql_actions[query_id] = ""
                     logger.info(f"SQL {query_id} 跳过当前SQL，继续处理下一条")
                     continue
 
@@ -283,10 +288,15 @@ class DBAgent:
 
                 # 预测根因
                 logger.info(f"SQL {query_id} 开始预测根因")
+                # 保存 state 的备份，以便异常时恢复
+                state_backup = copy.deepcopy(state)
                 try:
                     predicted_root, state = self.planner.predict(query_info, state, self.memory_manager)
                 except Exception as e:
                     logger.error(f"SQL {query_id} 预测根因时发生异常: {e}", exc_info=True)
+                    sql_root_cause_states[query_id] = state_backup
+                    round_sql_times[query_id] = query_info.execution_time
+                    round_sql_actions[query_id] = ""
                     logger.info(f"SQL {query_id} 跳过当前SQL，继续处理下一条")
                     continue
 
@@ -329,6 +339,10 @@ class DBAgent:
                     evaluation_result = await self.action_manager.step(query_info, root_causes, mode=state["mode"])
                 except Exception as e:
                     logger.error(f"SQL {query_id} 执行step时发生异常: {e}", exc_info=True)
+                    new_time = query_info.execution_time
+                    round_sql_times[query_id] = new_time
+                    round_sql_actions[query_id] = ""
+                    sql_root_cause_states[query_id] = state
                     logger.info(f"SQL {query_id} 跳过当前SQL，继续处理下一条")
                     continue
 
