@@ -405,7 +405,7 @@ def clean_sql(sql):
     return sql
 
 
-def extract_tables(parsed, postgres_config):
+def extract_tables(parsed, database_config):
     tables = set()
 
     def _extract(token_list):
@@ -438,22 +438,22 @@ def extract_tables(parsed, postgres_config):
     _extract(parsed)
 
     postgres_db = PostgresDB(
-        user=postgres_config["user"],
-        password=postgres_config["password"],
-        host=postgres_config["host"],
-        port=postgres_config["port"],
-        dbname=postgres_config["dbname"],
-        workload_type=postgres_config["workload_type"],
-        postgres_path=postgres_config["postgres_path"],
-        postgres_data=postgres_config["postgres_data"],
-        log_path=postgres_config["log_path"],
+        user=database_config["user"],
+        password=database_config["password"],
+        host=database_config["host"],
+        port=database_config["port"],
+        dbname=database_config["dbname"],
+        workload_type=database_config["workload_type"],
+        postgres_path=database_config["postgres_path"],
+        postgres_data=database_config["postgres_data"],
+        log_path=database_config["log_path"],
     )
     existing_tables = postgres_db.get_tables()
 
     return [t for t in tables if t in existing_tables]
 
 
-def extract_columns(parsed, postgres_config):
+def extract_columns(parsed, database_config):
     columns = set()
 
     def _extract_columns(token_list):
@@ -503,23 +503,23 @@ def extract_columns(parsed, postgres_config):
 
     # 连接数据库以检查列是否存在
     postgres_db = PostgresDB(
-        user=postgres_config["user"],
-        password=postgres_config["password"],
-        host=postgres_config["host"],
-        port=postgres_config["port"],
-        dbname=postgres_config["dbname"],
-        workload_type=postgres_config["workload_type"],
-        postgres_path=postgres_config["postgres_path"],
-        postgres_data=postgres_config["postgres_data"],
-        log_path=postgres_config["log_path"],
+        user=database_config["user"],
+        password=database_config["password"],
+        host=database_config["host"],
+        port=database_config["port"],
+        dbname=database_config["dbname"],
+        workload_type=database_config["workload_type"],
+        postgres_path=database_config["postgres_path"],
+        postgres_data=database_config["postgres_data"],
+        log_path=database_config["log_path"],
     )
     existing_columns = postgres_db.get_columns()
 
     return [t for t in columns if t in existing_columns and t != "*"]
 
 
-def base_information_collect(query_info, postgres_config):
-    postgres_db = PostgresDB(postgres_config)
+def base_information_collect(query_info, database_config):
+    postgres_db = PostgresDB(database_config)
 
     db_info = {
         "db_type": postgres_db.db_type,
@@ -622,33 +622,33 @@ def find_duplicate_subqueries(sql):
     return duplicates
 
 
-def find_related_views(sql, postgres_config):
+def find_related_views(sql, database_config):
     from src.database.pg_env import PostgresDB
 
     postgres_db = PostgresDB(
-        user=postgres_config["user"],
-        password=postgres_config["password"],
-        host=postgres_config["host"],
-        port=postgres_config["port"],
-        dbname=postgres_config["dbname"],
-        workload_type=postgres_config["workload_type"],
-        postgres_path=postgres_config["postgres_path"],
-        postgres_data=postgres_config["postgres_data"],
-        log_path=postgres_config["log_path"],
+        user=database_config["user"],
+        password=database_config["password"],
+        host=database_config["host"],
+        port=database_config["port"],
+        dbname=database_config["dbname"],
+        workload_type=database_config["workload_type"],
+        postgres_path=database_config["postgres_path"],
+        postgres_data=database_config["postgres_data"],
+        log_path=database_config["log_path"],
     )
 
     views = postgres_db.get_views()
 
     parsed = sqlparse.parse(sql)[0]
-    target_tables = extract_tables(parsed)
-    target_columns = extract_columns(parsed)
+    target_tables = extract_tables(parsed, database_config)
+    target_columns = extract_columns(parsed, database_config)
 
     related_views = []
 
     for viewname, definition in views:
         definition_parsed = sqlparse.parse(definition)[0]
-        view_tables = extract_tables(definition_parsed)
-        view_columns = extract_columns(definition_parsed)
+        view_tables = extract_tables(definition_parsed, database_config)
+        view_columns = extract_columns(definition_parsed, database_config)
         if any(tbl in view_tables for tbl in target_tables):
             if any(col in view_columns for col in target_columns):
                 definition = clean_sql(definition)
@@ -659,17 +659,17 @@ def find_related_views(sql, postgres_config):
 
 # info collect
 @mcp.tool()
-async def indexes_info_collect(postgres_config):
+async def indexes_info_collect(database_config):
     postgres_db = PostgresDB(
-        user=postgres_config["user"],
-        password=postgres_config["password"],
-        host=postgres_config["host"],
-        port=postgres_config["port"],
-        dbname=postgres_config["dbname"],
-        workload_type=postgres_config["workload_type"],
-        postgres_path=postgres_config["postgres_path"],
-        postgres_data=postgres_config["postgres_data"],
-        log_path=postgres_config["log_path"],
+        user=database_config["user"],
+        password=database_config["password"],
+        host=database_config["host"],
+        port=database_config["port"],
+        dbname=database_config["dbname"],
+        workload_type=database_config["workload_type"],
+        postgres_path=database_config["postgres_path"],
+        postgres_data=database_config["postgres_data"],
+        log_path=database_config["log_path"],
     )
 
     sql = "SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY tablename, indexname;"
@@ -680,7 +680,7 @@ async def indexes_info_collect(postgres_config):
 
 
 @mcp.tool()
-async def query_info_collect(query, postgres_config):
+async def query_info_collect(query, database_config):
     token_list = sqlparse.parse(query)[0]
     query_info = {}
 
@@ -693,15 +693,15 @@ async def query_info_collect(query, postgres_config):
     duplicate_subqueries = find_duplicate_subqueries(query)
     query_info["duplicate_subqueries"] = duplicate_subqueries
 
-    related_views = find_related_views(query, postgres_config)
+    related_views = find_related_views(query, database_config)
     query_info["related_views"] = related_views
 
     return query_info
 
 
 @mcp.tool()
-async def system_knobs_info_collect(postgres_config, knob_config):
-    postgres_db = PostgresDB(postgres_config)
+async def system_knobs_info_collect(database_config, knob_config):
+    postgres_db = PostgresDB(database_config)
 
     system_knobs_info = {}
 
@@ -713,8 +713,8 @@ async def system_knobs_info_collect(postgres_config, knob_config):
 
 
 @mcp.tool()
-async def query_knobs_info_collect(postgres_config, knob_config):
-    postgres_db = PostgresDB(postgres_config)
+async def query_knobs_info_collect(database_config, knob_config):
+    postgres_db = PostgresDB(database_config)
 
     query_knobs_info = {}
 
@@ -726,21 +726,21 @@ async def query_knobs_info_collect(postgres_config, knob_config):
 
 
 @mcp.tool()
-async def plan_info_collect(query, postgres_config):
+async def plan_info_collect(query, database_config):
     postgres_db = PostgresDB(
-        user=postgres_config["user"],
-        password=postgres_config["password"],
-        host=postgres_config["host"],
-        port=postgres_config["port"],
-        dbname=postgres_config["dbname"],
-        workload_type=postgres_config["workload_type"],
-        postgres_path=postgres_config["postgres_path"],
-        postgres_data=postgres_config["postgres_data"],
-        log_path=postgres_config["log_path"],
+        user=database_config["user"],
+        password=database_config["password"],
+        host=database_config["host"],
+        port=database_config["port"],
+        dbname=database_config["dbname"],
+        workload_type=database_config["workload_type"],
+        postgres_path=database_config["postgres_path"],
+        postgres_data=database_config["postgres_data"],
+        log_path=database_config["log_path"],
     )
 
     parsed = sqlparse.parse(query)[0]
-    target_tables = extract_tables(parsed, postgres_config)
+    target_tables = extract_tables(parsed, database_config)
 
     # 获取上次analyze更新的时间
     time_since_last_analyze = {}
@@ -784,7 +784,7 @@ async def plan_info_collect(query, postgres_config):
 
     # 获得相关列的统计信息
     column_stats_info = {}
-    target_columns = extract_columns(parsed, postgres_config)
+    target_columns = extract_columns(parsed, database_config)
     for column in target_columns:
         column_stats_sql = f"""
             SELECT
@@ -839,11 +839,11 @@ async def indexes_action_space(query):
 
 
 @mcp.tool()
-async def system_knobs_action_space(postgres_config, knob_config):
+async def system_knobs_action_space(database_config, knob_config):
 
     # 这里还可以缩小到一个只调整和query相关的knobs的空间
 
-    postgres_db = PostgresDB(postgres_config)
+    postgres_db = PostgresDB(database_config)
 
     knob_info = {}
 
@@ -877,7 +877,7 @@ async def system_knobs_action_space(postgres_config, knob_config):
 
 
 @mcp.tool()
-async def rewrite_action_space(sql, postgres_config):
+async def rewrite_action_space(sql, database_config):
     """
     读取user_selected_rules.txt，判断哪些规则可以应用于当前SQL，返回可用规则名列表。
     sql: 需要分析的SQL语句
@@ -918,12 +918,12 @@ async def rewrite_action_space(sql, postgres_config):
     calcite_conn = conn.unwrap(CalciteConnection)
     root_schema = calcite_conn.getRootSchema()
 
-    dbtype = postgres_config["db_type"]
-    dbname = postgres_config["dbname"]
-    user = postgres_config["user"]
-    passwd = postgres_config["password"]
-    host = postgres_config["host"]
-    port = postgres_config["port"]
+    dbtype = database_config["db_type"]
+    dbname = database_config["dbname"]
+    user = database_config["user"]
+    passwd = database_config["password"]
+    host = database_config["host"]
+    port = database_config["port"]
 
     if dbtype == "mysql":
         data_source = JdbcSchema.dataSource(
@@ -981,9 +981,9 @@ async def rewrite_action_space(sql, postgres_config):
 
 
 @mcp.tool()
-async def query_knobs_action_space(postgres_config, knob_config):
+async def query_knobs_action_space(database_config, knob_config):
 
-    postgres_db = PostgresDB(postgres_config)
+    postgres_db = PostgresDB(database_config)
 
     knob_info = {}
 

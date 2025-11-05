@@ -24,6 +24,9 @@ src/agent/ablation_db_agent.py
 ablation.md
 src/agent/memory/experience/**
 src/agent/memory/model/**
+config/job_config.json
+config/tpch_config.json
+config/tpcds_config.json
 # test_sql_gen/data/hint/**
 # test_sql_gen/data/hint_normal/**
 # test_sql_gen/data/hint+index/**

@@ -100,7 +100,9 @@ class ActionManager:
 
         self.fix_model = self.agent_config.get("fix_agent_model")
         self.diagnostic_model = self.agent_config.get("diagnostic_agent_model")
-        self.sql_timeout = self.agent_config.get("sql_execution_timeout")
+        # Get sql_timeout from DATABASE_CONFIG.query_timeout, fallback to AGENT_CONFIG.sql_execution_timeout
+        database_config = configs.get("DATABASE_CONFIG", {})
+        self.sql_timeout = database_config.get("query_timeout")
         self.config_path = self.agent_config.get("action_server_config")
         self.fix_timeout = self.agent_config.get("fix_timeout")
 
@@ -174,8 +176,8 @@ class ActionManager:
         # 4. action_generate
         # 5. evaluate_action
 
-        postgres_config = self.configs.get("POSTGRES_CONFIG")
-        base_info = diagnose_tools.base_information_collect(query_info, postgres_config)
+        database_config = self.configs.get("DATABASE_CONFIG")
+        base_info = diagnose_tools.base_information_collect(query_info, database_config)
 
         retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
         positives = retrieval.get("positive", [])
@@ -276,7 +278,7 @@ class ActionManager:
                 "msg": f"SQL修复失败: {fix_action}, 错误: {err}",
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
-                "new_time": 20,
+                "new_time": self.sql_timeout,
             }
 
         old_time = query_info.execution_time
@@ -305,7 +307,7 @@ class ActionManager:
                 "msg": f"性能测试SQL执行失败: {err}",
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
-                "new_time": 20,
+                "new_time": self.sql_timeout,
             }
 
         # 4. 性能对比与后续处理

@@ -111,7 +111,8 @@ async def main():
 
         logger.info("Simplified database optimization completed!")
 
-
+# cd /root/DREAM/src
+# python simple.py --data_path /root/DREAM/data/slow_queries/TPC-H --order qorder.txt --duration 30 --config /root/DREAM/config/tpch_config.json
 if __name__ == "__main__":
     try:
         asyncio.run(main())

@@ -37,7 +37,7 @@ class DBAgent:
 
         db_type = configs.get("DATABASE_TYPE", "postgres")
         if db_type.lower() == "postgres":
-            db_config = configs.get("POSTGRES_CONFIG")
+            db_config = configs.get("DATABASE_CONFIG")
             self.db = PostgresDB(db_config)
             logger.info("使用PostgreSQL数据库")
         elif db_type.lower() == "tidb":
@@ -359,7 +359,8 @@ class DBAgent:
                 if evaluation_result.get("status") == -1:
                     print(evaluation_result.get("msg"))
                     logger.info(f"SQL {query_id} 修复失败，执行下一条SQL语句")
-                    new_time = self.agent_config.get("sql_execution_timeout")
+                    database_config = self.configs.get("DATABASE_CONFIG", {})
+                    new_time = database_config.get("query_timeout") or old_time
                     # 保存案例并获取修正后的根因
                     case_id = self.memory_manager.save_case(
                         query_info,

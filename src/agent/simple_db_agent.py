@@ -37,7 +37,7 @@ class SimpleDBAgent:
 
         db_type = configs.get("DATABASE_TYPE", "postgres")
         if db_type.lower() == "postgres":
-            db_config = configs.get("POSTGRES_CONFIG")
+            db_config = configs.get("DATABASE_CONFIG")
             self.db = PostgresDB(db_config)
             logger.info("Using PostgreSQL database")
         elif db_type.lower() == "tidb":
@@ -169,8 +169,8 @@ class SimpleDBAgent:
     async def simple_diagnosis(self, query_info):
         """Simple LLM-based diagnosis without root cause prediction"""
         # Collect base information
-        postgres_config = self.configs.get("POSTGRES_CONFIG")
-        base_info = diagnose_tools.base_information_collect(query_info, postgres_config)
+        database_config = self.configs.get("DATABASE_CONFIG")
+        base_info = diagnose_tools.base_information_collect(query_info, database_config)
 
         # Build simple diagnosis prompt
         prompt = build_simple_diagnosis_prompt(query_info, base_info)
@@ -293,10 +293,12 @@ class SimpleDBAgent:
                 if evaluation_result.get("status") == -1:
                     print(evaluation_result.get("msg"))
                     logger.info(f"SQL {query_id} fix failed, moving to next SQL")
-                    new_time = self.agent_config.get("sql_execution_timeout")
+                    # Get timeout from DATABASE_CONFIG or use old_time as fallback
+                    database_config = self.configs.get("DATABASE_CONFIG", {})
+                    new_time = database_config.get("query_timeout") or old_time
                 elif evaluation_result.get("status") == 1:
                     logger.info(f"SQL {query_id} fix successful")
-                    new_time = evaluation_result.get("new_time")
+                    new_time = evaluation_result.get("new_time", old_time)
                 else:
                     logger.info(f"SQL {query_id} fix ineffective, recording negative case")
                     new_time = evaluation_result.get("new_time", old_time)
