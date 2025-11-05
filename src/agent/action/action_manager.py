@@ -221,7 +221,7 @@ class ActionManager:
         for index_name in index_names:
             try:
                 with self.db.connection.cursor() as cur:
-                    cur.execute(f"SET statement_timeout = 0")
+                    cur.execute("SET statement_timeout = 0")
                     cur.execute(f"DROP INDEX IF EXISTS {index_name}")
                 self.db.connection.commit()
                 print(f"已撤销索引: {index_name}")
@@ -233,7 +233,7 @@ class ActionManager:
         for knob_name in knob_names:
             try:
                 with self.db.connection.cursor() as cur:
-                    cur.execute(f"SET statement_timeout = 0")
+                    cur.execute("SET statement_timeout = 0")
                     cur.execute(f"RESET {knob_name};")
                 self.db.connection.commit()
                 print(f"{knob_name} 已恢复默认值")
@@ -250,7 +250,7 @@ class ActionManager:
         # 在执行前对 fix_action / rewrite_sql 进行预处理，得到最终 fix_action 与初始 fix_sql
         fix_action, fix_sql = await self.derive_fix_action_and_sql(fix_action, rewrite_sql, query_info.query)
 
-        print(f"execute fix_action")
+        print("execute fix_action")
 
         # 1. 检查修复SQL能否执行（如有 DDL/SET 等修复，需先执行）
         if fix_action != "":
@@ -258,7 +258,7 @@ class ActionManager:
         else:
             success = True
             err = ""
-        print(f"execute fix_action done")
+        print("execute fix_action done")
 
         retry_count = 0
         max_retry = 5
@@ -283,10 +283,10 @@ class ActionManager:
 
         old_time = query_info.execution_time
 
-        print(f"execute performance test")
+        print("execute performance test")
         # 执行性能测试
         success, _, new_time, err = self.db.execute(fix_sql, timeout=self.sql_timeout)
-        print(f"execute performance test done")
+        print("execute performance test done")
 
         if fix_action != "":
             index_names = self.extract_index_names(fix_action)
@@ -390,7 +390,7 @@ class ActionManager:
         return result
 
     async def check_sql_rewrite(self, origin_sql, rewrite_sql):
-        print(f"start QED check")
+        print("start QED check")
         qed_match = self.db.check_sql_equivalence(origin_sql, rewrite_sql)
         print(f"QED equivalence check: {qed_match}")
 
@@ -458,7 +458,7 @@ class ActionManager:
         if has_query_root:
             applicable_rules = self._get_applicable_rewrite_rules(query_info)
             if applicable_rules:
-                pruning_guidance.append(f"The ineffective query rewrite rules:")
+                pruning_guidance.append("The ineffective query rewrite rules:")
                 for rule in applicable_rules:
                     pruning_guidance.append(f"{rule}")
 
@@ -816,7 +816,7 @@ class ActionManager:
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)
         # print(f"prompt: {prompt}")
-        # print(f"prompt已生成")
+        # print("prompt已生成")
         result = await Runner.run(starting_agent=self.agent, input=prompt)
         return result.final_output
 

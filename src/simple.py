@@ -79,7 +79,7 @@ async def main():
     logger = logging.getLogger(__name__)
 
     args = parse_args()
-    logger.info(f"Starting Simplified Database Optimization System")
+    logger.info("Starting Simplified Database Optimization System")
     logger.info(f"Data path: {args.data_path}")
     logger.info(f"Execution order: {args.order}")
     logger.info(f"Optimization duration: {args.duration} hours")

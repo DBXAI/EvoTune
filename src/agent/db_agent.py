@@ -221,7 +221,7 @@ class DBAgent:
                 original_sql = query
                 collected_sql = best_sql_texts.get(query_id, original_sql)
 
-                logger.info(f"读取慢SQL完成")
+                logger.info("读取慢SQL完成")
 
                 # 仅当存在历史最佳DDL/SET修复动作时，先应用动作后收集一次；否则直接收集一次
                 pre_index_names = []
@@ -238,7 +238,7 @@ class DBAgent:
                         logger.info(f"提取DDL/SET修复动作中的参数名称完成")
                         pre_applied = True
 
-                logger.info(f"开始执行SQL收集数据")
+                logger.info("开始执行SQL收集数据")
 
                 try:
                     result = self.db.run_sql_and_collect_all(collected_sql)
@@ -247,7 +247,7 @@ class DBAgent:
                     logger.info(f"SQL {query_id} 跳过当前SQL，继续处理下一条")
                     continue
 
-                logger.info(f"SQL收集数据完成")
+                logger.info("SQL收集数据完成")
 
                 # 构建 QueryInfo；若 collected_sql 与 original_sql 不同，视为 rewrite
                 query_info = QueryInfo(
@@ -260,7 +260,7 @@ class DBAgent:
                     is_rewrite=(collected_sql != original_sql),
                 )
 
-                logger.info(f"构建QueryInfo完成")
+                logger.info("构建QueryInfo完成")
 
                 # 若首次遇到该 SQL，先用本轮默认执行结果初始化“最佳”记录
                 if query_id not in best_sql_times:
@@ -268,7 +268,7 @@ class DBAgent:
                     best_sql_actions[query_id] = ""
                     best_sql_texts[query_id] = collected_sql
 
-                logger.info(f"初始化状态完成")
+                logger.info("初始化状态完成")
 
                 # 初始化状态
                 if query_id not in sql_root_cause_states:
@@ -460,10 +460,10 @@ class DBAgent:
         # 输出最终结果
         final_time = time.time()
         total_elapsed = final_time - start_time
-        logger.info(f"=== 优化完成 ===")
+        logger.info("=== 优化完成 ===")
         logger.info(f"总用时: {total_elapsed:.2f}s（超时限制: {duration}s）")
         logger.info(f"完成轮数: {round_idx} 轮")
         logger.info(f"各SQL最优执行时间: {best_sql_times}")
         logger.info(f"workload最优总执行时间: {sum(best_sql_times.values()):.4f}s")
         logger.info(f"各SQL最优修复actions: {best_sql_actions}")
-        logger.info(f"诊断流程结束")
+        logger.info("诊断流程结束")

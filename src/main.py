@@ -68,7 +68,7 @@ async def main():
     logger = logging.getLogger(__name__)
 
     args = parse_args()
-    logger.info(f"启动DREAM数据库诊断系统")
+    logger.info("启动DREAM数据库诊断系统")
     logger.info(f"数据路径: {args.data_path}")
     logger.info(f"执行顺序: {args.order}")
     logger.info(f"调优时间: {args.duration} 小时")

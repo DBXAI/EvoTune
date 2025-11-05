@@ -334,10 +334,10 @@ class SimpleDBAgent:
         # Output final results
         final_time = time.time()
         total_elapsed = final_time - start_time
-        logger.info(f"=== Optimization Complete ===")
+        logger.info("=== Optimization Complete ===")
         logger.info(f"Total time: {total_elapsed:.2f}s (timeout limit: {duration}s)")
         logger.info(f"Completed rounds: {round_idx}")
         logger.info(f"Best SQL execution times: {best_sql_times}")
         logger.info(f"Workload best total execution time: {sum(best_sql_times.values()):.4f}s")
         logger.info(f"Best SQL fix actions: {best_sql_actions}")
-        logger.info(f"Diagnosis process ended")
+        logger.info("Diagnosis process ended")
