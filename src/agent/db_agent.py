@@ -392,9 +392,9 @@ class DBAgent:
                     case = self.memory_manager.get_case(case_id)
                     root_causes = case.case_info.get("root_causes")
 
-                    # 成功：将该根因尝试计数清零并累计成功次数
+                    # 成功：累计成功次数
                     key = self.memory_manager._normalize_root_causes(root_causes)
-                    state["attempts"][key] = 0
+                    state["attempts"][key] = state["attempts"].get(key, 0) + 1
                     state["successes"][key] = state["successes"].get(key, 0) + 1
                     # 成功后置空 current_root，下次允许小模型重新诊断（刷新根因）
                     state["current_root"] = None
