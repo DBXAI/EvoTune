@@ -1,4 +1,6 @@
 import logging
+import os
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 import asyncio
@@ -22,7 +24,9 @@ ROOT_CAUSES = [
     "poorly written queries",
 ]
 
-INPUT_CSV = "/root/DREAM/test_sql_gen/tpch_detailed1.csv"  # 输入文件名
+# 使用相对路径，基于项目根目录
+project_root = Path(__file__).parent.parent
+INPUT_CSV = str(project_root / "test_sql_gen" / "tpch_detailed1.csv")  # 输入文件名
 OUTPUT_CSV = "slow_sql_labeled.csv"  # 输出文件名
 
 

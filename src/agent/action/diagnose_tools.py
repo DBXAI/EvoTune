@@ -35,7 +35,9 @@ mcp = FastMCP("db_diagnosis")
 
 class SQLRuleMatcher:
     def __init__(self):
-        self.rules_file = "/root/DREAM/src/agent/action/calcite_rewrite_rules_abbreviated.jsonl"
+        # 使用相对路径，基于当前模块所在目录
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.rules_file = os.path.join(current_dir, "calcite_rewrite_rules_abbreviated.jsonl")
         self.rules = self._load_rules()
 
     def _load_rules(self):
@@ -883,16 +885,17 @@ async def rewrite_action_space(sql, database_config):
     """
     import os
 
-    base_dir = os.path.abspath(os.curdir)
-    rules_path = os.path.join(base_dir, "user_selected_rules.txt")
+    # 使用相对路径，基于当前模块所在目录
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    rules_path = os.path.join(current_dir, "user_selected_rules.txt")
     if not os.path.exists(rules_path):
         return f"规则文件不存在，请检查路径：{rules_path}"
     with open(rules_path, "r") as f:
         rulelist = [line.strip() for line in f if line.strip()]
 
     # 启动JVM（如果未启动）
-    query_rewrite_dir = os.path.join(base_dir, "agent/action")  # 修改
-    local_lib_dir = os.path.join(base_dir, "agent/action/libs")  # 修改
+    query_rewrite_dir = current_dir  # 使用当前模块所在目录
+    local_lib_dir = os.path.join(query_rewrite_dir, "libs")
     classpath_file = os.path.join(query_rewrite_dir, "classpath.txt")
     with open(classpath_file, "r") as f:
         classpath = f.readline().strip().split(":")
