@@ -45,8 +45,8 @@ class DBAgent:
             self.db = TiDB(db_config)
             logger.info("使用TiDB数据库")
 
-        rcrank_config = configs.get("RCRANK_PREDICTOR_CONFIG")
-        predictor = RCRankPredictor(rcrank_config)
+        planner_config = configs.get("PLANNER_CONFIG")
+        predictor = RCRankPredictor(planner_config)
 
         memory_config = configs.get("MEMORY_MANAGER_CONFIG")
         self.memory_manager = MemoryManager(memory_config, predictor=predictor)
@@ -420,9 +420,8 @@ class DBAgent:
                     state["attempts"][key] = state["attempts"].get(key, 0) + 1
 
                 # 依据无效尝试计数达到阈值时，标记该根因为已尝试并置空 current_root
-                key = self.memory_manager._normalize_root_causes(root_causes)
                 if state.get("attempts", {}).get(key, 0) >= no_improvement_threshold:
-                    state["root_tried"].add(self.memory_manager._normalize_root_causes(root_causes))
+                    state["root_tried"].add(key)
 
                 # 仅在修复成功且更优时更新“最佳”记录
                 if new_time < best_sql_times[query_id]:

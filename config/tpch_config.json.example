@@ -84,13 +84,6 @@
     "opt_threshold": 0.5,
     "num_classes": 4
   },
-  "RCRANK_PREDICTOR_CONFIG": {
-    "model_path": "/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
-    "train_data_path": "/root/DREAM/src/agent/plan/slow_sql_data_gen.csv",
-    "device": "cpu",
-    "opt_threshold": 0.5,
-    "num_classes": 4
-  },
   "MEMORY_MANAGER_CONFIG": {
     "db_path": "/root/DREAM/src/memory_results_tpch",
     "archive_size": 20,

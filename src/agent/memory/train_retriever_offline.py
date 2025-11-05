@@ -76,10 +76,10 @@ def train_retriever_from_samples(
         return
 
     # Initialize MemoryManager and Retriever
-    rcrank_config = memory_manager_config.get("RCRANK_PREDICTOR_CONFIG", {})
-    if not rcrank_config:
-        rcrank_config = {"device": "cpu"}
-    predictor = RCRankPredictor(rcrank_config)
+    planner_config = memory_manager_config.get("PLANNER_CONFIG", {})
+    if not planner_config:
+        planner_config = {"device": "cpu"}
+    predictor = RCRankPredictor(planner_config)
     memory_manager = MemoryManager(memory_manager_config, predictor=predictor)
     retriever = memory_manager.retriever
 
@@ -200,13 +200,13 @@ def main():
 
     memory_manager_config = configs.get("MEMORY_MANAGER_CONFIG")
 
-    # If RCRANK_PREDICTOR_CONFIG is not in configs, add default configuration
-    if "RCRANK_PREDICTOR_CONFIG" not in configs:
-        configs["RCRANK_PREDICTOR_CONFIG"] = {"device": "cpu"}
+    # If PLANNER_CONFIG is not in configs, add default configuration
+    if "PLANNER_CONFIG" not in configs:
+        configs["PLANNER_CONFIG"] = {"device": "cpu"}
 
-    # Add RCRANK_PREDICTOR_CONFIG to memory_manager_config if needed
-    if "RCRANK_PREDICTOR_CONFIG" not in memory_manager_config:
-        memory_manager_config["RCRANK_PREDICTOR_CONFIG"] = configs["RCRANK_PREDICTOR_CONFIG"]
+    # Add PLANNER_CONFIG to memory_manager_config if needed
+    if "PLANNER_CONFIG" not in memory_manager_config:
+        memory_manager_config["PLANNER_CONFIG"] = configs["PLANNER_CONFIG"]
 
     # Start training
     train_retriever_from_samples(
