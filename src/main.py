@@ -9,6 +9,8 @@ from datetime import datetime
 # add project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent.db_agent import DBAgent
+
 
 # setup logging, output to console and file
 def setup_logging():
@@ -45,8 +47,6 @@ def setup_logging():
 
 
 setup_logging()
-
-from agent.db_agent import DBAgent
 
 
 def parse_args():

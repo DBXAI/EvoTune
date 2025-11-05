@@ -184,8 +184,6 @@ class DBAgent:
         best_sql_actions = {}
         best_sql_times = {}
         best_sql_texts = {}
-        workload_best_time = None
-        workload_best_actions = None
 
         # 跟踪每个SQL的简化状态
         # {query_id: {"root_tried": set[str], "current_root": Any, "mode": 'exploit'|'explore', "confidence": Dict[str,float], "attempts": Dict[str,int], "successes": Dict[str,int]}}
@@ -230,12 +228,12 @@ class DBAgent:
                 if query_id in best_sql_actions and best_sql_actions[query_id]:
                     pre_fix_action = best_sql_actions[query_id]
                     success, _, _, _ = self.db.execute(pre_fix_action)
-                    logger.info(f"应用历史最佳DDL/SET修复动作完成")
+                    logger.info("应用历史最佳DDL/SET修复动作完成")
                     if success:
                         pre_index_names = self.action_manager.extract_index_names(pre_fix_action)
-                        logger.info(f"提取DDL/SET修复动作中的索引名称完成")
+                        logger.info("提取DDL/SET修复动作中的索引名称完成")
                         pre_knob_names = self.action_manager.extract_knob_names(pre_fix_action)
-                        logger.info(f"提取DDL/SET修复动作中的参数名称完成")
+                        logger.info("提取DDL/SET修复动作中的参数名称完成")
                         pre_applied = True
 
                 logger.info("开始执行SQL收集数据")
@@ -447,10 +445,6 @@ class DBAgent:
             round_total_time = sum([t for t in round_sql_times.values()])
             logger.info(f"第 {round_idx} 轮workload总执行时间: {round_total_time:.4f}s")
             logger.info(f"第 {round_idx} 轮各SQL执行时间: {round_sql_times}")
-
-            # if workload_best_time is None or round_total_time < workload_best_time:
-            #     workload_best_time = round_total_time
-            #     workload_best_actions = round_sql_actions.copy()
 
             logger.info(f"迭代至第 {round_idx} 轮，各SQL最优执行时间: {best_sql_times}")
             logger.info(f"迭代至第 {round_idx} 轮，workload最优总执行时间: {sum(best_sql_times.values())}")

@@ -14,6 +14,7 @@ from agents.mcp import MCPServerSse, MCPServerStdio
 from scipy.stats import spearmanr
 
 from agent.action import diagnose_tools
+from agent.action.diagnose_tools import SQLRuleMatcher
 
 # 添加项目根目录到Python路径
 project_root = str(Path(__file__).parent.parent.parent.parent)
@@ -531,8 +532,6 @@ class ActionManager:
                 # 获取历史案例中的改写后查询
                 rewritten_query = case.case_info.get("query_info").get("query")
 
-                from agent.action.diagnose_tools import SQLRuleMatcher
-
                 rule_matcher = SQLRuleMatcher()
 
                 applicable_rules = rule_matcher.match_rules(original_query)
@@ -542,8 +541,6 @@ class ActionManager:
 
         failed_rule_info = []
         for rule_name in failed_rules:
-            from agent.action.diagnose_tools import SQLRuleMatcher
-
             rule_matcher = SQLRuleMatcher()
             rule_info = rule_matcher.get_rule_info(rule_name)
             if rule_info:
@@ -810,7 +807,7 @@ class ActionManager:
                 )
             else:
                 return "no clear pattern", None
-        except:
+        except Exception:
             return "insufficient data", None
 
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):

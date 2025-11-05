@@ -161,8 +161,6 @@ class SQLRuleMatcher:
         检查规则是否在改写中被使用，基于具体的Calcite规则模式
         """
         rule_name = rule["name"]
-        original_lower = original_query.lower()
-        rewritten_lower = rewritten_query.lower()
 
         # 基于具体规则名称进行精确匹配
         if "SORT_UNION_TRANSPOSE" in rule_name:
@@ -906,7 +904,7 @@ async def rewrite_action_space(sql, database_config):
     from org.apache.calcite.adapter.jdbc import JdbcSchema
     from org.apache.calcite.jdbc import CalciteConnection
     from org.apache.calcite.sql2rel import SqlToRelConverter
-    from org.apache.calcite.sql.dialect import PostgresqlSqlDialect
+    # from org.apache.calcite.sql.dialect import PostgresqlSqlDialect
     from org.apache.calcite.sql.parser import SqlParser
     from org.apache.calcite.sql.parser.babel import SqlBabelParserImpl
     from org.apache.calcite.sql.validate import SqlConformanceEnum
@@ -944,7 +942,7 @@ async def rewrite_action_space(sql, database_config):
     converterConfig = SqlToRelConverter.config().withExpand(True)
     config = Frameworks.newConfigBuilder().defaultSchema(schema).parserConfig(parserConfig).sqlToRelConverterConfig(converterConfig).build()
     planner = Frameworks.getPlanner(config)
-    dialect = PostgresqlSqlDialect.DEFAULT
+    # dialect = PostgresqlSqlDialect.DEFAULT
 
     # 解析SQL，生成rel_node
     planner.close()
@@ -1017,7 +1015,7 @@ async def query_knobs_action_space(database_config, knob_config):
 
 
 @mcp.tool()
-async def plan_action_space(query):
+async def plan_action_space(query, knob_config):
     query = query.lower()
 
     hint_actions = []
@@ -1089,7 +1087,7 @@ async def update_statistics(query):
             # get the statistics from pg_stat_all_tables
             stats = conn.execute(
                 text(
-                    f"""
+                    """
                 SELECT
                   n_live_tup,
                   n_dead_tup,
@@ -1101,7 +1099,7 @@ async def update_statistics(query):
                 FROM pg_stat_all_tables s
                 JOIN pg_class c ON s.relid = c.oid
                 WHERE c.relkind = 'r' AND s.schemaname = current_schema() AND s.relname = :tbl
-            """
+                """
                 ),
                 {"tbl": table},
             ).fetchone()
@@ -1181,7 +1179,7 @@ async def join_order_optimization(query):
         for table in tables:
             stats = conn.execute(
                 text(
-                    f"""
+                    """
                 SELECT 
                     reltuples::bigint as row_estimate,
                     relpages::bigint as page_estimate,
@@ -1190,7 +1188,7 @@ async def join_order_optimization(query):
                 FROM pg_class c
                 LEFT JOIN pg_stat_all_tables s ON c.oid = s.relid
                 WHERE c.relname = :table
-            """
+                """
                 ),
                 {"table": table},
             ).fetchone()
@@ -1230,12 +1228,12 @@ async def join_order_optimization(query):
                     try:
                         selectivity = conn.execute(
                             text(
-                                f"""
+                                """
                             SELECT n_distinct
                             FROM pg_stats
                             WHERE tablename = :table
                             AND attname = :column
-                        """
+                            """
                             ),
                             {"table": table, "column": col},
                         ).scalar()
@@ -1247,7 +1245,7 @@ async def join_order_optimization(query):
                                 "selectivity": selectivity if selectivity else 0,
                             }
                         )
-                    except:
+                    except Exception:
                         pass
 
         # 4. 优化连接顺序
@@ -1461,7 +1459,7 @@ async def optimize_repeatedly_subqueries(query):
                     )
                     if "EXPLAIN" in join_query.upper():
                         result["join_alternative"] = join_query
-            except:
+            except Exception:
                 pass
 
         optimized_query = new_query
@@ -1552,7 +1550,7 @@ async def optimize_query_knob(query):
                     knob_values[knob] = str(result[0])
                 else:
                     knob_values[knob] = None
-            except Exception as e:
+            except Exception:
                 knob_values[knob] = None
 
     # 组装返回结果

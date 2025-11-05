@@ -5,7 +5,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -77,7 +77,7 @@ class MemoryManager:
         # 假设有15种root cause，支持多根因组合
         self.island_keys = self._generate_island_keys(self.root_cause_types)
         self.islands = {key: set() for key in self.island_keys}
-        
+
         # 为 "normal" 根因也创建 island
         normal_island_key = self._normalize_root_causes(["normal"])
         self.islands[normal_island_key] = set()
@@ -213,7 +213,6 @@ class MemoryManager:
             pos_count = 0
             for i in range(batch_size):
                 if pos_mask[i].any():
-                    pos_logits = logits[i][pos_mask[i]]
                     pos_exp_logits = exp_logits[i][pos_mask[i]]
                     pos_loss += -torch.log(pos_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
                     pos_count += 1
@@ -223,7 +222,6 @@ class MemoryManager:
             neg_count = 0
             for i in range(batch_size):
                 if neg_mask[i].any():
-                    neg_logits = logits[i][neg_mask[i]]
                     neg_exp_logits = exp_logits[i][neg_mask[i]]
                     # 负样本损失：希望负样本的相似度尽可能小
                     neg_loss += torch.log(neg_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
@@ -837,7 +835,6 @@ class MemoryManager:
         if not self.archive:
             return None
 
-        query_text = query_info.query.lower().strip()
         exclude_roots = exclude_roots
 
         archive_cases = [self.cases[aid] for aid in self.archive]
