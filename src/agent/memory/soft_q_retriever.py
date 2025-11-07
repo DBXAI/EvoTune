@@ -13,43 +13,43 @@ import torch.nn.functional as F
 class Experience:
     query_info: Dict[str, Any]
     case_info: Dict[str, Any]
-    reward: int  # 0 或 1
+    reward: int  # 0 or 1
 
 
 class SoftQRetriever:
-    """基于软Q学习的案例检索器"""
+    """Case retriever based on soft Q-learning"""
 
     def __init__(self, memory_manager=None):
         self.device = "cpu"
 
-        # 网络参数
-        self.embedding_dim = 133  # 更新为133维
+        # Network parameters
+        self.embedding_dim = 133  # Updated to 133 dimensions
         self.hidden_dim = 512
         self.output_dim = 1
         self.temperature = 1.0
 
-        # 经验池参数
+        # Experience pool parameters
         self.batch_size = 2
         self.learning_rate = 1e-4
 
-        # 存储memory_manager引用
+        # Store memory_manager reference
         self.memory_manager = memory_manager
 
-        # 初始化网络
+        # Initialize network
         self._init_networks()
 
-        # 经验池（不限制大小，因为经验会持久化到文件）
+        # Experience pool (unlimited size, as experiences are persisted to file)
         self.experience_pool = deque()
 
-        # 优化器
+        # Optimizer
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.learning_rate)
 
-        # 统计信息
+        # Statistics
         self.total_experiences = 0
         self.update_count = 0
 
     def _init_networks(self):
-        # 主网络：两层MLP + Sigmoid（输出0-1之间的概率）
+        # Main network: two-layer MLP + Sigmoid (outputs probability between 0-1)
         self.network = nn.Sequential(
             nn.Linear(self.embedding_dim, self.hidden_dim),  # query_emb(32) + case_emb(64+32) + root_causes(4) + approve_time(1) = 133
             nn.ReLU(),
@@ -58,19 +58,19 @@ class SoftQRetriever:
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(self.hidden_dim // 2, self.output_dim),
-            nn.Sigmoid(),  # 输出0-1之间的概率
+            nn.Sigmoid(),  # Outputs probability between 0-1
         ).to(self.device)
 
-        # 目标网络（用于稳定训练）
+        # Target network (for stable training)
         self.target_network = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.hidden_dim),  # 133维输入
+            nn.Linear(self.embedding_dim, self.hidden_dim),  # 133-dimensional input
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(self.hidden_dim // 2, self.output_dim),
-            nn.Sigmoid(),  # 输出0-1之间的概率
+            nn.Sigmoid(),  # Outputs probability between 0-1
         ).to(self.device)
 
         self.target_network.load_state_dict(self.network.state_dict())
@@ -140,23 +140,23 @@ class SoftQRetriever:
             return value
 
     def select_cases(self, query_info, candidate_cases, root_causes, top_k=4):
-        """选择TopK个案例"""
+        """Select TopK cases"""
         if not candidate_cases:
             return []
 
-        # 计算每个案例的价值
+        # Calculate value for each case
         case_values = []
         for case_info in candidate_cases:
             value = self.predict_case_value(query_info, case_info, root_causes)
             case_values.append((case_info, value))
 
-        # 按价值排序
+        # Sort by value
         case_values.sort(key=lambda x: x[1], reverse=True)
 
-        # 选择TopK个
+        # Select TopK
         selected_cases = case_values[:top_k]
 
-        # 返回案例和概率（网络已经输出softmax概率）
+        # Return cases and probabilities (network already outputs softmax probability)
         result = []
         for case_info, probability in selected_cases:
             # if probability > 0.5:
@@ -171,19 +171,19 @@ class SoftQRetriever:
         self.total_experiences += 1
 
     def update_network(self):
-        """更新网络参数"""
+        """Update network parameters"""
         if len(self.experience_pool) < self.batch_size:
             return
 
-        # 随机采样经验
+        # Randomly sample experiences
         batch_experiences = random.sample(self.experience_pool, self.batch_size)
 
-        # 准备训练数据
+        # Prepare training data
         features_list = []
         rewards_list = []
 
         for experience in batch_experiences:
-            # 计算特征
+            # Compute features
             features = self._compute_features(
                 experience.query_info,
                 experience.case_info,
@@ -192,24 +192,24 @@ class SoftQRetriever:
             features_list.append(features)
             rewards_list.append(experience.reward)
 
-        # 转换为张量
+        # Convert to tensors
         features_tensor = torch.stack(features_list)
         rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).to(self.device)
 
-        # 前向传播
+        # Forward pass
         predictions = self.network(features_tensor).squeeze()
 
-        # 计算损失
+        # Compute loss
         loss = F.mse_loss(predictions, rewards_tensor)
 
-        # 反向传播
+        # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
         self.update_count += 1
 
-        # 定期更新目标网络
+        # Periodically update target network
         if self.update_count % 10 == 0:
             self.target_network.load_state_dict(self.network.state_dict())
 

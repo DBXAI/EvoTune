@@ -13,17 +13,17 @@ import pymysql
 class TiDB:
     def __init__(self, db_config):
         """
-        初始化TiDB连接器
+        Initialize TiDB connector
 
         Args:
-            host: TiDB服务器地址
-            port: 端口号
-            user: 用户名
-            password: 密码
-            database: 数据库名
-            db_type: 数据库类型
-            ssl_mode: SSL模式 (DISABLED, REQUIRED, VERIFY_IDENTITY)
-            ssl_ca: SSL证书路径
+            host: TiDB server address
+            port: Port number
+            user: Username
+            password: Password
+            database: Database name
+            db_type: Database type
+            ssl_mode: SSL mode (DISABLED, REQUIRED, VERIFY_IDENTITY)
+            ssl_ca: SSL certificate path
         """
         self.host = db_config["host"]
         self.port = db_config["port"]
@@ -36,9 +36,9 @@ class TiDB:
         self.connection = None
 
     def _check_tidb_running(self):
-        """检查TiDB是否在指定端口运行"""
+        """Check if TiDB is running on the specified port"""
         try:
-            # 尝试连接端口
+            # Try to connect to the port
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2)
             result = sock.connect_ex((self.host, self.port))
@@ -48,7 +48,7 @@ class TiDB:
             return False
 
     def _check_tiup_playground_running(self):
-        """检查是否有tiup playground进程在运行"""
+        """Check if tiup playground process is running"""
         try:
             for proc in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
@@ -62,9 +62,9 @@ class TiDB:
             return False
 
     def _start_tiup_playground(self):
-        """启动tiup playground"""
+        """Start tiup playground"""
         try:
-            print("正在启动tiup playground --tag DREAM...")
+            print("Starting tiup playground --tag DREAM...")
             # use subprocess to start tiup playground, set to background
             process = subprocess.Popen(
                 ["tiup", "playground", "--tag", "DREAM"],
@@ -78,27 +78,27 @@ class TiDB:
 
             # check if successfully started
             if self._check_tidb_running():
-                print("tiup playground启动成功！")
+                print("tiup playground started successfully!")
                 return True
             else:
-                print("tiup playground启动失败或超时")
+                print("tiup playground startup failed or timed out")
                 return False
 
         except Exception as e:
-            print(f"启动tiup playground时发生错误: {e}")
+            print(f"Error starting tiup playground: {e}")
             return False
 
     def _ensure_tidb_running(self):
         # ensure TiDB is running, if not, start it
         if not self._check_tidb_running():
-            print("TiDB未在运行，检查tiup playground状态...")
+            print("TiDB is not running, checking tiup playground status...")
 
             if not self._check_tiup_playground_running():
-                print("未找到tiup playground进程，正在启动...")
+                print("tiup playground process not found, starting...")
                 if not self._start_tiup_playground():
-                    raise Exception("无法启动TiDB服务")
+                    raise Exception("Unable to start TiDB service")
             else:
-                print("找到tiup playground进程，等待服务启动...")
+                print("Found tiup playground process, waiting for service to start...")
                 max_wait = 30
                 wait_time = 0
                 while not self._check_tidb_running() and wait_time < max_wait:
@@ -106,9 +106,9 @@ class TiDB:
                     wait_time += 2
 
                 if not self._check_tidb_running():
-                    raise Exception("TiDB服务启动超时")
+                    raise Exception("TiDB service startup timeout")
 
-        print("TiDB服务已就绪")
+        print("TiDB service is ready")
 
     def _get_ssl_config(self):
         # get SSL config
@@ -306,7 +306,7 @@ class TiDB:
                 return normalized1 == normalized2
 
             except Exception as e:
-                print(f"比较SQL结果时发生错误: {e}")
+                print(f"Error comparing SQL results: {e}")
                 return False
 
     def close(self):

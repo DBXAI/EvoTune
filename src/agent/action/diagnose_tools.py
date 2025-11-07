@@ -22,20 +22,20 @@ from sqlparse.tokens import DML
 from sqlparse.tokens import Comparison as TComparison
 from sqlparse.tokens import Keyword, Literal, Name, Whitespace, Wildcard
 
-# 添加项目根目录到Python路径
+# Add project root directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 import jpype as jp
 
 from src.database.pg_env import PostgresDB
 
-# 初始化 FastMCP 服务器
+# Initialize FastMCP server
 mcp = FastMCP("db_diagnosis")
 
 
 class SQLRuleMatcher:
     def __init__(self):
-        # 使用相对路径，基于当前模块所在目录
+        # Use relative path based on current module directory
         current_dir = os.path.dirname(os.path.abspath(__file__))
         self.rules_file = os.path.join(current_dir, "calcite_rewrite_rules_abbreviated.jsonl")
         self.rules = self._load_rules()
@@ -151,7 +151,7 @@ class SQLRuleMatcher:
 
     def get_rule_info(self, rule_name):
         """
-        根据规则名称获取规则信息
+        Get rule information based on rule name
         """
         for rule in self.rules:
             if rule["name"] == rule_name:
@@ -160,242 +160,242 @@ class SQLRuleMatcher:
 
     def _rule_used_in_rewrite(self, rule, original_query, rewritten_query):
         """
-        检查规则是否在改写中被使用，基于具体的Calcite规则模式
+        Check if rule is used in rewrite, based on specific Calcite rule patterns
         """
         rule_name = rule["name"]
 
-        # 基于具体规则名称进行精确匹配
+        # Exact matching based on specific rule names
         if "SORT_UNION_TRANSPOSE" in rule_name:
-            # 检查ORDER BY是否被推入UNION
+            # Check if ORDER BY is pushed into UNION
             return self._check_union_order_by_push(original_query, rewritten_query)
 
         elif "PROJECT_CORRELATE_TRANSPOSE" in rule_name:
-            # 检查相关子查询的投影下推
+            # Check correlated subquery projection pushdown
             return self._check_correlated_subquery_projection(original_query, rewritten_query)
 
         elif "FILTER_MERGE" in rule_name:
-            # 检查WHERE条件合并
+            # Check WHERE condition merge
             return self._check_where_merge(original_query, rewritten_query)
 
         elif "JOIN_ADD_REDUNDANT_SEMI_JOIN" in rule_name:
-            # 检查半连接添加
+            # Check semi-join addition
             return self._check_semi_join_addition(original_query, rewritten_query)
 
         elif "AGGREGATE_EXPAND_DISTINCT_AGGREGATES" in rule_name:
-            # 检查DISTINCT聚合展开
+            # Check DISTINCT aggregate expansion
             return self._check_distinct_aggregate_expansion(original_query, rewritten_query)
 
         elif "AGGREGATE_UNION_TRANSPOSE" in rule_name:
-            # 检查聚合下推到UNION
+            # Check aggregate pushdown to UNION
             return self._check_aggregate_union_transpose(original_query, rewritten_query)
 
         elif "JOIN_CONDITION_PUSH" in rule_name:
-            # 检查JOIN条件下推
+            # Check JOIN condition pushdown
             return self._check_join_condition_push(original_query, rewritten_query)
 
         elif "SORT_REMOVE_CONSTANT_KEYS" in rule_name:
-            # 检查ORDER BY常量键移除
+            # Check ORDER BY constant key removal
             return self._check_order_by_constant_removal(original_query, rewritten_query)
 
         elif "AGGREGATE_JOIN_REMOVE" in rule_name:
-            # 检查不必要的JOIN移除
+            # Check unnecessary JOIN removal
             return self._check_unnecessary_join_removal(original_query, rewritten_query)
 
         elif "PROJECT_WINDOW_TRANSPOSE" in rule_name:
-            # 检查窗口函数投影转置
+            # Check window function projection transpose
             return self._check_window_projection_transpose(original_query, rewritten_query)
 
         elif "FILTER_VALUES_MERGE" in rule_name:
-            # 检查VALUES子句过滤合并
+            # Check VALUES clause filter merge
             return self._check_values_filter_merge(original_query, rewritten_query)
 
         elif "FILTER_SUB_QUERY_TO_CORRELATE" in rule_name:
-            # 检查子查询转换为相关子查询
+            # Check subquery to correlated subquery conversion
             return self._check_subquery_to_correlate(original_query, rewritten_query)
 
         elif "UNION_REMOVE" in rule_name:
-            # 检查冗余UNION移除
+            # Check redundant UNION removal
             return self._check_redundant_union_removal(original_query, rewritten_query)
 
         elif "UNION_TO_DISTINCT" in rule_name:
-            # 检查UNION转换为DISTINCT
+            # Check UNION to DISTINCT conversion
             return self._check_union_to_distinct(original_query, rewritten_query)
 
         elif "SORT_REMOVE" in rule_name:
-            # 检查冗余ORDER BY移除
+            # Check redundant ORDER BY removal
             return self._check_redundant_sort_removal(original_query, rewritten_query)
 
         elif "PROJECT_REMOVE" in rule_name:
-            # 检查冗余投影移除
+            # Check redundant projection removal
             return self._check_redundant_projection_removal(original_query, rewritten_query)
 
         elif "JOIN_TO_CORRELATE" in rule_name:
-            # 检查JOIN转换为相关子查询
+            # Check JOIN to correlated subquery conversion
             return self._check_join_to_correlate(original_query, rewritten_query)
 
         elif "INTERSECT_TO_DISTINCT" in rule_name:
-            # 检查INTERSECT转换为DISTINCT
+            # Check INTERSECT to DISTINCT conversion
             return self._check_intersect_to_distinct(original_query, rewritten_query)
 
         return False
 
     def _check_union_order_by_push(self, original_query, rewritten_query):
-        """检查ORDER BY是否被推入UNION"""
+        """Check if ORDER BY is pushed into UNION"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
         if "union" in original_lower and "union" in rewritten_lower:
-            # 检查ORDER BY是否从UNION后移到了UNION内部
+            # Check if ORDER BY moved from after UNION to inside UNION
             original_order_by_count = original_lower.count("order by")
             rewritten_order_by_count = rewritten_lower.count("order by")
             return original_order_by_count != rewritten_order_by_count
         return False
 
     def _check_correlated_subquery_projection(self, original_query, rewritten_query):
-        """检查相关子查询的投影下推"""
-        # 检查是否从相关子查询中提取了投影
+        """Check correlated subquery projection pushdown"""
+        # Check if projection is extracted from correlated subquery
         return "select" in original_query.lower() and "select" in rewritten_query.lower() and "exists" in original_query.lower() or "in " in original_query.lower()
 
     def _check_where_merge(self, original_query, rewritten_query):
-        """检查WHERE条件合并"""
+        """Check WHERE condition merge"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查WHERE子句数量的变化
+        # Check change in WHERE clause count
         original_where_count = original_lower.count("where")
         rewritten_where_count = rewritten_lower.count("where")
         return original_where_count > rewritten_where_count
 
     def _check_semi_join_addition(self, original_query, rewritten_query):
-        """检查半连接添加"""
+        """Check semi-join addition"""
         rewritten_lower = rewritten_query.lower()
-        # 检查是否添加了EXISTS或IN子查询
+        # Check if EXISTS or IN subquery is added
         return "exists" in rewritten_lower or " in " in rewritten_lower
 
     def _check_distinct_aggregate_expansion(self, original_query, rewritten_query):
-        """检查DISTINCT聚合展开"""
+        """Check DISTINCT aggregate expansion"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查DISTINCT是否被移除，GROUP BY是否被添加
+        # Check if DISTINCT is removed and GROUP BY is added
         return "distinct" in original_lower and "distinct" not in rewritten_lower and "group by" in rewritten_lower
 
     def _check_aggregate_union_transpose(self, original_query, rewritten_query):
-        """检查聚合下推到UNION"""
+        """Check aggregate pushdown to UNION"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查聚合函数是否从UNION后移到了UNION内部
+        # Check if aggregate functions moved from after UNION to inside UNION
         agg_functions = ["count", "sum", "avg", "min", "max"]
         original_agg_count = sum(original_lower.count(func) for func in agg_functions)
         rewritten_agg_count = sum(rewritten_lower.count(func) for func in agg_functions)
         return rewritten_agg_count > original_agg_count
 
     def _check_join_condition_push(self, original_query, rewritten_query):
-        """检查JOIN条件下推"""
+        """Check JOIN condition pushdown"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查WHERE条件是否被移到了ON子句
+        # Check if WHERE condition is moved to ON clause
         return "where" in original_lower and "on " in rewritten_lower
 
     def _check_order_by_constant_removal(self, original_query, rewritten_query):
-        """检查ORDER BY常量键移除"""
+        """Check ORDER BY constant key removal"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查ORDER BY子句是否被简化
+        # Check if ORDER BY clause is simplified
         if "order by" in original_lower and "order by" in rewritten_lower:
-            # 简单的启发式：如果ORDER BY子句变短了，可能移除了常量
+            # Simple heuristic: if ORDER BY clause is shorter, constants may have been removed
             original_order_by = original_query[original_query.lower().find("order by") :]
             rewritten_order_by = rewritten_query[rewritten_query.lower().find("order by") :]
             return len(rewritten_order_by) < len(original_order_by)
         return False
 
     def _check_unnecessary_join_removal(self, original_query, rewritten_query):
-        """检查不必要的JOIN移除"""
+        """Check unnecessary JOIN removal"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查JOIN数量是否减少
+        # Check if JOIN count is reduced
         original_join_count = original_lower.count("join")
         rewritten_join_count = rewritten_lower.count("join")
         return rewritten_join_count < original_join_count
 
     def _check_window_projection_transpose(self, original_query, rewritten_query):
-        """检查窗口函数投影转置"""
+        """Check window function projection transpose"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查窗口函数是否被分离到子查询中
+        # Check if window function is separated into subquery
         return "over(" in original_lower and "over(" in rewritten_lower and "select" in original_lower and "select" in rewritten_lower
 
     def _check_values_filter_merge(self, original_query, rewritten_query):
-        """检查VALUES子句过滤合并"""
+        """Check VALUES clause filter merge"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查VALUES子句是否被简化
+        # Check if VALUES clause is simplified
         return "values" in original_lower and "values" in rewritten_lower
 
     def _check_subquery_to_correlate(self, original_query, rewritten_query):
-        """检查子查询转换为相关子查询"""
+        """Check subquery to correlated subquery conversion"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查子查询是否被转换为JOIN
+        # Check if subquery is converted to JOIN
         return "select" in original_lower and "join" in rewritten_lower
 
     def _check_redundant_union_removal(self, original_query, rewritten_query):
-        """检查冗余UNION移除"""
+        """Check redundant UNION removal"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查UNION是否被移除
+        # Check if UNION is removed
         original_union_count = original_lower.count("union")
         rewritten_union_count = rewritten_lower.count("union")
         return rewritten_union_count < original_union_count
 
     def _check_union_to_distinct(self, original_query, rewritten_query):
-        """检查UNION转换为DISTINCT"""
+        """Check UNION to DISTINCT conversion"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查UNION是否被转换为DISTINCT
+        # Check if UNION is converted to DISTINCT
         return "union" in original_lower and "distinct" in rewritten_lower and "union" not in rewritten_lower
 
     def _check_redundant_sort_removal(self, original_query, rewritten_query):
-        """检查冗余ORDER BY移除"""
+        """Check redundant ORDER BY removal"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查ORDER BY是否被移除
+        # Check if ORDER BY is removed
         return "order by" in original_lower and "order by" not in rewritten_lower
 
     def _check_redundant_projection_removal(self, original_query, rewritten_query):
-        """检查冗余投影移除"""
+        """Check redundant projection removal"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查SELECT子句是否被简化
+        # Check if SELECT clause is simplified
         original_select_count = original_lower.count("select")
         rewritten_select_count = rewritten_lower.count("select")
         return rewritten_select_count < original_select_count
 
     def _check_join_to_correlate(self, original_query, rewritten_query):
-        """检查JOIN转换为相关子查询"""
+        """Check JOIN to correlated subquery conversion"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查JOIN是否被转换为EXISTS或IN
+        # Check if JOIN is converted to EXISTS or IN
         return "join" in original_lower and ("exists" in rewritten_lower or " in " in rewritten_lower)
 
     def _check_intersect_to_distinct(self, original_query, rewritten_query):
-        """检查INTERSECT转换为DISTINCT"""
+        """Check INTERSECT to DISTINCT conversion"""
         original_lower = original_query.lower()
         rewritten_lower = rewritten_query.lower()
 
-        # 检查INTERSECT是否被转换为GROUP BY + COUNT
+        # Check if INTERSECT is converted to GROUP BY + COUNT
         return "intersect" in original_lower and "group by" in rewritten_lower and "count" in rewritten_lower
 
 
@@ -458,7 +458,7 @@ def extract_columns(parsed, database_config):
 
     def _extract_columns(token_list):
         for token in token_list.tokens:
-            # 处理 SELECT 子句
+            # Process SELECT clause
             if token.ttype is DML and token.value.upper() == "SELECT":
                 idx, next_token = token_list.token_next(token_list.token_index(token))
                 if isinstance(next_token, IdentifierList):
@@ -467,7 +467,7 @@ def extract_columns(parsed, database_config):
                 else:
                     _extract_identifier(next_token)
 
-            # 递归处理子查询/嵌套结构
+            # Recursively process subqueries/nested structures
             elif token.is_group:
                 _extract_columns(token)
 
@@ -476,7 +476,7 @@ def extract_columns(parsed, database_config):
             real_name = identifier.get_real_name()
             if real_name:
                 columns.add(real_name)
-            # 尝试解析函数调用中的列名，比如 "SUM(o.o_totalprice) AS total"
+            # Try to parse column names in function calls, e.g., "SUM(o.o_totalprice) AS total"
             if identifier.tokens:
                 for subtoken in identifier.tokens:
                     if isinstance(subtoken, Function):
@@ -486,22 +486,22 @@ def extract_columns(parsed, database_config):
         elif hasattr(identifier, "ttype") and identifier.ttype == Wildcard:
             columns.add("*")
         elif hasattr(identifier, "value"):
-            # 最后兜底策略：直接通过正则提取字段名
+            # Final fallback strategy: directly extract field names via regex
             potential_cols = re.findall(r"\b\w+\.\w+\b", identifier.value)
             for col in potential_cols:
                 columns.add(col.split(".")[-1])
 
     def _extract_function(func_token):
-        # 尝试提取函数体里的字段名
+        # Try to extract field names in function body
         inside = func_token.value
-        # 捕获字段名 o.o_totalprice 或 o_orderdate
+        # Capture field names like o.o_totalprice or o_orderdate
         matches = re.findall(r"\b\w+\.\w+\b", inside)
         for match in matches:
             columns.add(match.split(".")[-1])
 
     _extract_columns(parsed)
 
-    # 连接数据库以检查列是否存在
+    # Connect to database to check if columns exist
     postgres_db = PostgresDB(
         user=database_config["user"],
         password=database_config["password"],
@@ -553,10 +553,10 @@ def is_redundant_comparison(token):
 
 
 def find_redundant_where_conditions_recursive(token_list):
-    """递归查找所有 WHERE 中的冗余条件"""
+    """Recursively find all redundant conditions in WHERE"""
     redundant = []
     for token in token_list.tokens:
-        # 找到 WHERE 子句
+        # Find WHERE clause
         if isinstance(token, Where):
             for subtoken in token.tokens:
                 expr = is_redundant_comparison(subtoken)
@@ -567,14 +567,14 @@ def find_redundant_where_conditions_recursive(token_list):
                     "FALSE",
                 ):
                     redundant.append(subtoken.value.upper())
-        # 如果是一个嵌套结构（子查询、括号等），继续递归
+        # If it's a nested structure (subquery, parentheses, etc.), continue recursion
         if isinstance(token, TokenList):
             redundant.extend(find_redundant_where_conditions_recursive(token))
     return redundant
 
 
 def count_nested_selects(parsed):
-    """递归计算 SELECT 的嵌套层数"""
+    """Recursively calculate nesting level of SELECT"""
 
     def _count(token_list, level=0):
         max_level = level
@@ -590,16 +590,16 @@ def count_nested_selects(parsed):
 
 
 def extract_subqueries(token_list):
-    """递归提取所有子查询文本"""
+    """Recursively extract all subquery text"""
     subqueries = []
 
     for token in token_list.tokens:
-        # 检测 SELECT 子查询：以 (SELECT 开头的 Parenthesis
+        # Detect SELECT subquery: Parenthesis starting with (SELECT
         if isinstance(token, Parenthesis):
             inside = token.value.strip("() ").strip()
             if inside.upper().startswith("SELECT"):
                 subqueries.append(inside)
-        # 如果还有嵌套结构，递归处理
+        # If there are nested structures, process recursively
         if isinstance(token, TokenList):
             subqueries.extend(extract_subqueries(token))
 
@@ -607,7 +607,7 @@ def extract_subqueries(token_list):
 
 
 def find_duplicate_subqueries(sql):
-    """找出重复的子查询（完全相同）"""
+    """Find duplicate subqueries (exactly the same)"""
     parsed = sqlparse.parse(sql)[0]
     subqueries = extract_subqueries(parsed)
     seen = {}
@@ -742,7 +742,7 @@ async def plan_info_collect(query, database_config):
     parsed = sqlparse.parse(query)[0]
     target_tables = extract_tables(parsed, database_config)
 
-    # 获取上次analyze更新的时间
+    # Get time since last analyze update
     time_since_last_analyze = {}
     for table in target_tables:
         analyze_sql = f"""
@@ -757,7 +757,7 @@ async def plan_info_collect(query, database_config):
             table_name, time_since = result[0]
             time_since_last_analyze[table_name] = time_since
 
-    # 获取表的统计信息
+    # Get table statistics
     table_stats_info = {}
     table_stats_sql = """
         SELECT
@@ -782,7 +782,7 @@ async def plan_info_collect(query, database_config):
             "total_size": total_size,
         }
 
-    # 获得相关列的统计信息
+    # Get statistics for relevant columns
     column_stats_info = {}
     target_columns = extract_columns(parsed, database_config)
     for column in target_columns:
@@ -841,7 +841,7 @@ async def indexes_action_space(query):
 @mcp.tool()
 async def system_knobs_action_space(database_config, knob_config):
 
-    # 这里还可以缩小到一个只调整和query相关的knobs的空间
+    # Can also narrow down to a space that only adjusts knobs related to the query
 
     postgres_db = PostgresDB(database_config)
 

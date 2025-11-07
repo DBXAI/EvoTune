@@ -28,7 +28,7 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     positives_text = fmt_cases(positives)
     negatives_text = fmt_cases(negatives)
 
-    # 模式提示
+    # Mode prompt
     if mode == "exploit":
         mode_instruction = """You are now in **EXPLOIT mode**. Refer to the following Positive Cases and Negative Cases, which are derived from historical fixes under the same root cause. 
     - Positive Cases represent effective fixes. Treat their Fix_Actions as **examples of optimization patterns**, You must **not copy them directly or merely reorder them**. Instead, propose **new fix_actions** that explore additional possibilities. 
@@ -149,12 +149,12 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
       ]
     """
 
-    # 处理 timeout 情况
+    # Handle timeout case
     execution_time_text = f"{query_info.execution_time} s"
     if query_info.execution_time == timeout:
         execution_time_text = f"{query_info.execution_time} (timeout)"
 
-    # 格式化调优历史（成功/失败计数）
+    # Format tuning history (success/failure counts)
     if tuning_history:
         lines = []
         for item in tuning_history:
@@ -226,13 +226,13 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
 
 def build_action_space_prompt(root_causes, db, knob_config, current_knob_values, query_info=None):
     """Build action space prompt based on root causes."""
-    # 根因
+    # Root causes
     root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
 
-    # 根据根因构建操作空间prompt
+    # Build action space prompt based on root causes
     action_space_prompt = ""
 
-    # 索引相关
+    # Index related
     if "missing indexes" in root_causes:
         current_indexes = db.get_indexes() if db else []
         action_space_prompt += f"""
@@ -244,7 +244,7 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
     - Do not conflict with the existing indexes in the database: {current_indexes}
     """
 
-    # Knob相关
+    # Knob related
     if "inappropriate query knobs" in root_causes:
         system_knobs_specs = knob_config.get("system_knobs")
         current_values = current_knob_values.get("system_knobs")
@@ -260,7 +260,7 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
     {knob_lines}
     """
 
-    # 执行计划/优化器相关
+    # Execution plan/optimizer related
     if "suboptimal plan optimizer" in root_causes:
         query_knobs_specs = knob_config.get("query_knobs")
         current_values = current_knob_values.get("query_knobs")
@@ -276,7 +276,7 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
     {knob_lines}
     - **IMPORTANT**: When using Plan Optimizer Space, output ONLY the hint block. Do NOT include the original SQL. Example: /*+ Set(enable_hashjoin on) Set(enable_sort on) */"""
 
-    # SQL 可读性/重写相关
+    # SQL readability/rewrite related
     if "poorly written queries" in root_causes:
         from .action.diagnose_tools import SQLRuleMatcher
 

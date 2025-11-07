@@ -45,7 +45,7 @@ class PostgresDB:
             self.connection = None
 
     def connect(self):
-        """建立并返回一个数据库连接"""
+        """Establish and return a database connection"""
         if self.connection is None or self.connection.closed:
             self.connection = psycopg.connect(self.conn_str, autocommit=True, prepare_threshold=None)
         return self.connection
@@ -59,7 +59,7 @@ class PostgresDB:
 
         with conn.cursor() as cur:
             try:
-                cur.execute(f"SET statement_timeout = {timeout * 1000}")  # 设置超时
+                cur.execute(f"SET statement_timeout = {timeout * 1000}")  # Set timeout
                 start_time = time.time()
                 cur.execute(sql)
                 end_time = time.time()
@@ -102,8 +102,7 @@ class PostgresDB:
                         # print(f"SELECT语句返回 {len(select_results)} 行结果")
 
                     else:
-                        # print(f"执行非SELECT语句 {i+1}: {stmt[:50]}...")
-                        # 执行非SELECT语句（如CREATE VIEW, DROP VIEW）
+                        # Execute non-SELECT statements (e.g., CREATE VIEW, DROP VIEW)
                         cursor.execute(stmt)
                         conn.commit()
 
@@ -125,10 +124,10 @@ class PostgresDB:
                     return []
 
             except psycopg.errors.QueryCanceled as e:
-                print(f"查询超时 (>{timeout}秒): {str(e)}")
+                print(f"Query timeout (>{timeout}s): {str(e)}")
                 return []
             except Exception as e:
-                print(f"查询执行失败: {str(e)}")
+                print(f"Query execution failed: {str(e)}")
                 return []
 
     def extract_sql_statements(self, sql_text):
@@ -372,29 +371,29 @@ class PostgresDB:
 
     def get_plan(self, sql):
         """
-        获取SQL的执行计划。支持包含 CREATE VIEW / DROP VIEW 的复杂SQL。
-        执行流程：
-        1. 先执行 CREATE 相关语句（不加 EXPLAIN）
-        2. 找到第一个 SELECT，生成计划并返回
-        3. 执行 DROP 语句清理
+        Get SQL execution plan. Supports complex SQL with CREATE VIEW / DROP VIEW.
+        Execution flow:
+        1. Execute CREATE related statements first (without EXPLAIN)
+        2. Find first SELECT, generate plan and return
+        3. Execute DROP statements for cleanup
         """
         sql = sql.strip()
 
-        # 使用解析器统计语句数量
+        # Use parser to count statements
         statements = self.extract_sql_statements(sql)
         if len(statements) > 1:
             plan_result = None
 
             try:
-                # 1. 执行 CREATE/ALTER/SET 等准备语句
+                # 1. Execute CREATE/ALTER/SET preparation statements
                 for stmt in statements:
                     if stmt.upper().startswith(("CREATE", "ALTER", "SET")):
                         try:
                             self.execute(stmt)
                         except Exception as e:
-                            print(f"执行 {stmt} 失败: {e}")
+                            print(f"Failed to execute {stmt}: {e}")
 
-                # 2. 找到第一个可 EXPLAIN 的查询语句（WITH/SELECT/INSERT/UPDATE/DELETE）
+                # 2. Find first EXPLAIN-able query statement (WITH/SELECT/INSERT/UPDATE/DELETE)
                 for stmt in statements:
                     if stmt.upper().startswith("WITH") or stmt.upper().startswith("SELECT") or stmt.upper().startswith("/*+") or stmt.upper().startswith("INSERT") or stmt.upper().startswith("UPDATE") or stmt.upper().startswith("DELETE"):
                         try:
@@ -402,27 +401,27 @@ class PostgresDB:
                             plan_result = self.fetch_results(plan_sql)
                             break
                         except Exception as e:
-                            print(f"获取执行计划失败: {e}")
+                            print(f"Failed to get execution plan: {e}")
 
             finally:
-                # 3. 清理 DROP 语句
+                # 3. Cleanup DROP statements
                 for stmt in statements:
                     if stmt.upper().startswith("DROP"):
                         try:
                             self.execute(stmt)
                         except Exception as e:
-                            print(f"执行 {stmt} 失败: {e}")
+                            print(f"Failed to execute {stmt}: {e}")
 
             return plan_result
 
         else:
-            # 单个语句，直接获取计划
+            # Single statement, get plan directly
             try:
                 single_stmt = statements[0] if statements else sql
                 plan_sql = f"EXPLAIN (FORMAT JSON) {single_stmt}"
                 return self.fetch_results(plan_sql)
             except Exception as e:
-                print(f"获取执行计划失败: {e}")
+                print(f"Failed to get execution plan: {e}")
                 return None
 
     def get_metrics_specification(self):
@@ -453,13 +452,13 @@ class PostgresDB:
         with conn.cursor(row_factory=dict_row) as cursor:
             for table, keys in METRICS_SPECIFICATION.items():
                 try:
-                    # 只采集当前数据库
+                    # Only collect current database
                     if table == "pg_stat_database":
                         cursor.execute(f"SELECT * FROM {table} WHERE datname = current_database()")
                     else:
                         cursor.execute(f"SELECT * FROM {table}")
                     records = cursor.fetchall()
-                    # 只保留关心的字段
+                    # Only keep fields of interest
                     filtered = []
                     for r in records:
                         filtered.append({k: r[k] for k in keys if k in r})
@@ -619,12 +618,12 @@ class PostgresDB:
                     seen_columns.add(column_name)
 
                     col_def = f"{column_name} {col['data_type']}"
-                    # 移除 PostgreSQL 特定的类型（如 SERIAL），替换为 INTEGER
+                    # Remove PostgreSQL-specific types (e.g., SERIAL), replace with INTEGER
                     col_def = col_def.replace("SERIAL", "INTEGER")
                     col_def = col_def.replace("serial", "INTEGER")
                     columns.append(col_def)
 
-                # 生成 QED 兼容的 CREATE TABLE 语句
+                # Generate QED-compatible CREATE TABLE statement
                 create_table_sql = f"CREATE TABLE {table_name} (\n"
                 create_table_sql += ",\n".join(f"  {col}" for col in columns)
                 create_table_sql += "\n);\n\n"
@@ -713,9 +712,9 @@ class PostgresDB:
 
     def compare_sql_results(self, sql1, sql2):
         """
-        判断两个SQL语句的输出结果是否完全一致（包括内容和重复行）。
-        支持 SQL 中包含 CREATE VIEW + SELECT + DROP VIEW。
-        如果两个SQL都有CREATE VIEW，会分别执行后比较结果。
+        Determine if two SQL statements produce exactly the same output (including content and duplicate rows).
+        Supports SQL containing CREATE VIEW + SELECT + DROP VIEW.
+        If both SQLs have CREATE VIEW, they will be executed separately and results compared.
         """
 
         try:
@@ -733,7 +732,7 @@ class PostgresDB:
             return Counter(result1) == Counter(result2)
 
         except Exception as e:
-            print(f"比较SQL结果时出错: {e}")
+            print(f"Error comparing SQL results: {e}")
             return False
 
     # def compare_sql_results(self, sql1, sql2):

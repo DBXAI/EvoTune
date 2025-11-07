@@ -23,7 +23,7 @@ class ResourceMonitor:
             # if process does not exist, create a virtual process object
             self.process = None
             self.n_cpu = 1
-            print(f"警告: 进程 {pid} 不存在或无法访问，将使用默认值")
+            print(f"Warning: Process {pid} does not exist or cannot be accessed, using default values")
 
         self.cpu_usage_seq = Manager().list()
         self.mem_virtual_usage_seq = Manager().list()

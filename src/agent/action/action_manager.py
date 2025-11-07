@@ -16,7 +16,7 @@ from scipy.stats import spearmanr
 from agent.action import diagnose_tools
 from agent.action.diagnose_tools import SQLRuleMatcher
 
-# 添加项目根目录到Python路径
+# Add project root directory to Python path
 project_root = str(Path(__file__).parent.parent.parent.parent)
 if project_root not in sys.path:
     sys.path.append(project_root)
@@ -26,7 +26,7 @@ from agent.prompt import *
 nest_asyncio.apply()
 
 
-# 避免LLM API调用时打印retry日志
+# Avoid printing retry logs during LLM API calls
 def delete_all_loggers():
     import logging
 
@@ -122,12 +122,12 @@ class ActionManager:
         )
 
     async def __aenter__(self):
-        """异步上下文管理器的进入方法"""
+        """Async context manager entry"""
         await self.initialize()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """异步上下文管理器的退出方法"""
+        """Async context manager exit"""
         if self.agent:
             self.agent = None
 
@@ -142,7 +142,7 @@ class ActionManager:
         self.server_manager = None
 
     async def initialize(self):
-        """初始化 MCP 服务器和 Agent"""
+        """Initialize MCP servers and Agent"""
         with open(self.config_path, "r", encoding="utf-8") as f:
             config_data = yaml.safe_load(f)
 
@@ -166,11 +166,11 @@ class ActionManager:
             print(f"Warning: Error during cleanup: {e}")
 
     async def step(self, query_info, root_cause, mode="exploit"):
-        """分析慢查询并生成修复操作的工作流"""
+        """Analyze slow query and generate fix action workflow"""
         if not self.agent:
             await self.initialize()
 
-        # 动态workflow:
+        # Dynamic workflow:
         # 1. information collect
         # 2. match_history
         # 3. action_define
@@ -187,21 +187,21 @@ class ActionManager:
 
         action_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
 
-        # 提取fix action和rewrite sql
+        # Extract fix action and rewrite sql
         fix_action, rewrite_sql = self.extract_fix_action(action_result)
 
-        # 进行action验证
+        # Validate action
         evaluation_result = await self.evaluate_action(fix_action, rewrite_sql, query_info)
 
         reward = evaluation_result.get("status", 0)
         case = positives + negatives
 
-        # 保存经验（与检索模式无关，仅根据enable_save_samples判断）
+        # Save experience (independent of retrieval mode, only based on enable_save_samples)
         if self.memory_manager.enable_save_samples and case:
             for case_info in case:
                 self.memory_manager.save_experience(query_info.__dict__, case_info, reward)
 
-        # 只在动态检索模式下更新经验池和网络
+        # Only update experience pool and network in dynamic retrieval mode
         if self.memory_manager.retrieval_mode == "dynamic" and case:
             for case_info in case:
                 self.memory_manager.retriever.add_experience(query_info.__dict__, case_info, reward)
@@ -225,10 +225,10 @@ class ActionManager:
                     cur.execute("SET statement_timeout = 0")
                     cur.execute(f"DROP INDEX IF EXISTS {index_name}")
                 self.db.connection.commit()
-                print(f"已撤销索引: {index_name}")
+                print(f"Rolled back index: {index_name}")
             except Exception as e:
                 self.db.connection.rollback()
-                print(f"撤销索引失败: {e}")
+                print(f"Failed to rollback index: {e}")
 
         # undo all knob settings
         for knob_name in knob_names:
@@ -237,29 +237,29 @@ class ActionManager:
                     cur.execute("SET statement_timeout = 0")
                     cur.execute(f"RESET {knob_name};")
                 self.db.connection.commit()
-                print(f"{knob_name} 已恢复默认值")
+                print(f"{knob_name} restored to default value")
             except Exception as e:
                 self.db.connection.rollback()
-                print(f"恢复{knob_name}失败: {e}")
+                print(f"Failed to restore {knob_name}: {e}")
 
     async def evaluate_action(self, fix_action, rewrite_sql, query_info):
         """
-        1. 检测修复操作能否执行：不能执行，返回让大模型重新生成
-        2. 检测修复操作前后结果是否一致：不一致，返回让大模型重新生成
-        3. 检测修复操作是否带来性能提升
+        1. Check if fix action can be executed: if not, return to let LLM regenerate
+        2. Check if results before and after fix action are consistent: if not, return to let LLM regenerate
+        3. Check if fix action brings performance improvement
         """
-        # 在执行前对 fix_action / rewrite_sql 进行预处理，得到最终 fix_action 与初始 fix_sql
+        # Preprocess fix_action / rewrite_sql before execution to get final fix_action and initial fix_sql
         fix_action, fix_sql = await self.derive_fix_action_and_sql(fix_action, rewrite_sql, query_info.query)
 
-        print("execute fix_action")
+        print("Executing fix_action")
 
-        # 1. 检查修复SQL能否执行（如有 DDL/SET 等修复，需先执行）
+        # 1. Check if fix SQL can be executed (if there are DDL/SET fixes, need to execute first)
         if fix_action != "":
             success, _, _, err = self.db.execute(fix_action, timeout=self.fix_timeout)
         else:
             success = True
             err = ""
-        print("execute fix_action done")
+        print("Fix_action execution completed")
 
         retry_count = 0
         max_retry = 5
@@ -276,7 +276,7 @@ class ActionManager:
         if not success:
             return {
                 "status": -1,
-                "msg": f"SQL修复失败: {fix_action}, 错误: {err}",
+                "msg": f"SQL fix failed: {fix_action}, error: {err}",
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": self.sql_timeout,
@@ -284,10 +284,10 @@ class ActionManager:
 
         old_time = query_info.execution_time
 
-        print("execute performance test")
-        # 执行性能测试
+        print("Executing performance test")
+        # Execute performance test
         success, _, new_time, err = self.db.execute(fix_sql, timeout=self.sql_timeout)
-        print("execute performance test done")
+        print("Performance test completed")
 
         if fix_action != "":
             index_names = self.extract_index_names(fix_action)
@@ -298,24 +298,24 @@ class ActionManager:
             if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):
                 return {
                     "status": 0,
-                    "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s",
+                    "msg": f"Fix ineffective, performance not improved or degraded, original time {old_time:.4f}s, new time {new_time:.4f}s",
                     "fix_action": fix_action,
                     "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                     "new_time": new_time,
                 }
             return {
                 "status": -1,
-                "msg": f"性能测试SQL执行失败: {err}",
+                "msg": f"Performance test SQL execution failed: {err}",
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": self.sql_timeout,
             }
 
-        # 4. 性能对比与后续处理
+        # 4. Performance comparison and subsequent processing
         if (old_time - new_time) / old_time > 0.1:
             return {
                 "status": 1,
-                "msg": f"修复成功，性能提升，耗时由{old_time:.4f}s降至{new_time:.4f}s",
+                "msg": f"Fix successful, performance improved, time reduced from {old_time:.4f}s to {new_time:.4f}s",
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": new_time,
@@ -323,7 +323,7 @@ class ActionManager:
         else:
             return {
                 "status": 0,
-                "msg": f"修复无效，性能未提升或下降，原耗时{old_time:.4f}s，新耗时{new_time:.4f}s",
+                "msg": f"Fix ineffective, performance not improved or degraded, original time {old_time:.4f}s, new time {new_time:.4f}s",
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": new_time,
@@ -428,13 +428,13 @@ class ActionManager:
 
         base_action_space = build_action_space_prompt(root_causes, self.db, knob_config, current_knob_values, query_info)
 
-        # Action Pruning: 基于历史同根因案例避免无效操作
+        # Action Pruning: Avoid ineffective operations based on historical cases with same root cause
         pruning_guidance = self.action_pruning(root_causes, query_info)
 
-        # Action Refinement: 基于历史同根因案例指导有效搜索方向
+        # Action Refinement: Guide effective search direction based on historical cases with same root cause
         refinement_guidance = self.action_refinement(root_causes, query_info)
 
-        # 整合pruning和refinement指导到action space
+        # Integrate pruning and refinement guidance into action space
         enhanced_action_space = self._integrate_pruning_and_refinement(base_action_space, pruning_guidance, refinement_guidance)
 
         return enhanced_action_space
@@ -469,31 +469,31 @@ class ActionManager:
         """
         Retrieve historical fix_actions with the same root cause from memory_manager, extract failed index names
         """
-        # 获取同根因的历史案例
+        # Get historical cases with same root cause
         target_root = self.memory_manager._normalize_root_causes(root_causes)
         target_island_ids = list(self.memory_manager.islands.get(target_root, set()))
 
         if not target_island_ids:
             return set()
 
-        # 获取同根因的案例
+        # Get cases with same root cause
         same_root_cases = self.memory_manager.ids_to_cases(target_island_ids)
 
-        # 进一步筛选同SQL的案例
+        # Further filter cases with same SQL
         query_id = query_info.query_id
         same_sql_cases = []
         for case in same_root_cases:
             if case.case_info.get("query_info").get("query_id") == query_id:
                 same_sql_cases.append(case)
 
-        # 如果没有同SQL的案例，使用所有同根因的案例
+        # If no cases with same SQL, use all cases with same root cause
         if not same_sql_cases:
             return set()
 
-        # 提取失败的索引名称
+        # Extract failed index names
         failed_index_actions = set()
         for case in same_sql_cases:
-            # 只处理negative cases或性能没有提升的案例
+            # Only process negative cases or cases with no performance improvement
             case_label = case.case_info.get("label")
             if case_label == "negative":
                 fix_action = case.case_info.get("fix_action")
@@ -523,13 +523,13 @@ class ActionManager:
             return []
 
         failed_rules = set()
-        # 使用当前查询作为原始查询（同SQL案例的原始查询应该是相同的）
+        # Use current query as original query (original queries of same SQL cases should be identical)
         original_query = query_info.query
 
         for case in same_sql_cases:
             case_label = case.case_info.get("label")
             if case_label == "negative":
-                # 获取历史案例中的改写后查询
+                # Get rewritten query from historical case
                 rewritten_query = case.case_info.get("query_info").get("query")
 
                 rule_matcher = SQLRuleMatcher()
@@ -579,9 +579,9 @@ class ActionManager:
 
         same_root_cases = self.memory_manager.ids_to_cases(target_island_ids)
 
-        # 使用embedding相似度检索相似SQL案例
+        # Use embedding similarity to retrieve similar SQL cases
         similar_cases = self.memory_manager.retrieve_embedding(query_info, top_n=50)
-        # 过滤出同根因的相似案例
+        # Filter similar cases with same root cause
         similar_same_root_cases = []
         for case in similar_cases:
             case_root = self.memory_manager._normalize_root_causes(case.case_info.get("root_causes"))
@@ -591,14 +591,14 @@ class ActionManager:
         if not similar_same_root_cases:
             return ""
 
-        # 过滤出approve_time > 0的案例
+        # Filter cases with approve_time > 0
         positive_cases = []
         for case in similar_same_root_cases:
             approve_time = case.case_info.get("approve_time")
             if approve_time and approve_time > 0:
                 positive_cases.append(case)
 
-        # 需要cases大于指定数量才提供建议
+        # Need cases greater than specified threshold to provide suggestions
         if len(positive_cases) < min_threshold:
             return ""
 
@@ -616,13 +616,13 @@ class ActionManager:
             if len(values) < min_threshold:
                 continue
 
-            # 找到最大值和最小值
+            # Find maximum and minimum values
             min_value = min(values)
             max_value = max(values)
 
             guidance.append(f"- Knob '{knob_name}': Recommended range [{min_value}, {max_value}],  Based on {len(values)} successful historical cases")
 
-        if len(guidance) <= 1:  # 只有标题，没有具体建议
+        if len(guidance) <= 1:  # Only title, no specific suggestions
             return ""
         else:
             return "\n".join(guidance)
@@ -760,7 +760,7 @@ class ActionManager:
 
     def _integrate_pruning_and_refinement(self, base_action_space, pruning_guidance, refinement_guidance):
         """
-        将pruning和refinement指导整合到action space中
+        Integrate pruning and refinement guidance into action space
         """
         enhanced_space = base_action_space
 
@@ -813,17 +813,17 @@ class ActionManager:
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)
         # print(f"prompt: {prompt}")
-        # print("prompt已生成")
+        # print("Prompt generated")
         result = await Runner.run(starting_agent=self.agent, input=prompt)
         return result.final_output
 
     def extract_fix_action(self, action_result):
-        """从action_result中提取fix_action和rewrite_sql"""
+        """Extract fix_action and rewrite_sql from action_result"""
         explanation, fix_action, is_rewrite = self.parse_action_result(action_result)
-        print("diagnosis output:")
-        print("explanation:", explanation)
-        print("fix_action:", fix_action)
-        print("is_rewrite:", is_rewrite)
+        print("Diagnosis output:")
+        print("Explanation:", explanation)
+        print("Fix action:", fix_action)
+        print("Is rewrite:", is_rewrite)
         if is_rewrite == "yes":
             fix_action, rewrite_sql = self.parse_query_rewrite(fix_action)
             return fix_action, rewrite_sql
@@ -831,15 +831,15 @@ class ActionManager:
             return fix_action, ""
 
     def parse_action_result(self, diagnosis):
-        # extract Explanation
+        # Extract Explanation
         explanation_match = re.search(r"Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)", diagnosis, re.IGNORECASE)
         explanation = explanation_match.group(1).strip() if explanation_match else ""
 
-        # extract FIX_ACTION
+        # Extract FIX_ACTION
         fix_match = re.search(r"Fix_Action:\s*([\s\S]+?)Query_Rewrite:", diagnosis, re.IGNORECASE)
         fix_action = fix_match.group(1).strip() if fix_match else ""
 
-        # extract Query_Rewrite
+        # Extract Query_Rewrite
         is_rewrite_match = re.search(r"Query_Rewrite:\s*(yes|no)", diagnosis, re.IGNORECASE)
         is_rewrite = is_rewrite_match.group(1).strip() if is_rewrite_match else ""
 

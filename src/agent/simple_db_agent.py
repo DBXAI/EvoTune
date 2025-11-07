@@ -206,7 +206,7 @@ class SimpleDBAgent:
 
             # Check timeout
             if elapsed_time >= duration * 3600:
-                logger.info(f"Reached timeout {duration}s, stopping optimization")
+                logger.info(f"Reached timeout {duration}h, stopping optimization")
                 break
 
             round_idx += 1
@@ -335,7 +335,7 @@ class SimpleDBAgent:
         final_time = time.time()
         total_elapsed = final_time - start_time
         logger.info("=== Optimization Complete ===")
-        logger.info(f"Total time: {total_elapsed:.2f}s (timeout limit: {duration}s)")
+        logger.info(f"Total time: {total_elapsed:.2f}s (timeout limit: {duration}h)")
         logger.info(f"Completed rounds: {round_idx}")
         logger.info(f"Best SQL execution times: {best_sql_times}")
         logger.info(f"Workload best total execution time: {sum(best_sql_times.values()):.4f}s")

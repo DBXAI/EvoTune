@@ -169,13 +169,13 @@ class Planner:
         # }
 
     def predict(self, query_info, state, memory_manager):
-        # 若已有 current_root，则直接复用；否则调用小模型+LLM 获取新的根因
+        # If current_root already exists, reuse it; otherwise call small model + LLM to get new root cause
         current_root = state.get("current_root")
         if current_root is None:
-            # 小模型初判 + 置信度
+            # Small model initial prediction + confidence
             model_out = self.model_predict(query_info)
             current_root = model_out.get("root_causes")
-            print("小模型预测根因: ", current_root)
+            print("Small model predicted root cause: ", current_root)
             pred_opt = model_out.get("pred_label_opt")
             labels = [
                 "missing indexes",
@@ -186,12 +186,12 @@ class Planner:
             confidence = np.array(pred_opt).reshape(-1)
             state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
 
-        # 将当前根因和置信度传给LLM
-        # 构建按根因聚合的历史成功/失败计数
+        # Pass current root cause and confidence to LLM
+        # Build historical success/failure counts aggregated by root cause
         tuning_history = []
         union_keys = set(state.get("attempts", {}).keys()) | set(state.get("successes", {}).keys())
         for k in union_keys:
-            # 归一化为 frozenset 或单元素集合
+            # Normalize to frozenset or single element set
             label = list(k)
             tuning_history.append(
                 {

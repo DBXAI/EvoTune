@@ -11,10 +11,10 @@ from typing import Any, Dict, List
 from agent.db_agent import DBAgent
 from utils.types import AnomalyInfo, QueryInfo
 
-# 给慢SQL打标签
+# Label slow SQL
 # python label_slow_sql.py
 
-# 假设根因列表与原有一致
+# Assume root cause list is consistent with original
 ROOT_CAUSES = [
     "under-optimized join order",
     "inappropriate knob settings",
@@ -24,13 +24,13 @@ ROOT_CAUSES = [
     "poorly written queries",
 ]
 
-# 使用相对路径，基于项目根目录
+# Use relative path based on project root directory
 project_root = Path(__file__).parent.parent
-INPUT_CSV = str(project_root / "test_sql_gen" / "tpch_detailed1.csv")  # 输入文件名
-OUTPUT_CSV = "slow_sql_labeled.csv"  # 输出文件名
+INPUT_CSV = str(project_root / "test_sql_gen" / "tpch_detailed1.csv")  # Input file name
+OUTPUT_CSV = "slow_sql_labeled.csv"  # Output file name
 
 
-# 读取慢SQL
+# Read slow SQL
 def read_slow_sqls(csv_path: str) -> List[Dict[str, Any]]:
     sqls = []
     with open(csv_path, "r", encoding="utf-8") as f:
@@ -43,16 +43,16 @@ def read_slow_sqls(csv_path: str) -> List[Dict[str, Any]]:
 async def label_slow_sqls():
     agent = DBAgent()
     slow_sqls = read_slow_sqls(INPUT_CSV)
-    # 打开csv，写入表头
+    # Open CSV and write header
     with open(OUTPUT_CSV, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["query", "opt_rate_label"])
         writer.writeheader()
         for idx, sql_row in enumerate(slow_sqls):
-            print(f"处理第{idx+1}/{len(slow_sqls)}条慢SQL...")
+            print(f"Processing {idx+1}/{len(slow_sqls)} slow SQL...")
             time_ratios = []
             for cause_id, cause in enumerate(ROOT_CAUSES):
-                print(f"处理第{idx+1}/{len(slow_sqls)}条慢SQL，假设根因：{cause}...")
-                # 构造query_info/anomaly_info，假设字段名与主流程一致
+                print(f"Processing {idx+1}/{len(slow_sqls)} slow SQL, assuming root cause: {cause}...")
+                # Construct query_info/anomaly_info, assume field names are consistent with main process
                 query_info = {
                     "query_id": sql_row.get("index_x", str(idx)),
                     "query": sql_row["query"],
@@ -62,11 +62,11 @@ async def label_slow_sqls():
                     "execution_time": float(sql_row.get("duration", 0)),
                 }
 
-                # 反序列化 timeseries 字段
+                # Deserialize timeseries field
                 try:
                     kpis_list = json.loads(query_info["query_kpis"])
                 except Exception as e:
-                    print(f"timeseries 解析失败: {query_info['query_kpis']}, error: {e}")
+                    print(f"Failed to parse timeseries: {query_info['query_kpis']}, error: {e}")
                     kpis_list = [[0.0], [0.0], [0.0], [0.0]]
 
                 metrics = {
@@ -75,11 +75,11 @@ async def label_slow_sqls():
                     "io_wait": kpis_list[2] if len(kpis_list) > 2 else [],
                     "network_traffic": kpis_list[3] if len(kpis_list) > 3 else [],
                 }
-                # 解析日志信息
+                # Parse log information
                 try:
                     log_all = json.loads(query_info["log_all"])
                 except Exception as e:
-                    print(f"log_all 解析失败: {query_info['log_all']}, error: {e}")
+                    print(f"Failed to parse log_all: {query_info['log_all']}, error: {e}")
                     log_all = [0, 0, 0]
                 log_info = {
                     "read_rows": log_all[0] if len(log_all) > 0 else 0,
@@ -97,12 +97,12 @@ async def label_slow_sqls():
                     "log_info": log_info,
                 }
 
-                # 这里强制指定根因
+                # Force specify root cause here
                 analysis_result = {
                     "root_cause": cause,
                 }
 
-                # 构造输入对象进行类型检查
+                # Construct input objects for type checking
                 query = QueryInfo(
                     query_id=query_info["query_id"],
                     query=query_info["query"],
@@ -117,15 +117,15 @@ async def label_slow_sqls():
                     log_info=anomaly_info["log_info"],
                 )
 
-                # action_manager生成修复SQL
+                # action_manager generates fix SQL
                 historical_data = []
                 action_results = await agent.action_manager.analyze_and_act(analysis_result, query, anomaly, historical_data)
                 diagnosis = action_results.get("diagnosis", "")
                 sql_fixes = agent.extract_sql_fix(diagnosis)
                 if not sql_fixes:
-                    time_ratio = 0.0  # 无法修复，优化率为0
+                    time_ratio = 0.0  # Cannot fix, optimization rate is 0
                 else:
-                    # 评估修复效果
+                    # Evaluate fix effectiveness
                     evaluation = await agent.planner.evaluate_action(sql_fixes, cause, query, simulation_mode=True)
                     msg = evaluation[1]
                     print(f"msg: {msg}")
@@ -150,9 +150,9 @@ async def label_slow_sqls():
                     else:
                         time_ratio = 0.0
                 time_ratios.append(round(time_ratio, 4))
-            # 立即写入一条记录
+            # Write record immediately
             writer.writerow({"query": sql_row["query"], "opt_rate_label": str(time_ratios)})
-            print(f"已写入: query={sql_row['query'][:50]}..., opt_rate_label={time_ratios}")
+            print(f"Written: query={sql_row['query'][:50]}..., opt_rate_label={time_ratios}")
     await agent.cleanup()
 
 
