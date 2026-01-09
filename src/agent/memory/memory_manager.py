@@ -39,7 +39,7 @@ class MemoryCase:
 
 
 class MemoryManager:
-    def __init__(self, config, predictor=None):
+    def __init__(self, config, predictor=None, planner_config=None):
         self.db_path = config.get("db_path")
         self.archive_size = config.get("archive_size")
         self.cases = {}
@@ -55,6 +55,7 @@ class MemoryManager:
 
         self.bce_weight = config.get("bce_weight")
         self.contrastive_weight = config.get("contrastive_weight")
+        self.lambda_neg = config.get("lambda_neg", 1.0)
 
         self.bert_model_path = config.get("bert_model_path")
 
@@ -83,6 +84,7 @@ class MemoryManager:
         self.islands[normal_island_key] = set()
 
         self._rcrank_predictor = predictor
+        self._planner_config = planner_config  # Store planner config for lazy initialization
 
         # Initialize soft Q retriever
         self.retriever = SoftQRetriever(memory_manager=self)
@@ -145,8 +147,10 @@ class MemoryManager:
         batch_size,
         bce_weight=0.7,
         contrastive_weight=0.3,
+        lambda_neg=1.0,
     ):
         # Use the hybrid loss (BCE + supervised contrastive learning) to finetune the RCRank model
+        # According to paper: L_total = λ₁ * L_b + λ₂ * L_c
         os.makedirs(output_dir, exist_ok=True)
 
         train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(csv_path, batch_size=batch_size, device=device)
@@ -164,75 +168,101 @@ class MemoryManager:
         # BCE loss function
         bce_loss_fn = nn.BCELoss(reduction="mean")
 
-        def enhanced_supcon_loss(emb, labels, case_labels, temperature=0.07):
+        def enhanced_supcon_loss(emb, labels, case_labels, temperature=0.07, lambda_neg=1.0):
             """
-            Enhanced supervised contrastive learning loss:
-            - Pull closer: samples with correct root causes (positive cases)
-            - Push away: samples with wrong root causes (negative cases)
+            Supervised contrastive learning loss according to paper:
+            - Positive pairs P: both positive cases sharing the same bottleneck (root cause)
+            - Negative pairs N = N1 ∪ N2:
+              - N1: positive-negative pairs with same predicted bottleneck
+              - N2: positive-positive pairs with different bottlenecks
+            
+            Loss: L_c = -1/|P| * sum_{(i,j) in P} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
+                  + λ * 1/|N| * sum_{(i,j) in N} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
 
             Args:
                 emb: [B, D] - sample embeddings
                 labels: [B, K] - multi-label one-hot vectors (root cause labels)
                 case_labels: [B] - case labels ("positive" or "negative")
-                temperature: temperature parameter
+                temperature: temperature parameter τ
+                lambda_neg: weight λ for negative pairs
             """
             emb = F.normalize(emb, dim=1)
+            # Compute similarity matrix: s_ij = e_i^T e_j / τ
             logits = torch.div(torch.matmul(emb, emb.T), temperature)  # [B, B]
 
             # Mask: exclude self
             self_mask = torch.eye(logits.size(0), dtype=torch.bool, device=logits.device)
-
-            # Build positive and negative sample masks
-            batch_size = emb.size(0)
-            pos_mask = torch.zeros_like(logits, dtype=torch.bool)
-            neg_mask = torch.zeros_like(logits, dtype=torch.bool)
-
-            for i in range(batch_size):
-                for j in range(batch_size):
-                    if i == j:
-                        continue
-
-                    # Positive samples: both are positive cases and share root cause
-                    if case_labels[i] == "positive" and case_labels[j] == "positive" and (labels[i] @ labels[j]) > 0:
-                        pos_mask[i, j] = True
-
-                    # Negative samples: one is positive and one is negative, or both are negative
-                    elif (case_labels[i] == "positive" and case_labels[j] == "negative") or (case_labels[i] == "negative" and case_labels[j] == "positive") or (case_labels[i] == "negative" and case_labels[j] == "negative"):
-                        neg_mask[i, j] = True
-
-            # Denominator mask: exclude self
             logits_mask = ~self_mask
 
-            # Stabilization
+            # Stabilization: subtract max for numerical stability
             logits_max, _ = torch.max(logits.masked_fill(~logits_mask, float("-inf")), dim=1, keepdim=True)
             logits = logits - logits_max.detach()
             exp_logits = torch.exp(logits) * logits_mask.float()
 
-            # Calculate positive sample loss (pull closer correct root causes)
+            batch_size = emb.size(0)
+            
+            # Build positive pairs P: both positive and share same bottleneck
+            # P = {(i,j) | L_i = L_j = positive, B_i = B_j}
+            pos_mask = torch.zeros_like(logits, dtype=torch.bool)
+            for i in range(batch_size):
+                for j in range(batch_size):
+                    if i == j:
+                        continue
+                    # Both positive and share at least one root cause
+                    if (case_labels[i] == "positive" and case_labels[j] == "positive" and 
+                        (labels[i] @ labels[j]) > 0):
+                        pos_mask[i, j] = True
+
+            # Build negative pairs N = N1 ∪ N2
+            neg_mask = torch.zeros_like(logits, dtype=torch.bool)
+            for i in range(batch_size):
+                for j in range(batch_size):
+                    if i == j:
+                        continue
+                    
+                    # N1: positive-negative pairs with same predicted bottleneck
+                    # N1 = {(i,j) | L_i = positive, L_j = negative, B_i = B_j}
+                    if ((case_labels[i] == "positive" and case_labels[j] == "negative") or
+                        (case_labels[i] == "negative" and case_labels[j] == "positive")):
+                        # Check if they share the same predicted bottleneck
+                        if (labels[i] @ labels[j]) > 0:
+                            neg_mask[i, j] = True
+                    
+                    # N2: positive-positive pairs with different bottlenecks
+                    # N2 = {(i,j) | L_i = L_j = positive, B_i ≠ B_j}
+                    elif (case_labels[i] == "positive" and case_labels[j] == "positive"):
+                        # Different bottlenecks: no shared root cause
+                        if (labels[i] @ labels[j]) == 0:
+                            neg_mask[i, j] = True
+
+            # Calculate positive pairs loss: -1/|P| * sum log(exp(s_ij) / sum_k exp(s_ik))
             pos_loss = 0.0
-            pos_count = 0
+            pos_pairs_count = 0
             for i in range(batch_size):
                 if pos_mask[i].any():
-                    pos_exp_logits = exp_logits[i][pos_mask[i]]
-                    pos_loss += -torch.log(pos_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
-                    pos_count += 1
+                    # For each positive pair (i,j), compute log(exp(s_ij) / sum_{k≠i} exp(s_ik))
+                    for j in range(batch_size):
+                        if pos_mask[i, j]:
+                            pos_loss += -torch.log(exp_logits[i, j] / (exp_logits[i].sum() + 1e-12) + 1e-12)
+                            pos_pairs_count += 1
 
-            # Calculate negative sample loss (push away wrong root causes)
+            # Calculate negative pairs loss: λ * 1/|N| * sum log(exp(s_ij) / sum_k exp(s_ik))
             neg_loss = 0.0
-            neg_count = 0
+            neg_pairs_count = 0
             for i in range(batch_size):
                 if neg_mask[i].any():
-                    neg_exp_logits = exp_logits[i][neg_mask[i]]
-                    # Negative sample loss: hope negative samples have minimal similarity
-                    neg_loss += torch.log(neg_exp_logits.sum() / exp_logits[i].sum() + 1e-12)
-                    neg_count += 1
+                    # For each negative pair (i,j), compute log(exp(s_ij) / sum_{k≠i} exp(s_ik))
+                    for j in range(batch_size):
+                        if neg_mask[i, j]:
+                            neg_loss += torch.log(exp_logits[i, j] / (exp_logits[i].sum() + 1e-12) + 1e-12)
+                            neg_pairs_count += 1
 
-            # Combine losses
+            # Combine losses according to paper formula
             total_loss = 0.0
-            if pos_count > 0:
-                total_loss += pos_loss / pos_count
-            if neg_count > 0:
-                total_loss += neg_loss / neg_count
+            if pos_pairs_count > 0:
+                total_loss += pos_loss / pos_pairs_count
+            if neg_pairs_count > 0:
+                total_loss += lambda_neg * neg_loss / neg_pairs_count
 
             return total_loss if total_loss > 0 else torch.tensor(0.0, device=emb.device, requires_grad=True)
 
@@ -244,11 +274,17 @@ class MemoryManager:
             bce_weight=0.7,
             contrastive_weight=0.3,
             temperature=0.07,
+            lambda_neg=1.0,
         ):
             """
-            Hybrid loss: L_total = λ₁ * L_BCE + λ₂ * L_Enhanced_Contrastive
+            Hybrid loss according to paper: L_total = λ₁ * L_b + λ₂ * L_c
+            
+            Where:
+            - L_b: BCE loss for positive cases only
+            - L_c: Supervised contrastive loss with positive and negative pairs
             """
-            # 1. BCE classification loss (only calculated for positive cases, negative case labels are wrong)
+            # 1. BCE classification loss (only calculated for positive cases)
+            # L_b = -1/|D_pos| * sum_{i in D_pos} sum_{r=1}^R [y_{i,r} * log(ŷ_{i,r}) + (1-y_{i,r}) * log(1-ŷ_{i,r})]
             positive_mask = torch.tensor([label == "positive" for label in case_labels], device=pred_label.device)
             if positive_mask.any():
                 # Only calculate BCE loss for positive cases
@@ -259,10 +295,12 @@ class MemoryManager:
                 # If no positive cases, BCE loss is 0
                 bce_loss = torch.tensor(0.0, device=pred_label.device, requires_grad=True)
 
-            # 2. Enhanced supervised contrastive learning loss (pull closer correct root causes, push away wrong root causes)
-            contrastive_loss = enhanced_supcon_loss(emb, labels, case_labels, temperature)
+            # 2. Supervised contrastive learning loss
+            # L_c = -1/|P| * sum_{(i,j) in P} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
+            #      + λ * 1/|N| * sum_{(i,j) in N} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
+            contrastive_loss = enhanced_supcon_loss(emb, labels, case_labels, temperature, lambda_neg)
 
-            # 3. Weighted combination
+            # 3. Weighted combination: L_total = λ₁ * L_b + λ₂ * L_c
             total_loss = bce_weight * bce_loss + contrastive_weight * contrastive_loss
 
             return total_loss, bce_loss, contrastive_loss
@@ -320,6 +358,7 @@ class MemoryManager:
                         bce_weight,
                         contrastive_weight,
                         temperature,
+                        lambda_neg,
                     )
                     epoch_bce_loss += bce_loss.item()
                     epoch_contrastive_loss += contrastive_loss.item()
@@ -377,6 +416,7 @@ class MemoryManager:
             self.finetune_batch_size,
             self.bce_weight,
             self.contrastive_weight,
+            self.lambda_neg,
         )
 
         # reload predictor
@@ -727,7 +767,15 @@ class MemoryManager:
         if not hasattr(self, "_rcrank_predictor") or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
 
-            self._rcrank_predictor = RCRankPredictor(device="cpu")
+            if self._planner_config is None:
+                self._planner_config = {
+                    "device": "cpu",
+                    "model_path": "/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
+                    "train_data_path": "/root/DREAM/src/agent/plan/slow_sql_data_gen.csv",
+                    "opt_threshold": 0.5,
+                    "num_classes": 4
+                }
+            self._rcrank_predictor = RCRankPredictor(self._planner_config)
         predictor = self._rcrank_predictor
 
         import pandas as pd

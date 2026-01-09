@@ -107,6 +107,11 @@ class ActionManager:
         self.config_path = self.agent_config.get("action_server_config")
         self.fix_timeout = self.agent_config.get("fix_timeout")
 
+        # Ablation experiment parameters
+        self.enable_retrieval = self.agent_config.get("enable_retrieval", True)
+        self.enable_action_define = self.agent_config.get("enable_action_define", True)
+        self.enable_action_pruning = self.agent_config.get("enable_action_pruning", True)
+
         self.api_settings = self.configs.get("API_SETTINGS")
 
         if self.api_settings:
@@ -180,9 +185,15 @@ class ActionManager:
         database_config = self.configs.get("DATABASE_CONFIG")
         base_info = diagnose_tools.base_information_collect(query_info, database_config)
 
-        retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
-        positives = retrieval.get("positive", [])
-        negatives = retrieval.get("negative", [])
+        # Retrieve cases based on enable_retrieval flag
+        if self.enable_retrieval:
+            retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
+            positives = retrieval.get("positive", [])
+            negatives = retrieval.get("negative", [])
+        else:
+            positives = []
+            negatives = []
+
         action_space = await self.action_space_collect(root_cause, query_info)
 
         action_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
@@ -423,19 +434,25 @@ class ActionManager:
         """
         Dynamically collect action space, perform pruning and refinement based on historical cases
         """
-        knob_config = self.configs.get("KNOB_CONFIG")
-        current_knob_values = self.db.get_current_knob_values(knob_config)
-
-        base_action_space = build_action_space_prompt(root_causes, self.db, knob_config, current_knob_values, query_info)
+        # Build base action space based on enable_action_define flag
+        if self.enable_action_define:
+            knob_config = self.configs.get("KNOB_CONFIG")
+            current_knob_values = self.db.get_current_knob_values(knob_config)
+            base_action_space = build_action_space_prompt(root_causes, self.db, knob_config, current_knob_values, query_info)
+        else:
+            # No action define: provide basic action space without database information
+            base_action_space = self._build_basic_action_space(root_causes)
 
         # Action Pruning: Avoid ineffective operations based on historical cases with same root cause
-        pruning_guidance = self.action_pruning(root_causes, query_info)
-
-        # Action Refinement: Guide effective search direction based on historical cases with same root cause
-        refinement_guidance = self.action_refinement(root_causes, query_info)
-
-        # Integrate pruning and refinement guidance into action space
-        enhanced_action_space = self._integrate_pruning_and_refinement(base_action_space, pruning_guidance, refinement_guidance)
+        if self.enable_action_pruning:
+            pruning_guidance = self.action_pruning(root_causes, query_info)
+            # Action Refinement: Guide effective search direction based on historical cases with same root cause
+            refinement_guidance = self.action_refinement(root_causes, query_info)
+            # Integrate pruning and refinement guidance into action space
+            enhanced_action_space = self._integrate_pruning_and_refinement(base_action_space, pruning_guidance, refinement_guidance)
+        else:
+            # No pruning: return base action space without pruning and refinement
+            enhanced_action_space = base_action_space
 
         return enhanced_action_space
 
@@ -758,6 +775,56 @@ class ActionManager:
 
         return hints
 
+    def _build_basic_action_space(self, root_causes):
+        """
+        Build basic action space without database information (for no_action_define ablation)
+        """
+        root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
+        action_space_prompt = ""
+
+        # Index related
+        if "missing indexes" in root_causes:
+            action_space_prompt += """
+    • Index Space: 
+    - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx.
+    - Index creation should be strictly guided by the slow_sql queries.
+    - Consider the query execution plan to identify missing indexes that could improve performance.
+    - Avoid generating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
+    - Use CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS to create or drop indexes.
+    """
+
+        # Knob related
+        if "inappropriate query knobs" in root_causes:
+            action_space_prompt += """
+    • Knob Space:  
+    - You can adjust database configuration parameters using SET knob = value.
+    - Focus on parameters that can improve query performance.
+    - Be conservative with changes to avoid system instability.
+    - Use SET statement to modify database knobs.
+    """
+
+        # Execution plan/optimizer related
+        if "suboptimal plan optimizer" in root_causes:
+            action_space_prompt += """
+    • Plan Optimizer Space: 
+    - Use PostgreSQL comment-style hints to guide query execution.
+    - Output ONLY the hint block like: /*+ Set(knob_name value) Set(knob_name value) ... */
+    - Do NOT include the SQL query when using hints.
+    - Use hints to force specific join methods, scan types, etc.
+    """
+
+        # SQL readability/rewrite related
+        if "poorly written queries" in root_causes:
+            action_space_prompt += """
+    • Query Rewrite Space: 
+    - Query Rewrite need to generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query while improving performance.
+    - Ensure the rewritten query maintains identical result set and semantic equivalence.
+    - Prioritize rules that reduce computational complexity, eliminate redundant operations, or optimize data access patterns.
+    - The final output must be a complete, executable SQL statement that preserves all original query semantics while demonstrating measurable performance improvements.
+    """
+
+        return action_space_prompt
+
     def _integrate_pruning_and_refinement(self, base_action_space, pruning_guidance, refinement_guidance):
         """
         Integrate pruning and refinement guidance into action space
@@ -769,13 +836,6 @@ class ActionManager:
 
         if refinement_guidance:
             enhanced_space += f"\n\n{refinement_guidance}"
-
-        # if pruning_guidance or refinement_guidance:
-        #     enhanced_space += "\n\n## Comprehensive Optimization Strategy"
-        #     enhanced_space += "\n- Prioritize operation types and strategies from historical success cases"
-        #     enhanced_space += "\n- Avoid operation types and strategies from historical failure cases"
-        #     enhanced_space += "\n- Refine and innovate within successful areas, rather than completely copying"
-        #     enhanced_space += "\n- Adjust historical success strategies based on current query characteristics"
 
         return enhanced_space
 
@@ -812,8 +872,6 @@ class ActionManager:
 
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)
-        # print(f"prompt: {prompt}")
-        # print("Prompt generated")
         result = await Runner.run(starting_agent=self.agent, input=prompt)
         return result.final_output
 

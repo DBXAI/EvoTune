@@ -221,9 +221,9 @@ def main():
 
 # cd /root/DREAM/src/agent/memory
 # python train_retriever_offline.py \
-#     --samples_path experience/retriever_samples.jsonl \
-#     --model_save_path model/soft_q_retriever.pt \
-#     --config_path ../../../config/base_config.json \
+#     --samples_path experience/retriever_samples_tpch.jsonl \
+#     --model_save_path model/soft_q_retriever_tpch.pt \
+#     --config_path ../../../config/tpch_config.json \
 #     --epochs 10 \
 #     --batch_size 32 \
 #     --learning_rate 0.0001

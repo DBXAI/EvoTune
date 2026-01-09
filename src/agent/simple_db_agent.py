@@ -25,7 +25,6 @@ from utils.types import QueryInfo
 
 logger = logging.getLogger(__name__)
 
-# Ensure logger inherits root logger configuration
 logger.setLevel(logging.INFO)
 logger.propagate = True
 

@@ -94,6 +94,7 @@
     "model_output_dir": "/root/DREAM/src/agent/plan/model_res",
     "bce_weight": 0.7,
     "contrastive_weight": 0.3,
+    "lambda_neg": 1.0,
     "enable_finetune": true,
     "retrieval_mode": "dynamic",
     "enable_save_samples": true,

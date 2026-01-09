@@ -26,7 +26,7 @@ class Planner:
         self.memory_manager = memory_manager
         self.predictor = predictor
         self.agent_config = agent_config
-        self.device = predictor.device
+        self.device = predictor.device if predictor is not None else "cpu"
 
         # Initialize encoding components
         self.encoding = Encoding(None, {"NA": 0})

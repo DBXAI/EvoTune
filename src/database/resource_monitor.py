@@ -57,15 +57,26 @@ class ResourceMonitor:
         x_new = np.linspace(0, 1, target_len)
         return np.interp(x_new, x_old, arr).tolist()
 
-    def get_monitor_data(self, process_len=9):
-        [proc.join() for proc in self.processes]
-        # cpu = list(self.cpu_usage_seq)
-        # io_read = list(self.io_read_seq)
-        # io_write = list(self.io_write_seq)
-        # mem_virtual = list(self.mem_virtual_usage_seq)
-        # mem_physical = list(self.mem_physical_usage_seq)
-        # net_recv = list(self.net_recv_seq)
-        # net_sent = list(self.net_sent_seq)
+    def _wait_for_processes(self, timeout=10):
+        for proc in self.processes:
+            if proc.is_alive():
+                proc.join(timeout=timeout)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=2)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join()
+
+    def _sleep_with_check(self, duration):
+        """使用更短的sleep间隔，以便更快响应终止信号"""
+        for _ in range(int(duration * 10)):
+            if not self.alive.value:
+                return
+            time.sleep(0.1)
+
+    def get_monitor_data(self, process_len=9, timeout=10):
+        self._wait_for_processes(timeout)
 
         cpu = self.resample(list(self.cpu_usage_seq), process_len)
         io_read = self.resample(list(self.io_read_seq), process_len)
@@ -77,8 +88,8 @@ class ResourceMonitor:
 
         return cpu, io_read, io_write, mem_virtual, mem_physical, net_recv, net_sent
 
-    def get_monitor_data_avg(self):
-        [proc.join() for proc in self.processes]
+    def get_monitor_data_avg(self, timeout=10):
+        self._wait_for_processes(timeout)
         cpu = list(self.cpu_usage_seq)
         mem_virtual = list(self.mem_virtual_usage_seq)
         mem_physical = list(self.mem_physical_usage_seq)
@@ -108,7 +119,7 @@ class ResourceMonitor:
         count = 0
         while self.alive.value and count < self.ticks:
             if count < self.warmup:
-                time.sleep(self.interval)
+                self._sleep_with_check(self.interval)
                 count = count + 1
                 continue
             if self.process is None:
@@ -127,19 +138,21 @@ class ResourceMonitor:
                 ):
                     self.mem_physical_usage_seq.append(0.0)
                     self.mem_virtual_usage_seq.append(0.0)
-            time.sleep(self.interval)
+            self._sleep_with_check(self.interval)
             count += 1
 
     def monitor_io_usage(self):
         count = 0
         while self.alive.value and count < self.ticks:
             if count < self.warmup:
-                time.sleep(self.interval)
+                self._sleep_with_check(self.interval)
                 count = count + 1
                 continue
             try:
                 sp1 = psutil.disk_io_counters()
-                time.sleep(self.interval)
+                self._sleep_with_check(self.interval)
+                if not self.alive.value:
+                    return
                 sp2 = psutil.disk_io_counters()
                 self.io_read_seq.append((sp2[2] - sp1[2]) / (1024.0 * 1024.0))
                 self.io_write_seq.append((sp2[3] - sp1[3]) / (1024.0 * 1024.0))
@@ -157,13 +170,15 @@ class ResourceMonitor:
         count = 0
         while self.alive.value and count < self.ticks:
             if count < self.warmup:
-                time.sleep(self.interval)
+                self._sleep_with_check(self.interval)
                 count = count + 1
                 continue
             if self.process is None:
                 self.cpu_usage_seq.append(0.0)
             else:
                 try:
+                    # cpu_percent 的 interval 参数会阻塞，但这是必要的
+                    # 如果 alive 被设置为 False，下次循环时会退出
                     cpu = self.process.cpu_percent(interval=self.interval)
                     self.cpu_usage_seq.append(cpu)
                 except (
@@ -178,12 +193,14 @@ class ResourceMonitor:
         count = 0
         while self.alive.value and count < self.ticks:
             if count < self.warmup:
-                time.sleep(self.interval)
+                self._sleep_with_check(self.interval)
                 count = count + 1
                 continue
             try:
                 net1 = psutil.net_io_counters()
-                time.sleep(self.interval)
+                self._sleep_with_check(self.interval)
+                if not self.alive.value:
+                    return
                 net2 = psutil.net_io_counters()
                 self.net_recv_seq.append((net2.bytes_recv - net1.bytes_recv) / (1024.0 * 1024.0))
                 self.net_sent_seq.append((net2.bytes_sent - net1.bytes_sent) / (1024.0 * 1024.0))
@@ -199,3 +216,7 @@ class ResourceMonitor:
 
     def terminate(self):
         self.alive.value = False
+        time.sleep(0.1)
+        for proc in self.processes:
+            if proc.is_alive():
+                proc.terminate()

@@ -90,16 +90,12 @@ class PostgresDB:
 
                 for i, stmt in enumerate(statements):
                     if self.is_select_statement(stmt):
-                        # print(f"执行SELECT语句 {i+1}: {stmt[:100]}...")
                         cursor.execute(f"SET statement_timeout = {timeout * 1000}")
                         cursor.execute(stmt)
 
                         select_results = cursor.fetchall()
                         if len(cursor.description) == 1:
                             select_results = [row[0] for row in select_results]
-
-                        # print("result:", select_results)
-                        # print(f"SELECT语句返回 {len(select_results)} 行结果")
 
                     else:
                         # Execute non-SELECT statements (e.g., CREATE VIEW, DROP VIEW)
@@ -120,7 +116,6 @@ class PostgresDB:
                         return json.dumps(select_results, ensure_ascii=False)
                     return select_results
                 else:
-                    # print("未找到SELECT语句，返回空结果")
                     return []
 
             except psycopg.errors.QueryCanceled as e:
@@ -335,11 +330,6 @@ class PostgresDB:
     def get_pid(self):
         pid = self.fetch_results("SELECT pg_backend_pid();")
         return pid[0]
-
-    # def get_pid(self, data_dir="/var/lib/postgresql/14/main"):
-    #     with open(os.path.join(data_dir, "postmaster.pid")) as f:
-    #         pid = int(f.readline().strip())
-    #     return pid
 
     def get_metrics(self, sql, interval=1, warmup=0, duration=20):
         pid = self.get_pid()
@@ -560,18 +550,31 @@ class PostgresDB:
         monitor = ResourceMonitor(pid, interval, warmup, timeout)
         monitor.run()
 
-        _, _, execution_time, _ = self.execute(sql, timeout=timeout)
-
-        monitor.terminate()
-        (
-            cpu_usage,
-            read_io,
-            write_io,
-            virtual_memory,
-            physical_memory,
-            net_recv,
-            net_sent,
-        ) = monitor.get_monitor_data()
+        try:
+            _, _, execution_time, _ = self.execute(sql, timeout=timeout)
+        finally:
+            monitor.terminate()
+        
+        try:
+            (
+                cpu_usage,
+                read_io,
+                write_io,
+                virtual_memory,
+                physical_memory,
+                net_recv,
+                net_sent,
+            ) = monitor.get_monitor_data(timeout=10)
+        except Exception as e:
+            print(f"Warning: Failed to get monitor data: {e}")
+            cpu_usage = [0.0] * 9
+            read_io = [0.0] * 9
+            write_io = [0.0] * 9
+            virtual_memory = [0.0] * 9
+            physical_memory = [0.0] * 9
+            net_recv = [0.0] * 9
+            net_sent = [0.0] * 9
+        
         metrics = [
             cpu_usage,
             read_io,
@@ -734,52 +737,3 @@ class PostgresDB:
         except Exception as e:
             print(f"Error comparing SQL results: {e}")
             return False
-
-    # def compare_sql_results(self, sql1, sql2):
-    #     """
-    #     判断两个SQL语句的输出结果是否完全一致（包括内容和重复行）。
-    #     返回True表示完全一致，False表示不一致。
-    #     """
-    #     try:
-    #         # 清理SQL，去除注释、多余空白和结尾分号
-    #         def clean_sql(sql):
-    #             # 去除注释
-    #             lines = sql.split('\n')
-    #             cleaned_lines = []
-    #             for line in lines:
-    #                 # 去除行内注释
-    #                 if '--' in line:
-    #                     line = line.split('--')[0]
-    #                 cleaned_lines.append(line.strip())
-
-    #             # 合并并清理
-    #             sql = ' '.join(cleaned_lines)
-    #             # 去除多余空白
-    #             sql = ' '.join(sql.split())
-    #             # 去除结尾分号
-    #             sql = sql.rstrip(';')
-    #             return sql
-
-    #         sql1 = clean_sql(sql1)
-    #         sql2 = clean_sql(sql2)
-
-    #         conn = self.connect()
-
-    #         # 构建EXCEPT查询，确保SQL语法正确
-    #         except1 = f"SELECT * FROM ({sql1}) AS t1 EXCEPT ALL SELECT * FROM ({sql2}) AS t2"
-    #         except2 = f"SELECT * FROM ({sql2}) AS t2 EXCEPT ALL SELECT * FROM ({sql1}) AS t1"
-
-    #         with conn.cursor() as cursor:
-    #             cursor.execute(except1)
-    #             diff1 = cursor.fetchall()
-    #             cursor.execute(except2)
-    #             diff2 = cursor.fetchall()
-
-    #         return len(diff1) == 0 and len(diff2) == 0
-
-    #     except Exception as e:
-    #         print(f"比较SQL结果时出错: {e}")
-    #         print(f"SQL1: {sql1}")
-    #         print(f"SQL2: {sql2}")
-    #         # 如果比较失败，返回False表示结果不一致
-    #         return False

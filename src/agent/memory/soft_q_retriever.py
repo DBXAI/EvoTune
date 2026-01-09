@@ -156,6 +156,9 @@ class SoftQRetriever:
         # Select TopK
         selected_cases = case_values[:top_k]
 
+        # print the selected cases
+        # print(f"Selected cases: {selected_cases}")
+
         # Return cases and probabilities (network already outputs softmax probability)
         result = []
         for case_info, probability in selected_cases:
