@@ -56,6 +56,15 @@ class MemoryManager:
         self.bce_weight = config.get("bce_weight")
         self.contrastive_weight = config.get("contrastive_weight")
         self.lambda_neg = config.get("lambda_neg", 1.0)
+        
+        # Exploration threshold for verified supervision
+        self.eta = config.get("eta", 3)  # Minimum exploration threshold η
+        
+        # Contrastive loss negative pair weights: λ_4 < λ_3 < λ_2 < λ_1
+        self.lambda_1 = config.get("lambda_1", 1.0)  # N1: uncertain negatives (insufficient exploration)
+        self.lambda_2 = config.get("lambda_2", 0.8)   # N2: verified negatives (sufficient exploration)
+        self.lambda_3 = config.get("lambda_3", 0.5)   # N3: verified negatives (different bottlenecks)
+        self.lambda_4 = config.get("lambda_4", 0.2)   # N4: remaining pairs
 
         self.bert_model_path = config.get("bert_model_path")
 
@@ -117,6 +126,22 @@ class MemoryManager:
             label_vec = [1 if r in roots else 0 for r in label_space]
 
             duration = info.get("new_time", 0.0)
+            
+            # Get tuning attempts per component: n_{i,b}
+            # tuning_attempts is a dict mapping component (root_cause_type) to number of attempts
+            tuning_attempts = info.get("tuning_attempts", {})
+            if not tuning_attempts or not isinstance(tuning_attempts, dict):
+                # Fallback: if positive case, assume at least 1 attempt per root cause component
+                # For negative cases, assume 0 attempts (unverified)
+                tuning_attempts = {}
+                if info.get("label") == "positive":
+                    for rc in roots:
+                        if rc in label_space:
+                            tuning_attempts[rc] = tuning_attempts.get(rc, 0) + 1
+            
+            # Build attempts vector: [n_{i,b}] for each component b in label_space
+            attempts_vec = [tuning_attempts.get(rc, 0) for rc in label_space]
+            
             rows.append(
                 {
                     "sql_file": self.db_path,
@@ -128,6 +153,7 @@ class MemoryManager:
                     "duration": duration,
                     "error": None,
                     "case_label": info.get("label", "positive"),
+                    "tuning_attempts": json.dumps(attempts_vec),  # n_{i,b} for each component b
                 }
             )
         return pd.DataFrame(rows)
@@ -149,8 +175,8 @@ class MemoryManager:
         contrastive_weight=0.3,
         lambda_neg=1.0,
     ):
-        # Use the hybrid loss (BCE + supervised contrastive learning) to finetune the RCRank model
-        # According to paper: L_total = λ₁ * L_b + λ₂ * L_c
+        # Use the hybrid loss (Masked BCE + enhanced contrastive learning) to finetune the RCRank model
+        # According to paper: L_total = λ_b * L_b + λ_c * L_c
         os.makedirs(output_dir, exist_ok=True)
 
         train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(csv_path, batch_size=batch_size, device=device)
@@ -164,143 +190,246 @@ class MemoryManager:
         model.train()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)  # Important parameter, try 1e-4 or 3e-4
         temperature = 0.07
+        eta = self.eta  # Minimum exploration threshold
 
-        # BCE loss function
-        bce_loss_fn = nn.BCELoss(reduction="mean")
-
-        def enhanced_supcon_loss(emb, labels, case_labels, temperature=0.07, lambda_neg=1.0):
+        def masked_bce_loss(pred_label, labels, case_labels, tuning_attempts, eta, device):
             """
-            Supervised contrastive learning loss according to paper:
-            - Positive pairs P: both positive cases sharing the same bottleneck (root cause)
-            - Negative pairs N = N1 ∪ N2:
-              - N1: positive-negative pairs with same predicted bottleneck
-              - N2: positive-positive pairs with different bottlenecks
+            Masked Binary Cross-Entropy Loss according to paper:
+            L_b(B) = -1/(sum m_{i,b}) * sum_{i,b} m_{i,b} [Y_{i,b}*log(Ŷ_{i,b}) + (1-Y_{i,b})*log(1-Ŷ_{i,b})]
             
-            Loss: L_c = -1/|P| * sum_{(i,j) in P} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
-                  + λ * 1/|N| * sum_{(i,j) in N} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
+            Supervision mask m_{i,b}:
+            - If case_label is "positive": m_{i,b} = 1 for all components (entire label vector is kept)
+            - If case_label is "negative": 
+              - m_{i,b} = 1 if n_{i,b} >= η (verified negative, keep this component)
+              - m_{i,b} = 0 if n_{i,b} < η (unverified negative, mask this component)
+            
+            Args:
+                pred_label: [B, K] - predicted probabilities
+                labels: [B, K] - true labels (multi-label)
+                case_labels: [B] - case labels ("positive" or "negative")
+                tuning_attempts: [B, K] - number of tuning attempts n_{i,b} for each component
+                eta: minimum exploration threshold η
+                device: device for tensors
+            """
+            batch_size = pred_label.size(0)
+            num_components = pred_label.size(1)
+            
+            # Convert case_labels to boolean tensor
+            is_positive_case = torch.tensor(
+                [label == "positive" for label in case_labels],
+                device=device,
+                dtype=torch.bool
+            )  # [B]
+            
+            # Initialize supervision mask
+            supervision_mask = torch.zeros_like(pred_label, dtype=torch.bool, device=device)  # [B, K]
+            
+            # For positive cases: all components are kept (m_{i,b} = 1 for all b)
+            for i in range(batch_size):
+                if is_positive_case[i]:
+                    supervision_mask[i, :] = True
+                else:
+                    # For negative cases: keep only components where n_{i,b} >= η
+                    supervision_mask[i, :] = tuning_attempts[i, :] >= eta
+            
+            # If no valid supervision, return zero loss
+            if not supervision_mask.any():
+                return torch.tensor(0.0, device=device, requires_grad=True)
+            
+            # Compute BCE loss only for masked positions
+            bce_per_element = -(
+                labels * torch.log(pred_label + 1e-12) + 
+                (1 - labels) * torch.log(1 - pred_label + 1e-12)
+            )
+            
+            # Apply mask and compute mean
+            masked_bce = bce_per_element * supervision_mask.float()
+            total_mask_sum = supervision_mask.float().sum()
+            
+            if total_mask_sum > 0:
+                loss = masked_bce.sum() / total_mask_sum
+            else:
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            return loss
 
+        def enhanced_contrastive_loss(emb, labels, case_labels, tuning_attempts, temperature, eta, lambda_1, lambda_2, lambda_3, lambda_4, device):
+            """
+            Enhanced contrastive learning loss according to paper:
+            L_c(B) = -1/|I_B| * sum_{i in I_B} (1/|P(i)|) * sum_{j in P(i)} log(exp(s_ij/τ) / sum_{t=1}^4 sum_{k in N_t(i)} λ_t * exp(s_ik/τ))
+            
+            Positive pairs P(i): {j | Y_j=1, B_i=B_j} (both positive, same bottleneck)
+            
+            Negative pairs:
+            - N1(i): {j | Y_j=0, B_i=B_j, n_j < η} (uncertain negatives, insufficient exploration)
+            - N2(i): {j | Y_j=0, B_i=B_j, n_j >= η} (verified negatives, sufficient exploration)
+            - N3(i): {j | Y_j=1, B_i∩B_j=∅} (verified negatives, different bottlenecks)
+            - N4(i): I_B \ (P(i) ∪ N1(i) ∪ N2(i) ∪ N3(i)) (remaining pairs)
+            
+            Weights: λ_4 < λ_3 < λ_2 < λ_1
+            
             Args:
                 emb: [B, D] - sample embeddings
                 labels: [B, K] - multi-label one-hot vectors (root cause labels)
                 case_labels: [B] - case labels ("positive" or "negative")
+                tuning_attempts: [B, K] - number of tuning attempts n_{i,b}
                 temperature: temperature parameter τ
-                lambda_neg: weight λ for negative pairs
+                eta: minimum exploration threshold η
+                lambda_1, lambda_2, lambda_3, lambda_4: weights for negative pair types
+                device: device for tensors
             """
+            batch_size = emb.size(0)
             emb = F.normalize(emb, dim=1)
-            # Compute similarity matrix: s_ij = e_i^T e_j / τ
-            logits = torch.div(torch.matmul(emb, emb.T), temperature)  # [B, B]
-
+            
+            # Compute similarity matrix: s_ij = (e_i^T e_j) / (||e_i|| ||e_j||)
+            # Since embeddings are normalized, s_ij = e_i^T e_j
+            similarity_matrix = torch.matmul(emb, emb.T)  # [B, B]
+            
+            # Scale by temperature: s_ij / τ
+            logits = similarity_matrix / temperature  # [B, B]
+            
             # Mask: exclude self
-            self_mask = torch.eye(logits.size(0), dtype=torch.bool, device=logits.device)
+            self_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
             logits_mask = ~self_mask
-
+            
             # Stabilization: subtract max for numerical stability
             logits_max, _ = torch.max(logits.masked_fill(~logits_mask, float("-inf")), dim=1, keepdim=True)
             logits = logits - logits_max.detach()
-            exp_logits = torch.exp(logits) * logits_mask.float()
-
-            batch_size = emb.size(0)
+            exp_logits = torch.exp(logits) * logits_mask.float()  # [B, B]
             
-            # Build positive pairs P: both positive and share same bottleneck
-            # P = {(i,j) | L_i = L_j = positive, B_i = B_j}
-            pos_mask = torch.zeros_like(logits, dtype=torch.bool)
+            # Convert case_labels to boolean tensor
+            is_positive = torch.tensor(
+                [label == "positive" for label in case_labels], 
+                device=device, 
+                dtype=torch.bool
+            )  # [B]
+            
+            # Compute bottleneck sets for each sample
+            # B_i is the set of components where labels[i, b] = 1
+            bottleneck_sets = labels > 0.5  # [B, K] boolean
+            
+            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            valid_anchors = 0
+            
             for i in range(batch_size):
+                # Only compute loss for positive anchors
+                if not is_positive[i]:
+                    continue
+                
+                valid_anchors += 1
+                B_i = bottleneck_sets[i]  # [K] boolean vector
+                
+                # Build positive pairs P(i): {j | Y_j=1, B_i=B_j}
+                P_i = []
                 for j in range(batch_size):
                     if i == j:
                         continue
-                    # Both positive and share at least one root cause
-                    if (case_labels[i] == "positive" and case_labels[j] == "positive" and 
-                        (labels[i] @ labels[j]) > 0):
-                        pos_mask[i, j] = True
-
-            # Build negative pairs N = N1 ∪ N2
-            neg_mask = torch.zeros_like(logits, dtype=torch.bool)
-            for i in range(batch_size):
+                    if is_positive[j]:
+                        B_j = bottleneck_sets[j]
+                        # Check if B_i = B_j (same bottleneck set)
+                        if torch.equal(B_i, B_j):
+                            P_i.append(j)
+                
+                if len(P_i) == 0:
+                    continue
+                
+                # Build negative pairs
+                N1_i = []  # {j | Y_j=0, B_i=B_j, n_j < η}
+                N2_i = []  # {j | Y_j=0, B_i=B_j, n_j >= η}
+                N3_i = []  # {j | Y_j=1, B_i∩B_j=∅}
+                N4_i = []  # remaining pairs
+                
                 for j in range(batch_size):
                     if i == j:
                         continue
                     
-                    # N1: positive-negative pairs with same predicted bottleneck
-                    # N1 = {(i,j) | L_i = positive, L_j = negative, B_i = B_j}
-                    if ((case_labels[i] == "positive" and case_labels[j] == "negative") or
-                        (case_labels[i] == "negative" and case_labels[j] == "positive")):
-                        # Check if they share the same predicted bottleneck
-                        if (labels[i] @ labels[j]) > 0:
-                            neg_mask[i, j] = True
+                    B_j = bottleneck_sets[j]
+                    # Check if B_i = B_j (same bottleneck set)
+                    same_bottleneck = torch.equal(B_i, B_j)
+                    # Check if B_i ∩ B_j = ∅ (no shared components)
+                    no_intersection = (B_i & B_j).sum() == 0
                     
-                    # N2: positive-positive pairs with different bottlenecks
-                    # N2 = {(i,j) | L_i = L_j = positive, B_i ≠ B_j}
-                    elif (case_labels[i] == "positive" and case_labels[j] == "positive"):
-                        # Different bottlenecks: no shared root cause
-                        if (labels[i] @ labels[j]) == 0:
-                            neg_mask[i, j] = True
-
-            # Calculate positive pairs loss: -1/|P| * sum log(exp(s_ij) / sum_k exp(s_ik))
-            pos_loss = 0.0
-            pos_pairs_count = 0
-            for i in range(batch_size):
-                if pos_mask[i].any():
-                    # For each positive pair (i,j), compute log(exp(s_ij) / sum_{k≠i} exp(s_ik))
-                    for j in range(batch_size):
-                        if pos_mask[i, j]:
-                            pos_loss += -torch.log(exp_logits[i, j] / (exp_logits[i].sum() + 1e-12) + 1e-12)
-                            pos_pairs_count += 1
-
-            # Calculate negative pairs loss: λ * 1/|N| * sum log(exp(s_ij) / sum_k exp(s_ik))
-            neg_loss = 0.0
-            neg_pairs_count = 0
-            for i in range(batch_size):
-                if neg_mask[i].any():
-                    # For each negative pair (i,j), compute log(exp(s_ij) / sum_{k≠i} exp(s_ik))
-                    for j in range(batch_size):
-                        if neg_mask[i, j]:
-                            neg_loss += torch.log(exp_logits[i, j] / (exp_logits[i].sum() + 1e-12) + 1e-12)
-                            neg_pairs_count += 1
-
-            # Combine losses according to paper formula
-            total_loss = 0.0
-            if pos_pairs_count > 0:
-                total_loss += pos_loss / pos_pairs_count
-            if neg_pairs_count > 0:
-                total_loss += lambda_neg * neg_loss / neg_pairs_count
-
-            return total_loss if total_loss > 0 else torch.tensor(0.0, device=emb.device, requires_grad=True)
+                    if not is_positive[j] and same_bottleneck:
+                        # N1: {j | Y_j=0, B_i=B_j, n_j < η}
+                        # N2: {j | Y_j=0, B_i=B_j, n_j >= η}
+                        # Check exploration threshold: for all b in B_i, check if n_{j,b} >= η
+                        # Get attempts for components in B_i
+                        attempts_for_B_i = tuning_attempts[j][B_i]
+                        # If all components in B_i have attempts >= eta, it's N2, else N1
+                        if (attempts_for_B_i >= eta).all():
+                            N2_i.append(j)
+                        else:
+                            N1_i.append(j)
+                    elif is_positive[j] and no_intersection:
+                        N3_i.append(j)
+                    else:
+                        # Remaining pairs
+                        N4_i.append(j)
+                
+                # Compute denominator: sum_{t=1}^4 sum_{k in N_t(i)} λ_t * exp(s_ik/τ)
+                denominator = torch.tensor(0.0, device=device)
+                for k in N1_i:
+                    denominator = denominator + lambda_1 * exp_logits[i, k]
+                for k in N2_i:
+                    denominator = denominator + lambda_2 * exp_logits[i, k]
+                for k in N3_i:
+                    denominator = denominator + lambda_3 * exp_logits[i, k]
+                for k in N4_i:
+                    denominator = denominator + lambda_4 * exp_logits[i, k]
+                
+                # Add small epsilon for numerical stability
+                denominator = denominator + 1e-12
+                
+                # Compute loss for each positive pair
+                pair_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                for j in P_i:
+                    numerator = exp_logits[i, j]
+                    pair_loss = pair_loss + (-torch.log(numerator / denominator))
+                
+                # Average over positive pairs
+                if len(P_i) > 0:
+                    total_loss = total_loss + (pair_loss / len(P_i))
+            
+            # Average over valid anchors
+            if valid_anchors > 0:
+                return total_loss / valid_anchors
+            else:
+                return torch.tensor(0.0, device=device, requires_grad=True)
 
         def hybrid_loss(
             emb,
             labels,
             pred_label,
             case_labels,
+            tuning_attempts,
             bce_weight=0.7,
             contrastive_weight=0.3,
             temperature=0.07,
-            lambda_neg=1.0,
+            eta=3,
+            lambda_1=1.0,
+            lambda_2=0.8,
+            lambda_3=0.5,
+            lambda_4=0.2,
         ):
             """
-            Hybrid loss according to paper: L_total = λ₁ * L_b + λ₂ * L_c
+            Hybrid loss according to paper: L(B) = λ_b * L_b(B) + λ_c * L_c(B)
             
             Where:
-            - L_b: BCE loss for positive cases only
-            - L_c: Supervised contrastive loss with positive and negative pairs
+            - L_b: Masked Binary Cross-Entropy loss with supervision mask
+            - L_c: Enhanced contrastive learning loss with 4 types of negative pairs
             """
-            # 1. BCE classification loss (only calculated for positive cases)
-            # L_b = -1/|D_pos| * sum_{i in D_pos} sum_{r=1}^R [y_{i,r} * log(ŷ_{i,r}) + (1-y_{i,r}) * log(1-ŷ_{i,r})]
-            positive_mask = torch.tensor([label == "positive" for label in case_labels], device=pred_label.device)
-            if positive_mask.any():
-                # Only calculate BCE loss for positive cases
-                positive_pred = pred_label[positive_mask]
-                positive_labels = labels[positive_mask]
-                bce_loss = bce_loss_fn(positive_pred, positive_labels)
-            else:
-                # If no positive cases, BCE loss is 0
-                bce_loss = torch.tensor(0.0, device=pred_label.device, requires_grad=True)
+            device = pred_label.device
+            
+            # 1. Masked BCE classification loss
+            bce_loss = masked_bce_loss(pred_label, labels, case_labels, tuning_attempts, eta, device)
 
-            # 2. Supervised contrastive learning loss
-            # L_c = -1/|P| * sum_{(i,j) in P} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
-            #      + λ * 1/|N| * sum_{(i,j) in N} log(exp(s_ij) / sum_{k≠i} exp(s_ik))
-            contrastive_loss = enhanced_supcon_loss(emb, labels, case_labels, temperature, lambda_neg)
+            # 2. Enhanced contrastive learning loss
+            contrastive_loss = enhanced_contrastive_loss(
+                emb, labels, case_labels, tuning_attempts, 
+                temperature, eta, lambda_1, lambda_2, lambda_3, lambda_4, device
+            )
 
-            # 3. Weighted combination: L_total = λ₁ * L_b + λ₂ * L_c
+            # 3. Weighted combination: L_total = λ_b * L_b + λ_c * L_c
             total_loss = bce_weight * bce_loss + contrastive_weight * contrastive_loss
 
             return total_loss, bce_loss, contrastive_loss
@@ -328,6 +457,25 @@ class MemoryManager:
                 else:
                     # If no case_label column, use default value
                     case_labels = ["positive"] * len(sql_texts)
+                
+                # Get tuning_attempts n_{i,b} for each component
+                if "tuning_attempts" in batch:
+                    # Parse JSON string if needed
+                    tuning_attempts_list = batch["tuning_attempts"]
+                    if isinstance(tuning_attempts_list[0], str):
+                        tuning_attempts_list = [json.loads(ta) for ta in tuning_attempts_list]
+                    tuning_attempts = torch.tensor(tuning_attempts_list, device=device, dtype=torch.float32)  # [B, K]
+                else:
+                    # Default fallback when tuning_attempts are not available
+                    # For positive labels: assume at least 1 attempt (verified)
+                    # For negative labels with positive case_label: assume at least 1 attempt (tried but failed)
+                    # For negative labels with negative case_label: assume 0 attempts (unverified)
+                    default_attempts = labels.clone()  # Start with labels as base
+                    for i, case_label in enumerate(case_labels):
+                        if case_label == "positive" and labels[i].sum() == 0:
+                            # Positive case but no positive labels - assume at least 1 attempt per component
+                            default_attempts[i] = torch.ones_like(default_attempts[i])
+                    tuning_attempts = default_attempts.to(device)
 
                 # Text encoding
                 sql = predictor.tokenizer(
@@ -355,10 +503,15 @@ class MemoryManager:
                         labels,
                         pred_label,
                         case_labels,
+                        tuning_attempts,
                         bce_weight,
                         contrastive_weight,
                         temperature,
-                        lambda_neg,
+                        eta,
+                        self.lambda_1,
+                        self.lambda_2,
+                        self.lambda_3,
+                        self.lambda_4,
                     )
                     epoch_bce_loss += bce_loss.item()
                     epoch_contrastive_loss += contrastive_loss.item()
@@ -384,6 +537,7 @@ class MemoryManager:
             from agent.plan.online_predict import RCRankPredictor
 
             self._rcrank_predictor = RCRankPredictor(model_path=model_path, train_data_path=stats_data_path, device=device)
+            self._rcrank_predictor.model.eval()
             return
 
         predictor = self._rcrank_predictor
@@ -477,8 +631,32 @@ class MemoryManager:
                     data_to_save[cid] = case.case_info
                 json.dump(data_to_save, f)
 
-    def save_case(self, query_info, fix_action, root_causes, old_time, new_time, label):
+    def save_case(self, query_info, fix_action, root_causes, old_time, new_time, label, tuning_attempts=None):
+        """
+        Save a case to memory
+        
+        Args:
+            query_info: Query information
+            fix_action: Fix action applied
+            root_causes: Root causes (list or single value)
+            old_time: Original execution time
+            new_time: New execution time after fix
+            label: "positive" or "negative"
+            tuning_attempts: Dict[str, int] mapping component (root_cause_type) to number of attempts n_{i,b}
+                           If None, will be estimated from root_causes
+        """
         approve_time = old_time - new_time
+
+        # If tuning_attempts not provided, estimate from root_causes
+        if tuning_attempts is None:
+            tuning_attempts = {}
+            # If positive case, assume at least 1 attempt for each root cause component
+            if label == "positive":
+                root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
+                for rc in root_causes_list:
+                    if rc in self.root_cause_types:
+                        tuning_attempts[rc] = tuning_attempts.get(rc, 0) + 1
+            # For negative cases, we can't reliably estimate, so leave as empty dict
 
         case_info = {
             "query_info": query_info.__dict__,
@@ -488,6 +666,7 @@ class MemoryManager:
             "new_time": new_time,
             "label": label,
             "approve_time": approve_time,
+            "tuning_attempts": tuning_attempts,
         }
 
         case = MemoryCase(
@@ -523,9 +702,9 @@ class MemoryManager:
                 positive_cases = [c for c in self.cases.values() if c.case_info.get("label") == "positive"]
                 positive_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
                 self.archive = set([c.id for c in positive_cases[: self.archive_size]])
-            self._last_finetune_count = len(self.cases)
-            # self._last_finetune_count = 0
-            # self._maybe_finetune()
+            # self._last_finetune_count = len(self.cases)
+            self._last_finetune_count = 0
+            self._maybe_finetune()
         else:
             self._last_finetune_count = 0
 

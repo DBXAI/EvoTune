@@ -137,8 +137,8 @@ class Planner:
         # issue type mapping
         issue_types = {
             0: "missing indexes",
-            1: "inappropriate query knobs",
-            2: "suboptimal plan optimizer",
+            1: "suboptimal plan optimizer",
+            2: "inappropriate query knobs",
             3: "poorly written queries",
             4: "normal",
         }
@@ -179,8 +179,8 @@ class Planner:
             pred_opt = model_out.get("pred_label_opt")
             labels = [
                 "missing indexes",
-                "inappropriate query knobs",
                 "suboptimal plan optimizer",
+                "inappropriate query knobs",
                 "poorly written queries",
             ]
             confidence = np.array(pred_opt).reshape(-1)

@@ -272,74 +272,51 @@ class DBAgent:
                         "confidence": {},
                         "attempts": {},
                         "successes": {},
+                        "component_attempts": {},
                     }
 
                 state = sql_root_cause_states[query_id]
 
-                # # Predict root cause
-                # logger.info(f"SQL {query_id} starting root cause prediction")
-                # # Save state backup for exception recovery
-                # state_backup = copy.deepcopy(state)
-                # try:
-                #     predicted_root, state = self.planner.predict(query_info, state, self.memory_manager)
-                # except Exception as e:
-                #     logger.error(f"SQL {query_id} error during root cause prediction: {e}", exc_info=True)
-                #     sql_root_cause_states[query_id] = state_backup
-                #     round_sql_times[query_id] = query_info.execution_time
-                #     round_sql_actions[query_id] = ""
-                #     logger.info(f"SQL {query_id} skipping current SQL, continuing to next")
-                #     continue
+                # Predict root cause
+                logger.info(f"SQL {query_id} starting root cause prediction")
+                # Save state backup for exception recovery
+                state_backup = copy.deepcopy(state)
+                try:
+                    predicted_root, state = self.planner.predict(query_info, state, self.memory_manager)
+                except Exception as e:
+                    logger.error(f"SQL {query_id} error during root cause prediction: {e}", exc_info=True)
+                    sql_root_cause_states[query_id] = state_backup
+                    round_sql_times[query_id] = query_info.execution_time
+                    round_sql_actions[query_id] = ""
+                    logger.info(f"SQL {query_id} skipping current SQL, continuing to next")
+                    continue
 
-                # # Check if execution time < 1s and predicted root cause is normal, skip to next SQL
-                # predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)
-                # # normal_root_key = self.memory_manager._normalize_root_causes(["normal"])
-                # # if query_info.execution_time < 1.0 and predicted_root_key == normal_root_key:
-                # #     logger.info(f"SQL {query_id} execution time ({query_info.execution_time}s) < 1s and predicted root cause is normal, skipping to next SQL")
-                # #     round_sql_times[query_id] = query_info.execution_time
-                # #     round_sql_actions[query_id] = ""
-                # #     if query_info.execution_time < best_sql_times[query_id]:
-                # #         best_sql_times[query_id] = query_info.execution_time
-                # #         best_sql_actions[query_id] = ""
-                # #         best_sql_texts[query_id] = query_info.query
-                # #     sql_root_cause_states[query_id] = state
-                # #     continue
+                # Check if predicted root cause is already in root_tried
+                predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)
+                if predicted_root_key in state["root_tried"]:
+                    logger.info(f"SQL {query_id} predicted root cause already in root_tried, forcing exploration mode")
+                    state["mode"] = "explore"
+                else:
+                    # Dynamic epsilon-greedy decision
+                    state["mode"] = self.decide_exploration_mode(query_info, predicted_root, state)
+                    logger.info(f"SQL {query_id} dynamic epsilon decision")
 
-                # # Check if predicted root cause is already in root_tried
-                # if predicted_root_key in state["root_tried"]:
-                #     logger.info(f"SQL {query_id} predicted root cause already in root_tried, forcing exploration mode")
-                #     state["mode"] = "explore"
-                # else:
-                #     # Dynamic epsilon-greedy decision
-                #     state["mode"] = self.decide_exploration_mode(query_info, predicted_root, state)
-                #     logger.info(f"SQL {query_id} dynamic epsilon decision")
-
-                # if state["mode"] == "explore":
-                #     logger.info(f"SQL {query_id} entering exploration mode (archive similar root causes)")
-                #     exclude = {str(self.memory_manager._normalize_root_causes(k)) for k in state["root_tried"]}
-                #     next_root = self.memory_manager.explore_root_from_archive(query_info, exclude_roots=exclude)
-                #     if not next_root:
-                #         all_roots = [list(r) for r in self.memory_manager.island_keys]  # List[List[str]]
-                #         candidates = [r for r in all_roots if str(self.memory_manager._normalize_root_causes(r)) not in exclude]
-                #         if candidates == []:
-                #             logger.info(f"SQL {query_id} all root causes have been explored, ending exploration")
-                #             continue
-                #         else:
-                #             next_root = random.choice(candidates)
-                #     state["current_root"] = next_root
-                # else:
-                #     logger.info(f"SQL {query_id} entering exploitation mode (using predicted root cause)")
-                #     state["current_root"] = predicted_root
-                
-                # 新增代码
-                # Force root cause to be index and knob, disable exploration
-                # 强制指定根因为 index 和 knob，禁用探索模式
-                forced_root_causes = ["missing indexes", "inappropriate query knobs"]
-                logger.info(f"SQL {query_id} using forced root causes: {forced_root_causes} (exploration disabled)")
-                
-                # Force mode to exploit (no exploration)
-                state["mode"] = "exploit"
-                state["current_root"] = forced_root_causes
-                ##########################################
+                if state["mode"] == "explore":
+                    logger.info(f"SQL {query_id} entering exploration mode (archive similar root causes)")
+                    exclude = {str(self.memory_manager._normalize_root_causes(k)) for k in state["root_tried"]}
+                    next_root = self.memory_manager.explore_root_from_archive(query_info, exclude_roots=exclude)
+                    if not next_root:
+                        all_roots = [list(r) for r in self.memory_manager.island_keys]  # List[List[str]]
+                        candidates = [r for r in all_roots if str(self.memory_manager._normalize_root_causes(r)) not in exclude]
+                        if candidates == []:
+                            logger.info(f"SQL {query_id} all root causes have been explored, ending exploration")
+                            continue
+                        else:
+                            next_root = random.choice(candidates)
+                    state["current_root"] = next_root
+                else:
+                    logger.info(f"SQL {query_id} entering exploitation mode (using predicted root cause)")
+                    state["current_root"] = predicted_root
 
                 root_causes = state["current_root"]
                 if not root_causes:
@@ -388,7 +365,11 @@ class DBAgent:
                     logger.info(f"SQL {query_id} fix failed, moving to next SQL")
                     database_config = self.configs.get("DATABASE_CONFIG", {})
                     new_time = database_config.get("query_timeout") or old_time
-                    # Save case and get corrected root cause
+
+                    root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
+                    for rc in root_causes_list:
+                            state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
+                    
                     case_id = self.memory_manager.save_case(
                         query_info,
                         fix_action,
@@ -396,6 +377,7 @@ class DBAgent:
                         old_time,
                         new_time,
                         "negative",
+                        tuning_attempts=state["component_attempts"].copy(),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)
@@ -406,7 +388,11 @@ class DBAgent:
                 elif evaluation_result.get("status") == 1:
                     logger.info(f"SQL {query_id} fix successful")
                     new_time = evaluation_result.get("new_time")
-                    # Save case and get corrected root cause
+
+                    root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
+                    for rc in root_causes_list:
+                            state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
+
                     case_id = self.memory_manager.save_case(
                         query_info,
                         fix_action,
@@ -414,6 +400,7 @@ class DBAgent:
                         old_time,
                         new_time,
                         "positive",
+                        tuning_attempts=state["component_attempts"].copy(),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)
@@ -430,7 +417,11 @@ class DBAgent:
                     # Fix ineffective: record negative case and advance source (try again next round)
                     logger.info(f"SQL {query_id} fix ineffective, recording negative case")
                     new_time = evaluation_result.get("new_time", old_time)
-                    # Save case and get corrected root cause
+
+                    root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
+                    for rc in root_causes_list:
+                            state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
+                    
                     case_id = self.memory_manager.save_case(
                         query_info,
                         fix_action,
@@ -438,6 +429,7 @@ class DBAgent:
                         old_time,
                         new_time,
                         "negative",
+                        tuning_attempts=state["component_attempts"].copy(),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)

@@ -144,6 +144,8 @@ class RCRankPredictor:
         print("Statistics computation completed")
 
     def predict(self, query, plan, timeseries, log):
+        self.model.eval()
+        
         with torch.no_grad():
             sql = self.tokenizer(
                 query,
