@@ -204,18 +204,47 @@ class ActionManager:
         # Validate action
         evaluation_result = await self.evaluate_action(fix_action, rewrite_sql, query_info)
 
-        reward = evaluation_result.get("status", 0)
+        # Use approve_time as reward (performance improvement: old_time - new_time)
+        # approve_time represents the time saved, which is the actual reward signal
+        reward = evaluation_result.get("approve_time", 0.0)
         case = positives + negatives
 
         # Save experience (independent of retrieval mode, only based on enable_save_samples)
         if self.memory_manager.enable_save_samples and case:
+            # Generate next_query_info_id: next round, same query_id
+            next_query_info_id = self.memory_manager.generate_next_query_info_id(query_info.query_id)
+            
             for case_info in case:
-                self.memory_manager.save_experience(query_info.__dict__, case_info, reward)
+                # root_causes should be extracted from case_info or use the root_cause parameter
+                case_root_causes = case_info.get("root_causes", [])
+                if not case_root_causes and root_cause:
+                    case_root_causes = root_cause if isinstance(root_cause, list) else [root_cause]
+                self.memory_manager.save_experience(
+                    query_info, 
+                    case_info, 
+                    case_root_causes,
+                    reward,
+                    next_query_info_id=next_query_info_id,
+                    done=False
+                )
 
         # Only update experience pool and network in dynamic retrieval mode
         if self.memory_manager.retrieval_mode == "dynamic" and case:
+            # Generate next_query_info_id: next round, same query_id
+            next_query_info_id = self.memory_manager.generate_next_query_info_id(query_info.query_id)
+            
             for case_info in case:
-                self.memory_manager.retriever.add_experience(query_info.__dict__, case_info, reward)
+                case_root_causes = case_info.get("root_causes", [])
+                if not case_root_causes and root_cause:
+                    case_root_causes = root_cause if isinstance(root_cause, list) else [root_cause]
+                self.memory_manager.retriever.add_experience(
+                    query_info,
+                    case_info,
+                    case_root_causes,
+                    reward,
+                    next_query_info_id=next_query_info_id,
+                    done=False
+                )
             self.memory_manager.retriever.update_network()
 
         return evaluation_result
@@ -285,12 +314,16 @@ class ActionManager:
             fix_sql = new_fix_sql
             retry_count += 1
         if not success:
+            old_time = query_info.execution_time
+            approve_time = 0.0  # No improvement if fix failed
             return {
                 "status": -1,
                 "msg": f"SQL fix failed: {fix_action}, error: {err}",
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": self.sql_timeout,
+                "old_time": old_time,
+                "approve_time": approve_time,  # reward = approve_time (0.0 for failed fix)
             }
 
         old_time = query_info.execution_time
@@ -305,6 +338,10 @@ class ActionManager:
             knob_names = self.extract_knob_names(fix_action)
             self.rollback_action(index_names, knob_names)
 
+        # Calculate approve_time (reward): old_time - new_time
+        # This represents the performance improvement (time saved)
+        approve_time = old_time - new_time if success else 0.0
+
         if not success:
             if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):
                 return {
@@ -313,6 +350,8 @@ class ActionManager:
                     "fix_action": fix_action,
                     "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                     "new_time": new_time,
+                    "old_time": old_time,
+                    "approve_time": approve_time,
                 }
             return {
                 "status": -1,
@@ -320,6 +359,8 @@ class ActionManager:
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": self.sql_timeout,
+                "old_time": old_time,
+                "approve_time": approve_time,
             }
 
         # 4. Performance comparison and subsequent processing
@@ -330,6 +371,8 @@ class ActionManager:
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": new_time,
+                "old_time": old_time,
+                "approve_time": approve_time,
             }
         else:
             return {
@@ -338,6 +381,8 @@ class ActionManager:
                 "fix_action": fix_action,
                 "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
                 "new_time": new_time,
+                "old_time": old_time,
+                "approve_time": approve_time,
             }
 
     async def derive_fix_action_and_sql(self, fix_action, rewrite_sql, origin_sql):

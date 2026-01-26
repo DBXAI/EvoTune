@@ -21,7 +21,10 @@ from agent.plan.online_predict import RCRankPredictor
 
 
 def load_samples(samples_path):
-    """Load samples from JSONL file (Experience format)"""
+    """
+    Load samples from JSONL file (Experience format)
+    Expected format: (s_t, o_t, B_t, r_t, s_{t+1}, B_{t+1}, done)
+    """
     samples = []
     if not os.path.exists(samples_path):
         print(f"Error: Sample file does not exist: {samples_path}")
@@ -36,12 +39,9 @@ def load_samples(samples_path):
                 continue
             try:
                 sample = json.loads(line)
-                # Validate sample format: should contain query_info, case_info, reward
-                if "query_info" in sample and "case_info" in sample and "reward" in sample:
-                    samples.append(sample)
-                else:
-                    print(f"Warning: Line {line_count} has incorrect format, missing required fields")
-                    continue
+                if sample.get("next_query_info") is None or sample.get("next_root_causes") is None:
+                    sample["done"] = True
+                samples.append(sample)
             except json.JSONDecodeError as e:
                 print(f"Warning: Failed to parse line {line_count}: {e}")
                 continue
@@ -87,10 +87,15 @@ def train_retriever_from_samples(
     retriever.batch_size = batch_size
     retriever.learning_rate = learning_rate
     retriever.optimizer = torch.optim.Adam(retriever.network.parameters(), lr=learning_rate)
+    
+    # Set soft Q-learning parameters (can be made configurable)
+    retriever.gamma = 0.99  # Discount factor γ
+    retriever.alpha = 1.0  # Temperature parameter α
 
     # Training loop
     print(f"Starting training, {epochs} epochs...")
     for epoch in range(epochs):
+        print(f"Epoch {epoch + 1}/{epochs}")
         epoch_loss = 0.0
         batch_count = 0
 
@@ -102,6 +107,7 @@ def train_retriever_from_samples(
         # Batch training
         valid_batches = 0
         for i in range(0, len(samples), batch_size):
+            print(f"Processing batch {i // batch_size + 1}/{len(samples) // batch_size}")
             batch_samples = samples[i : i + batch_size]
 
             if len(batch_samples) < batch_size:
@@ -109,42 +115,96 @@ def train_retriever_from_samples(
 
             # Prepare training data
             features_list = []
-            rewards_list = []
+            td_targets = []
 
             for sample in batch_samples:
                 query_info = sample.get("query_info", {})
                 case_info = sample.get("case_info", {})
-                root_causes = case_info.get("root_causes", [])
-                reward = sample.get("reward", 0)
-                reward_binary = 1 if reward == 1 else 0
+                root_causes = sample.get("root_causes", [])
+                reward = sample.get("reward", 0.0)
+                # Support both old format (next_query_info) and new format (next_query_info_id)
+                next_query_info_id = sample.get("next_query_info_id", "")
+                next_query_info = sample.get("next_query_info")  # For backward compatibility
+                next_root_causes = sample.get("next_root_causes", [])  # For backward compatibility
+                done = sample.get("done", False)
 
+                # Compute features for (s_t, o_t, B_t)
                 features = retriever._compute_features(query_info, case_info, root_causes)
                 features_list.append(features)
-                rewards_list.append(reward_binary)
+                
+                # Compute TD target: y_t = r_t + γ * α * log(Σ_{o' in M_{t+1}} exp(Q_θ(s_{t+1}, M_{t+1}, o')/α))
+                if done or (not next_query_info_id and not next_query_info):
+                    # Terminal state: y_t = r_t
+                    td_target = torch.tensor(reward, dtype=torch.float32, device=retriever.device)
+                else:
+                    # Use new format if available, otherwise fall back to old format
+                    if next_query_info_id:
+                        # New format: get next_query_info and next_root_causes from memory_cases
+                        next_query_info_from_id, next_root_causes_from_id = retriever._get_next_state_from_id(next_query_info_id)
+                        if next_query_info_from_id is None:
+                            # If not found, treat as terminal
+                            td_target = torch.tensor(reward, dtype=torch.float32, device=retriever.device)
+                        else:
+                            # Get next memory cases M_{t+1}
+                            next_memory_cases = retriever._get_next_memory_cases(next_query_info_id)
+                            
+                            # Compute soft Bellman target
+                            soft_value = retriever._compute_soft_bellman_target(
+                                next_query_info_from_id,
+                                next_root_causes_from_id,
+                                next_memory_cases,
+                                False
+                            )
+                            
+                            # TD target: y_t = r_t + γ * soft_value
+                            td_target = torch.tensor(reward, dtype=torch.float32, device=retriever.device) + retriever.gamma * soft_value
+                    else:
+                        # Old format: backward compatibility - return all cases
+                        # For old format, we can't determine next_query_info_id, so use all cases
+                        next_memory_cases = [case.case_info for case in retriever.memory_manager.cases.values()]
+                        if len(next_memory_cases) > retriever.max_sample_cases:
+                            import random
+                            next_memory_cases = random.sample(next_memory_cases, retriever.max_sample_cases)
+                        
+                        # Compute soft Bellman target
+                        soft_value = retriever._compute_soft_bellman_target(
+                            next_query_info,
+                            next_root_causes,
+                            next_memory_cases,
+                            done
+                        )
+                        
+                        # TD target: y_t = r_t + γ * soft_value
+                        td_target = torch.tensor(reward, dtype=torch.float32, device=retriever.device) + retriever.gamma * soft_value
+                
+                td_targets.append(td_target)
 
             # Ensure all features have consistent dimensions
             if len(features_list) > 0:
                 feature_dim = features_list[0].shape[0]
                 # Filter out features with inconsistent dimensions
                 valid_features = []
-                valid_rewards = []
-                for feat, rew in zip(features_list, rewards_list):
+                valid_targets = []
+                for feat, target in zip(features_list, td_targets):
                     if feat.shape[0] == feature_dim:
                         valid_features.append(feat)
-                        valid_rewards.append(rew)
+                        valid_targets.append(target)
 
                 features_list = valid_features
-                rewards_list = valid_rewards
+                td_targets = valid_targets
+
+            if len(features_list) == 0:
+                continue
 
             # Convert to tensors
             features_tensor = torch.stack(features_list)
-            rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).to(retriever.device)
+            td_targets_tensor = torch.stack(td_targets)
 
-            # Forward pass
-            predictions = retriever.network(features_tensor).squeeze()
+            # Forward pass: Q_θ(s_t, M_t, o_t)
+            q_predictions = retriever.network(features_tensor).squeeze()
 
-            # Compute loss
-            loss = F.mse_loss(predictions, rewards_tensor)
+            # Compute TD loss: L_TD(θ) = E[(Q_θ(s_t, M_t, o_t) - y_t)^2]
+            loss = F.mse_loss(q_predictions, td_targets_tensor)
 
             # Backward pass
             retriever.optimizer.zero_grad()
@@ -160,7 +220,7 @@ def train_retriever_from_samples(
             valid_batches += 1
 
         avg_loss = epoch_loss / max(batch_count, 1)
-        print(f"Epoch {epoch + 1}/{epochs}, Average Loss: {avg_loss:.6f}, Valid Batches: {valid_batches}")
+        print(f"Epoch {epoch + 1}/{epochs}, Average TD Loss: {avg_loss:.6f}, Valid Batches: {valid_batches}")
 
         # # Update target network
         # if (epoch + 1) % 5 == 0:

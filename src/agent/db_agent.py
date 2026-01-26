@@ -205,6 +205,8 @@ class DBAgent:
 
             round_idx += 1
             logger.info(f"=== Round {round_idx} Diagnosis ===")
+            # Set current round in memory_manager for generating next_query_info_id
+            self.memory_manager.set_current_round(round_idx)
             round_start = time.time()
             round_sql_times = {}
             round_sql_actions = {}

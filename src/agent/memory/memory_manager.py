@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
@@ -77,6 +78,8 @@ class MemoryManager:
 
         # Retriever model save/load path
         self.retriever_model_path = config.get("retriever_model_path")
+
+        self.current_round = 1
 
         self.root_cause_types = [
             "missing indexes",
@@ -631,7 +634,7 @@ class MemoryManager:
                     data_to_save[cid] = case.case_info
                 json.dump(data_to_save, f)
 
-    def save_case(self, query_info, fix_action, root_causes, old_time, new_time, label, tuning_attempts=None):
+    def save_case(self, query_info, fix_action, root_causes, old_time, new_time, label, tuning_attempts=None, round_num=None):
         """
         Save a case to memory
         
@@ -644,6 +647,7 @@ class MemoryManager:
             label: "positive" or "negative"
             tuning_attempts: Dict[str, int] mapping component (root_cause_type) to number of attempts n_{i,b}
                            If None, will be estimated from root_causes
+            round_num: Current round number (if None, uses self.current_round)
         """
         approve_time = old_time - new_time
 
@@ -658,6 +662,18 @@ class MemoryManager:
                         tuning_attempts[rc] = tuning_attempts.get(rc, 0) + 1
             # For negative cases, we can't reliably estimate, so leave as empty dict
 
+        # Use provided round_num or current_round
+        if round_num is None:
+            round_num = self.current_round
+        
+        query_id_str = str(query_info.query_id)
+        match = re.match(r'^(\d+)(.*)$', query_id_str)
+        if match:
+            numeric_part = match.group(1)
+            suffix = match.group(2)
+            query_id_str = numeric_part.zfill(2) + suffix
+        case_id = f"{round_num}-{query_id_str}"
+
         case_info = {
             "query_info": query_info.__dict__,
             "fix_action": fix_action,
@@ -670,15 +686,44 @@ class MemoryManager:
         }
 
         case = MemoryCase(
-            id=str(len(self.cases) + 1),
+            id=case_id,
             case_info=case_info,
             metrics={},
             sql_embedding=None,
             action_embedding=None,
         )
         self.add_case(case)
+        
+        if self.retriever is not None:
+            self.retriever.check_and_add_pending_experiences(case_id)
 
         return case.id
+    
+    def generate_next_query_info_id(self, query_id, round_num=None):
+        """
+        Generate next_query_info_id in format "round-query_id"
+        
+        Args:
+            query_id: Query ID
+            round_num: Next round number (if None, uses current_round + 1)
+        
+        Returns:
+            next_query_info_id string, e.g., "2-01"
+        """
+        if round_num is None:
+            round_num = self.current_round + 1
+        
+        query_id_str = str(query_id)
+        match = re.match(r'^(\d+)(.*)$', query_id_str)
+        if match:
+            numeric_part = match.group(1)
+            suffix = match.group(2)  # Could be empty or letters like 'c', 'b'
+            query_id_str = numeric_part.zfill(2) + suffix
+        return f"{round_num}-{query_id_str}"
+    
+    def set_current_round(self, round_num):
+        """Set current round number"""
+        self.current_round = round_num
 
     def get_case(self, case_id):
         return self.cases.get(case_id)
@@ -702,9 +747,9 @@ class MemoryManager:
                 positive_cases = [c for c in self.cases.values() if c.case_info.get("label") == "positive"]
                 positive_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
                 self.archive = set([c.id for c in positive_cases[: self.archive_size]])
-            # self._last_finetune_count = len(self.cases)
-            self._last_finetune_count = 0
-            self._maybe_finetune()
+            self._last_finetune_count = len(self.cases)
+            # self._last_finetune_count = 0
+            # self._maybe_finetune()
         else:
             self._last_finetune_count = 0
 
@@ -1077,19 +1122,41 @@ class MemoryManager:
 
         return None
 
-    def save_experience(self, query_info, case_info, reward):
-        """Save single experience to file (JSONL format, append mode)"""
+    def save_experience(self, query_info, case_info, root_causes, reward, next_query_info_id=None, done=False):
+        """
+        Save single experience to file (JSONL format, append mode)
+        
+        Experience tuple: (s_t, o_t, B_t, r_t, next_query_info_id, done)
+        
+        Args:
+            query_info: s_t - current state (query_info)
+            case_info: o_t - retrieved observation from memory
+            root_causes: B_t - current bottleneck components
+            reward: r_t - reward
+            next_query_info_id: next_query_info_id in format "round-query_id", e.g., "2-01" for round 2, query 01
+                               None or empty string if terminal
+            done: Whether the episode is terminated
+        """
 
         if not self.samples_save_path:
             return
 
         os.makedirs(os.path.dirname(self.samples_save_path), exist_ok=True)
 
+        # Generate next_query_info_id if not provided
+        if next_query_info_id is None and not done:
+            next_query_info_id = self.generate_next_query_info_id(query_info.query_id)
+
+        # Prepare current experience dict
         exp_dict = {
-            "query_info": query_info,
+            "query_info": query_info.__dict__ if hasattr(query_info, '__dict__') else query_info,
             "case_info": case_info,
+            "root_causes": root_causes if isinstance(root_causes, list) else [root_causes] if root_causes else [],
             "reward": reward,
+            "next_query_info_id": next_query_info_id if next_query_info_id else "",
+            "done": done,
         }
 
+        # Save current experience to file
         with open(self.samples_save_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(exp_dict, ensure_ascii=False) + "\n")
