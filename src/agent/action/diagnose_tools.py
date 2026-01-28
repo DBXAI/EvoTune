@@ -27,7 +27,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
 
 import jpype as jp
 
-from src.database.pg_env import PostgresDB
+from database.pg_env import PostgresDB
 
 # Initialize FastMCP server
 mcp = FastMCP("db_diagnosis")
@@ -623,7 +623,7 @@ def find_duplicate_subqueries(sql):
 
 
 def find_related_views(sql, database_config):
-    from src.database.pg_env import PostgresDB
+    from database.pg_env import PostgresDB
 
     postgres_db = PostgresDB(
         user=database_config["user"],

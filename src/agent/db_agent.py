@@ -11,17 +11,12 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import beta
 
-# Add project root directory to Python path
-project_root = str(Path(__file__).parent.parent.parent)
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 from agent.action.action_manager import ActionManager
 from agent.memory.memory_manager import MemoryManager
 from agent.plan.online_predict import RCRankPredictor
 from agent.plan.planner import Planner
-from src.database.pg_env import PostgresDB
-from src.database.tidb_env import TiDB
+from database.pg_env import PostgresDB
+from database.tidb_env import TiDB
 from utils.types import QueryInfo
 
 logger = logging.getLogger(__name__)

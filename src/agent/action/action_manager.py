@@ -15,12 +15,6 @@ from scipy.stats import spearmanr
 
 from agent.action import diagnose_tools
 from agent.action.diagnose_tools import SQLRuleMatcher
-
-# Add project root directory to Python path
-project_root = str(Path(__file__).parent.parent.parent.parent)
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 from agent.prompt import *
 
 nest_asyncio.apply()
@@ -154,13 +148,13 @@ class ActionManager:
         configs = [ServerConfig.from_dict(service_config) for service_config in config_data["services"]]
         self.server_manager = MultiServerManager(configs)
 
-        self._servers = await self.exit_stack.enter_async_context(self.server_manager.manage_servers())
+        # self._servers = await self.exit_stack.enter_async_context(self.server_manager.manage_servers())
 
         self.agent = Agent(
             name="DBDiagnosticAgent",
             model=self.diagnostic_model,
             instructions=get_diagnostic_agent_instructions(),
-            mcp_servers=self._servers,
+            # mcp_servers=self._servers,
         )
         return self.agent
 

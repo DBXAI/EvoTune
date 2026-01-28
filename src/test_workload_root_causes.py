@@ -5,12 +5,8 @@ import json
 import logging
 import os
 import re
-import sys
 from datetime import datetime
 from pathlib import Path
-
-# Add project root to Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.db_agent import DBAgent
 from utils.types import QueryInfo

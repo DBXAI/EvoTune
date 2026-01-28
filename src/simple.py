@@ -9,12 +9,7 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from datetime import datetime
-
-# Add project root to Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 
 # Setup logging, output to console and file
 def setup_logging():

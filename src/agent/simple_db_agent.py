@@ -6,11 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-# Add project root directory to Python path
-project_root = str(Path(__file__).parent.parent.parent)
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 from agents import Agent, Runner
 
 from agent.action import diagnose_tools
@@ -19,8 +14,8 @@ from agent.prompt import (
     build_simple_diagnosis_prompt,
     get_diagnostic_agent_instructions,
 )
-from src.database.pg_env import PostgresDB
-from src.database.tidb_env import TiDB
+from database.pg_env import PostgresDB
+from database.tidb_env import TiDB
 from utils.types import QueryInfo
 
 logger = logging.getLogger(__name__)
