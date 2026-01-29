@@ -5,11 +5,8 @@ import logging
 import os
 import sys
 from datetime import datetime
-
 from agent.db_agent import DBAgent
 
-
-# setup logging, output to console and file
 def setup_logging():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     log_dir = os.path.join(project_root, "logs")
@@ -42,9 +39,7 @@ def setup_logging():
     print(f"Log file saved to: {log_file}")
     return log_file
 
-
 setup_logging()
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Slow Query Diagnosis Tool")
@@ -71,7 +66,6 @@ async def main():
     logger.info(f"Optimization duration: {args.duration} hours")
     logger.info(f"Configuration file: {args.config}")
 
-    # Load JSON configuration file
     with open(args.config, "r", encoding="utf-8") as f:
         configs = json.load(f)
 
@@ -81,14 +75,7 @@ async def main():
             order=args.order,
             duration=args.duration,
             no_improvement_threshold=configs["AGENT_CONFIG"]["no_improvement_threshold"],
-            epsilon=configs["AGENT_CONFIG"]["epsilon"],
         )
 
-
 if __name__ == "__main__":
-    # asyncio.run(main())
-    try:
-        asyncio.run(main())
-    except asyncio.CancelledError:
-        # anyio/MCP throws cancellation when normally closing stdio, which is a normal shutdown path
-        pass
+    asyncio.run(main())

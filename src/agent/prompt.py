@@ -278,7 +278,7 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
 
     # SQL readability/rewrite related
     if "poorly written queries" in root_causes:
-        from agent.action.diagnose_tools import SQLRuleMatcher
+        from agent.action.rule_matcher import SQLRuleMatcher
 
         matcher = SQLRuleMatcher()
         rule_descriptions = matcher.get_rule_descriptions(query_info.query)

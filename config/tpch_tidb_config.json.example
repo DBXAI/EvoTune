@@ -93,7 +93,7 @@
     "diagnostic_agent_model": "gpt-4.1",
     "fix_agent_model": "gpt-4.1",
     "root_cause_llm_model": "gpt-4.1",
-    "action_server_config": "/root/DREAM/src/agent/action/action_server_config.yaml"
+    "action_server_config": "/root/DREAM/src/agent/action/mcp_tools/action_server_config.yaml"
   }
 }
 

@@ -4,13 +4,9 @@ import logging
 import os
 import random
 import re
-import sys
 import time
-from pathlib import Path
-
 import numpy as np
 from scipy.stats import beta
-
 from agent.action.action_manager import ActionManager
 from agent.memory.memory_manager import MemoryManager
 from agent.plan.online_predict import RCRankPredictor
@@ -20,8 +16,6 @@ from database.tidb_env import TiDB
 from utils.types import QueryInfo
 
 logger = logging.getLogger(__name__)
-
-# Ensure logger inherits root logger configuration
 logger.setLevel(logging.INFO)
 logger.propagate = True
 
@@ -35,11 +29,9 @@ class DBAgent:
         if db_type.lower() == "postgres":
             db_config = configs.get("DATABASE_CONFIG")
             self.db = PostgresDB(db_config)
-            logger.info("Using PostgreSQL database")
         elif db_type.lower() == "tidb":
             db_config = configs.get("TiDB_CONFIG")
             self.db = TiDB(db_config)
-            logger.info("Using TiDB database")
 
         planner_config = configs.get("PLANNER_CONFIG")
         predictor = RCRankPredictor(planner_config)
@@ -55,16 +47,16 @@ class DBAgent:
             configs=configs,
         )
 
-        self.alpha_0 = 1.0  # Beta prior alpha
-        self.beta_0 = 1.0  # Beta prior beta
-        self.p_crit = 0.5  # Critical probability threshold
+        # Dynamic epsilon-greedy parameters
+        self.alpha_0 = 1.0
+        self.beta_0 = 1.0
+        self.p_crit = 0.5
         self.epsilon_min = self.agent_config.get("epsilon", 0.1)
         self.epsilon_max = 0.8
         self.kappa = 0.5
-        self.N_th = 3  # Failure count threshold
+        self.N_th = 3
 
     def calculate_dynamic_epsilon(self, root_cause_key, state):
-        # Get success and failure counts for this root cause
         s_r = state.get("successes").get(root_cause_key, 0)  # successes
         n_r = state.get("attempts").get(root_cause_key, 0)  # total attempts
 
@@ -164,7 +156,7 @@ class DBAgent:
         sql_without_hints = " ".join(sql_without_hints.split())
         return sql_without_hints.strip()
 
-    async def run(self, slow_query_path, order, duration, no_improvement_threshold=3, epsilon=0.1):
+    async def run(self, slow_query_path, order, duration, no_improvement_threshold=3):
         """
         Execute database optimization process
 
