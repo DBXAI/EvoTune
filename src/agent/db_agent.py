@@ -13,6 +13,7 @@ from agent.plan.online_predict import RCRankPredictor
 from agent.plan.planner import Planner
 from database.pg_env import PostgresDB
 from database.tidb_env import TiDB
+from utils.runtime_metrics import format_runtime_metrics, merge_runtime_metrics
 from utils.types import QueryInfo
 
 logger = logging.getLogger(__name__)
@@ -325,6 +326,16 @@ class DBAgent:
                     sql_root_cause_states[query_id] = state
                     logger.info(f"SQL {query_id} skipping current SQL, continuing to next")
                     continue
+
+                sql_runtime_metrics = merge_runtime_metrics(
+                    state.get("last_runtime_metrics"),
+                    evaluation_result.get("runtime_metrics"),
+                )
+                logger.info(
+                    "[Runtime][SQL %s] Overhead summary: %s",
+                    query_id,
+                    format_runtime_metrics(sql_runtime_metrics),
+                )
 
                 # Get fix content
                 fix_action = evaluation_result.get("fix_action")

@@ -1,6 +1,8 @@
 import asyncio
+import logging
 import os
 import re
+import time
 
 import nest_asyncio
 from agents import Agent, Runner
@@ -15,6 +17,11 @@ from agent.action.action_utils import (
     parse_query_rewrite,
 )
 from agent.prompt import *
+from utils.runtime_metrics import (
+    extract_run_usage_metrics,
+    format_runtime_metrics,
+    merge_runtime_metrics,
+)
 
 nest_asyncio.apply()
 
@@ -33,6 +40,9 @@ def delete_all_loggers():
 
 
 delete_all_loggers()
+
+
+logger = logging.getLogger(__name__)
 
 
 class ActionManager:
@@ -96,10 +106,18 @@ class ActionManager:
         except Exception as e:
             print(f"Warning: Error during cleanup: {e}")
 
+    def extract_index_names(self, sql):
+        return extract_index_names(sql)
+
+    def extract_knob_names(self, sql):
+        return extract_knob_names(sql)
+
     async def step(self, query_info, root_cause, mode="exploit"):
         """Analyze slow query and generate fix action workflow"""
         if not self.agent:
             await self.initialize()
+
+        runtime_metrics = {}
 
         # Dynamic workflow:
         # 1. information collect
@@ -112,6 +130,7 @@ class ActionManager:
         base_info = base_information_collect(query_info, database_config)
 
         # Retrieve cases based on enable_retrieval flag
+        retrieval_start = time.perf_counter()
         if self.enable_retrieval:
             retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
             positives = retrieval.get("positive", [])
@@ -119,7 +138,9 @@ class ActionManager:
         else:
             positives = []
             negatives = []
+        runtime_metrics["T_retrieval_infer"] = time.perf_counter() - retrieval_start
 
+        action_space_start = time.perf_counter()
         action_space = await action_space_collect(
             root_cause,
             query_info,
@@ -129,13 +150,22 @@ class ActionManager:
             db=self.db,
             memory_manager=self.memory_manager,
         )
+        runtime_metrics["T_action_space"] = time.perf_counter() - action_space_start
 
-        action_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
+        action_gen_start = time.perf_counter()
+        action_run_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
+        runtime_metrics["T_action_gen"] = time.perf_counter() - action_gen_start
+        runtime_metrics = merge_runtime_metrics(
+            runtime_metrics,
+            extract_run_usage_metrics(action_run_result, "action_gen"),
+        )
+        action_result = str(action_run_result.final_output)
 
         # Extract fix action and rewrite sql
         fix_action, rewrite_sql = self.extract_fix_action(action_result)
 
         # Validate action
+        action_eval_start = time.perf_counter()
         evaluation_result = await evaluate_action(
             fix_action,
             rewrite_sql,
@@ -149,6 +179,7 @@ class ActionManager:
             index_names = extract_index_names(evaluation_result.get("fix_action"))
             knob_names = extract_knob_names(evaluation_result.get("fix_action"))
             self.rollback_action(index_names, knob_names)
+        runtime_metrics["T_action_eval"] = time.perf_counter() - action_eval_start
 
         # Use approve_time as reward (performance improvement: old_time - new_time)
         # approve_time represents the time saved, which is the actual reward signal
@@ -175,6 +206,7 @@ class ActionManager:
                 )
 
         # Only update experience pool and network in dynamic retrieval mode
+        retriever_update_start = time.perf_counter()
         if self.memory_manager.retrieval_mode == "dynamic" and case:
             # Generate next_query_info_id: next round, same query_id
             next_query_info_id = self.memory_manager.generate_next_query_info_id(query_info.query_id)
@@ -192,6 +224,17 @@ class ActionManager:
                     done=False
                 )
             self.memory_manager.retriever.update_network()
+        runtime_metrics["T_retriever_update"] = time.perf_counter() - retriever_update_start
+
+        evaluation_result["runtime_metrics"] = merge_runtime_metrics(
+            evaluation_result.get("runtime_metrics"),
+            runtime_metrics,
+        )
+        logger.info(
+            "[Runtime][SQL %s] Action summary: %s",
+            getattr(query_info, "query_id", "unknown"),
+            format_runtime_metrics(evaluation_result["runtime_metrics"]),
+        )
 
         return evaluation_result
 
@@ -222,8 +265,7 @@ class ActionManager:
 
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)
-        result = await Runner.run(starting_agent=self.agent, input=prompt)
-        return result.final_output
+        return await Runner.run(starting_agent=self.agent, input=prompt)
 
     def extract_fix_action(self, action_result):
         """Extract fix_action and rewrite_sql from action_result"""

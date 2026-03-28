@@ -11,7 +11,7 @@
     "postgres_data": "/usr/lib/postgresql/14/data",
     "log_path": "/usr/lib/postgresql/14/log",
     "db_type": "postgres",
-    "query_timeout": 30
+    "query_timeout": 300
   },
   "KNOB_CONFIG": {
     "query_knobs": {

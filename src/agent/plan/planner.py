@@ -1,5 +1,7 @@
 import os
 import sys
+import logging
+import time
 
 # Add RCRank to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +21,14 @@ from agent.prompt import (
     build_root_cause_diagnosis_prompt,
     get_root_cause_llm_instructions,
 )
+from utils.runtime_metrics import (
+    extract_run_usage_metrics,
+    format_runtime_metrics,
+    merge_runtime_metrics,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class Planner:
@@ -42,12 +52,21 @@ class Planner:
         return encoded_df["json_plan_tensor"].iloc[0]
 
     def model_predict(self, query_info):
+        start_time = time.perf_counter()
         query, plan, timeseries, log = self._build_prediction_input(query_info)
 
         pred_label_opt, pred_label = self.predictor.predict(query=query, plan=plan, timeseries=timeseries, log=log)
 
         result = self._extract_top_root_cause(pred_label, pred_label_opt)
         result["pred_label_opt"] = pred_label_opt.cpu().numpy()
+        result["runtime_metrics"] = {
+            "T_diag_small_model": time.perf_counter() - start_time,
+        }
+        logger.info(
+            "[Runtime][SQL %s] %s",
+            getattr(query_info, "query_id", "unknown"),
+            format_runtime_metrics(result["runtime_metrics"]),
+        )
         return result
 
     def diagnosis_agent(self, prompt):
@@ -58,9 +77,16 @@ class Planner:
                 instructions=get_root_cause_llm_instructions(),
             ),
             input=prompt,
-        ).final_output.strip()
+        )
 
     def llm_predict(self, query_info, root_causes, state_confidence, tuning_history=None):
+        start_time = time.perf_counter()
+        llm_usage_metrics = {
+            "diag_llm_requests": 0,
+            "diag_llm_input_tokens": 0,
+            "diag_llm_output_tokens": 0,
+            "diag_llm_total_tokens": 0,
+        }
         # ε-greedy retrieval structure: {"positive", "negative"}
         # retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
         # positives = retrieval.get('positive', [])
@@ -74,14 +100,22 @@ class Planner:
         )
         # print("prompt: ", prompt)
 
-        output = self.diagnosis_agent(prompt)
+        run_result = self.diagnosis_agent(prompt)
+        usage_metrics = extract_run_usage_metrics(run_result, "diag_llm")
+        for key, value in usage_metrics.items():
+            llm_usage_metrics[key] += value
+        output = str(run_result.final_output).strip()
         print("output: ", output)
         parsed = self.parse_and_validate(output)
         labels, conf_map = parsed if parsed is not None else (None, None)
         # retry
         retry = 0
         while labels is None and retry < 5:
-            output = self.diagnosis_agent(prompt)
+            run_result = self.diagnosis_agent(prompt)
+            usage_metrics = extract_run_usage_metrics(run_result, "diag_llm")
+            for key, value in usage_metrics.items():
+                llm_usage_metrics[key] += value
+            output = str(run_result.final_output).strip()
             parsed = self.parse_and_validate(output)
             labels, conf_map = parsed if parsed is not None else (None, None)
             retry += 1
@@ -90,7 +124,17 @@ class Planner:
             labels = ["normal"]
             conf_map = {"normal": 1.0}
 
-        return {"root_causes": labels, "confidence": conf_map}
+        runtime_metrics = {
+            "T_diag_llm": time.perf_counter() - start_time,
+            "diag_llm_retries": retry,
+        }
+        runtime_metrics = merge_runtime_metrics(runtime_metrics, llm_usage_metrics)
+        logger.info(
+            "[Runtime][SQL %s] %s",
+            getattr(query_info, "query_id", "unknown"),
+            format_runtime_metrics(runtime_metrics),
+        )
+        return {"root_causes": labels, "confidence": conf_map, "runtime_metrics": runtime_metrics}
 
     def parse_and_validate(self, json_text):
         try:
@@ -169,11 +213,13 @@ class Planner:
         # }
 
     def predict(self, query_info, state, memory_manager):
+        runtime_metrics = {}
         # If current_root already exists, reuse it; otherwise call small model + LLM to get new root cause
         current_root = state.get("current_root")
         if current_root is None:
             # Small model initial prediction + confidence
             model_out = self.model_predict(query_info)
+            runtime_metrics = merge_runtime_metrics(runtime_metrics, model_out.get("runtime_metrics"))
             current_root = model_out.get("root_causes")
             print("Small model predicted root cause: ", current_root)
             pred_opt = model_out.get("pred_label_opt")
@@ -207,7 +253,14 @@ class Planner:
             state_confidence=state.get("confidence"),
             tuning_history=tuning_history,
         )
+        runtime_metrics = merge_runtime_metrics(runtime_metrics, llm_result.get("runtime_metrics"))
         predicted_root = llm_result.get("root_causes")
         state["confidence"] = llm_result.get("confidence")
+        state["last_runtime_metrics"] = runtime_metrics
+        logger.info(
+            "[Runtime][SQL %s] Diagnosis summary: %s",
+            getattr(query_info, "query_id", "unknown"),
+            format_runtime_metrics(runtime_metrics),
+        )
 
         return predicted_root, state
