@@ -40,7 +40,13 @@ class DBAgent:
         memory_config = configs.get("MEMORY_MANAGER_CONFIG")
         self.memory_manager = MemoryManager(memory_config, predictor=predictor)
 
-        self.planner = Planner(self.memory_manager, predictor=predictor, agent_config=self.agent_config)
+        self.planner = Planner(
+            self.memory_manager,
+            predictor=predictor,
+            agent_config=self.agent_config,
+            db=self.db,
+            database_config=db_config,
+        )
         self.action_manager = ActionManager(
             memory_manager=self.memory_manager,
             db=self.db,

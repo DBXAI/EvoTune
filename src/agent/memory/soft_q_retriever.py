@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from agent.contracts import CANONICAL_COMPONENTS, normalize_components
+
 
 @dataclass
 class Experience:
@@ -118,12 +120,8 @@ class SoftQRetriever:
         return embedding.to(self.device)
 
     def _encode_root_causes(self, root_causes) -> torch.Tensor:
-        root_cause_types = [
-            "missing indexes",
-            "inappropriate query knobs",
-            "suboptimal plan optimizer",
-            "poorly written queries",
-        ]
+        root_cause_types = list(CANONICAL_COMPONENTS)
+        root_causes = normalize_components(root_causes)
 
         root_cause_vector = torch.zeros(4)
         for i, root_cause_type in enumerate(root_cause_types):
@@ -231,7 +229,7 @@ class SoftQRetriever:
         experience = Experience(
             query_info=query_info.__dict__ if hasattr(query_info, '__dict__') else query_info,
             case_info=case_info,
-            root_causes=root_causes if isinstance(root_causes, list) else [root_causes] if root_causes else [],
+            root_causes=normalize_components(root_causes),
             reward=reward,
             next_query_info_id=next_query_info_id if next_query_info_id else "",
             done=done
@@ -441,8 +439,7 @@ class SoftQRetriever:
                 case_info = case.case_info
                 next_query_info = case_info.get("query_info")
                 next_root_causes = case_info.get("root_causes", [])
-                if not isinstance(next_root_causes, list):
-                    next_root_causes = [next_root_causes] if next_root_causes else []
+                next_root_causes = normalize_components(next_root_causes)
                 return next_query_info, next_root_causes
         except (ValueError, IndexError):
             pass

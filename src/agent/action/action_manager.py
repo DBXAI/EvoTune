@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import re
 import time
 
 import nest_asyncio
@@ -16,6 +15,7 @@ from agent.action.action_utils import (
     extract_knob_names,
     parse_query_rewrite,
 )
+from agent.contracts import parse_tuning_agent_output
 from agent.prompt import *
 from utils.runtime_metrics import (
     extract_run_usage_metrics,
@@ -265,6 +265,7 @@ class ActionManager:
 
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)
+        print("Tuning Agent Prompt:", prompt)
         return await Runner.run(starting_agent=self.agent, input=prompt)
 
     def extract_fix_action(self, action_result):
@@ -281,16 +282,4 @@ class ActionManager:
             return fix_action, ""
 
     def parse_action_result(self, diagnosis):
-        # Extract Explanation
-        explanation_match = re.search(r"Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)", diagnosis, re.IGNORECASE)
-        explanation = explanation_match.group(1).strip() if explanation_match else ""
-
-        # Extract FIX_ACTION
-        fix_match = re.search(r"Fix_Action:\s*([\s\S]+?)Query_Rewrite:", diagnosis, re.IGNORECASE)
-        fix_action = fix_match.group(1).strip() if fix_match else ""
-
-        # Extract Query_Rewrite
-        is_rewrite_match = re.search(r"Query_Rewrite:\s*(yes|no)", diagnosis, re.IGNORECASE)
-        is_rewrite = is_rewrite_match.group(1).strip() if is_rewrite_match else ""
-
-        return explanation, fix_action, is_rewrite
+        return parse_tuning_agent_output(diagnosis)

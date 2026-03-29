@@ -6,6 +6,7 @@ import time
 from agents import Agent, Runner
 from agent.action.action_manager import ActionManager
 from agent.action.action_utils import base_information_collect, parse_query_rewrite
+from agent.contracts import parse_tuning_agent_output
 from agent.prompt import (
     build_simple_diagnosis_prompt,
     get_diagnostic_agent_instructions,
@@ -85,19 +86,7 @@ class SimpleDBAgent:
             pass
 
     def parse_action_result(self, diagnosis):
-        # Extract Explanation
-        explanation_match = re.search(r"Explanation:\s*([\s\S]+?)(?=Fix_Action:|$)", diagnosis, re.IGNORECASE)
-        explanation = explanation_match.group(1).strip() if explanation_match else ""
-
-        # Extract FIX_ACTION
-        fix_match = re.search(r"Fix_Action:\s*([\s\S]+?)Query_Rewrite:", diagnosis, re.IGNORECASE)
-        fix_action = fix_match.group(1).strip() if fix_match else ""
-
-        # Extract Query_Rewrite
-        is_rewrite_match = re.search(r"Query_Rewrite:\s*(yes|no)", diagnosis, re.IGNORECASE)
-        is_rewrite = is_rewrite_match.group(1).strip() if is_rewrite_match else ""
-
-        return explanation, fix_action, is_rewrite
+        return parse_tuning_agent_output(diagnosis)
 
     def extract_fix_action(self, action_result):
         explanation, fix_action, is_rewrite = self.parse_action_result(action_result)

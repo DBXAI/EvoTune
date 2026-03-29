@@ -5,6 +5,12 @@ from agents import Runner
 from agent.prompt import build_fix_prompt, build_rewrite_prompt
 
 
+def _round_time_value(value):
+    if isinstance(value, float):
+        return round(value, 3)
+    return value
+
+
 async def evaluate_action(fix_action, rewrite_sql, query_info, *, db, fix_timeout, sql_timeout, fix_agent):
     fix_action, fix_sql = await derive_fix_action_and_sql(
         fix_action, rewrite_sql, query_info.query, db=db, fix_agent=fix_agent
@@ -34,26 +40,27 @@ async def evaluate_action(fix_action, rewrite_sql, query_info, *, db, fix_timeou
         fix_sql = new_fix_sql
         retry_count += 1
     if not success:
-        old_time = query_info.execution_time
+        old_time = _round_time_value(query_info.execution_time)
         approve_time = 0.0
         return {
             "status": -1,
             "msg": f"SQL fix failed: {fix_action}, error: {err}",
             "fix_action": fix_action,
             "rewrite_sql": (fix_sql if fix_sql != query_info.query else ""),
-            "new_time": sql_timeout,
+            "new_time": _round_time_value(sql_timeout),
             "old_time": old_time,
             "approve_time": approve_time,
         }
 
-    old_time = query_info.execution_time
+    old_time = _round_time_value(query_info.execution_time)
 
     print("Executing performance test")
     success, _, new_time, err = db.execute(fix_sql, timeout=sql_timeout)
     print("Performance test completed")
+    new_time = _round_time_value(new_time)
 
     # If we get here, ActionManager is responsible for rollback when needed.
-    approve_time = old_time - new_time if success else 0.0
+    approve_time = _round_time_value(old_time - new_time) if success else 0.0
 
     if not success:
         if err and isinstance(err, str) and ("timeout" in err.lower() or "querycanceled" in err):

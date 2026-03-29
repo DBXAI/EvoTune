@@ -5,12 +5,19 @@ from database.pg_env import PostgresDB
 
 def base_information_collect(query_info, database_config):
     postgres_db = PostgresDB(database_config)
+    dbname = getattr(postgres_db, "dbname", None) or database_config.get("dbname") or "unknown"
+
+    size = postgres_db.get_size()
+    if isinstance(size, list) and len(size) == 1:
+        size = size[0]
+    size = size or "unknown"
 
     db_info = {
         "db_type": postgres_db.db_type,
         "workload_type": postgres_db.workload_type,
-        "size": postgres_db.get_size(),
-        "schema": postgres_db.fetch_schema_info(),
+        "dbname": dbname,
+        "size": size,
+        "schema": dbname,
     }
 
     base_info = {

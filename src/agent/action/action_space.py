@@ -1,6 +1,7 @@
 import re
 
 from agent.action.action_utils import extract_index_names
+from agent.contracts import normalize_components
 from agent.action.rule_matcher import SQLRuleMatcher
 from agent.prompt import build_action_space_prompt
 
@@ -15,6 +16,8 @@ async def action_space_collect(
     db,
     memory_manager,
 ):
+    root_causes = normalize_components(root_causes)
+
     if enable_action_define:
         knob_config = configs.get("KNOB_CONFIG")
         current_knob_values = db.get_current_knob_values(knob_config)
@@ -37,15 +40,16 @@ async def action_space_collect(
 
 
 def action_pruning(root_causes, query_info, memory_manager):
-    has_index_root = "missing indexes" in root_causes
-    has_query_root = "poorly written queries" in root_causes
+    root_causes = normalize_components(root_causes)
+    has_index_root = "index" in root_causes
+    has_query_root = "query" in root_causes
 
     if not has_index_root and not has_query_root:
         return ""
 
     pruning_guidance = []
     pruning_guidance.append(
-        "• Action Pruning: Based on historical failure cases with the same root cause, "
+        "    • Action Pruning: Based on historical failure cases with the same root cause, "
         "the following discrete operations have been proven ineffective, please avoid using them:"
     )
 
@@ -62,6 +66,9 @@ def action_pruning(root_causes, query_info, memory_manager):
             pruning_guidance.append("The ineffective query rewrite rules:")
             for rule in applicable_rules:
                 pruning_guidance.append(f"{rule}")
+
+    if len(pruning_guidance) == 1:
+        pruning_guidance.append("None")
 
     return "\n".join(pruning_guidance)
 
@@ -98,7 +105,7 @@ def _get_failed_index_actions(root_causes, query_info, memory_manager):
 
 
 def _get_applicable_rewrite_rules(query_info, memory_manager):
-    target_root = memory_manager._normalize_root_causes(["poorly written queries"])
+    target_root = memory_manager._normalize_root_causes(["query"])
     target_island_ids = list(memory_manager.islands.get(target_root, set()))
 
     if not target_island_ids:
@@ -141,15 +148,16 @@ def _get_applicable_rewrite_rules(query_info, memory_manager):
 
 
 def action_refinement(root_causes, query_info, memory_manager):
-    has_knob_root = "inappropriate query knobs" in root_causes
-    has_hint_root = "suboptimal plan optimizer" in root_causes
+    root_causes = normalize_components(root_causes)
+    has_knob_root = "knob" in root_causes
+    has_hint_root = "hint" in root_causes
 
     if not has_knob_root and not has_hint_root:
         return ""
 
     refinement_guidance = []
     refinement_guidance.append(
-        "• Action Refinement: Based on historical success cases with the same root cause, "
+        "    • Action Refinement: Based on historical success cases with the same root cause, "
         "the following continuous operations have been proven effective, suggest prioritizing exploration:"
     )
 
@@ -162,6 +170,9 @@ def action_refinement(root_causes, query_info, memory_manager):
         hint_guidance = _get_hint_refinement_guidance(root_causes, query_info, memory_manager)
         if hint_guidance:
             refinement_guidance.append(hint_guidance)
+
+    if len(refinement_guidance) == 1:
+        refinement_guidance.append("None")
 
     return "\n".join(refinement_guidance)
 
@@ -199,7 +210,7 @@ def _get_knob_refinement_guidance(root_causes, query_info, memory_manager, min_t
 
     guidance = []
     guidance.append(
-        "\n• Knob Tuning Space Refinement: Based on historical successful cases, "
+        "• Knob Tuning Space Refinement: Based on historical successful cases, "
         "the following knob value ranges are recommended for exploration:"
     )
 
@@ -254,7 +265,7 @@ def _get_hint_refinement_guidance(root_causes, query_info, memory_manager):
 
     if positive_hints:
         guidance.append(
-            "\n• Query Hint Refinement: Based on historical hint usage data, the "
+            "• Query Hint Refinement: Based on historical hint usage data, the "
             "following hints have shown positive performance impact:"
         )
         positive_hints.sort(key=lambda x: x[1]["avg_improvement"], reverse=True)
@@ -363,20 +374,20 @@ def _extract_hints_from_action(action_str):
 
 
 def _build_basic_action_space(root_causes):
-    root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
+    root_causes = normalize_components(root_causes)
     action_space_prompt = ""
 
-    if "missing indexes" in root_causes:
+    if "index" in root_causes:
         action_space_prompt += """
     • Index Space: 
     - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx.
     - Index creation should be strictly guided by the slow_sql queries.
-    - Consider the query execution plan to identify missing indexes that could improve performance.
+    - Consider the query execution plan to identify beneficial indexes that could improve performance.
     - Avoid generating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
     - Use CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS to create or drop indexes.
     """
 
-    if "inappropriate query knobs" in root_causes:
+    if "knob" in root_causes:
         action_space_prompt += """
     • Knob Space:  
     - You can adjust database configuration parameters using SET knob = value.
@@ -385,16 +396,16 @@ def _build_basic_action_space(root_causes):
     - Use SET statement to modify database knobs.
     """
 
-    if "suboptimal plan optimizer" in root_causes:
+    if "hint" in root_causes:
         action_space_prompt += """
-    • Plan Optimizer Space: 
+    • Hint Space: 
     - Use PostgreSQL comment-style hints to guide query execution.
     - Output ONLY the hint block like: /*+ Set(knob_name value) Set(knob_name value) ... */
     - Do NOT include the SQL query when using hints.
     - Use hints to force specific join methods, scan types, etc.
     """
 
-    if "poorly written queries" in root_causes:
+    if "query" in root_causes:
         action_space_prompt += """
     • Query Rewrite Space: 
     - Query Rewrite need to generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query while improving performance.
@@ -410,9 +421,9 @@ def _integrate_pruning_and_refinement(base_action_space, pruning_guidance, refin
     enhanced_space = base_action_space
 
     if pruning_guidance:
-        enhanced_space += f"\n\n{pruning_guidance}"
+        enhanced_space += f"\n{pruning_guidance}"
 
     if refinement_guidance:
-        enhanced_space += f"\n\n{refinement_guidance}"
+        enhanced_space += f"\n{refinement_guidance}"
 
     return enhanced_space

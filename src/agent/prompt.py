@@ -3,58 +3,72 @@ Prompt generation functions for database optimization system.
 This module contains all prompt generation functions extracted from action_manager.py and planner.py.
 """
 
+from agent.contracts import (
+    CANONICAL_COMPONENTS,
+    COMPONENT_ACTION_SPACE_NAMES,
+    format_component_label,
+    normalize_component_confidence_map,
+    normalize_components,
+    normalize_tuning_history,
+)
+
 
 def fmt_cases(cases):
+    if not cases:
+        return "None."
+
     lines = []
     for i, case in enumerate(cases, 1):
-        lines.append(f"\n    Case {i}:\n    SQL: {case.get('query_info').get('query')}\n    Execution Plan: {case.get('query_info').get('plan_json')}\n    Origin Execution Runtime: {case.get('query_info').get('execution_time')}s\n    Root Causes: {case.get('root_causes')}\n    Fix_Actions: {case.get('fix_action')}\n    Improve: {case.get('approve_time')}")
+        query_info = case.get("query_info", {})
+        lines.append(
+            f"\n    Case {i}:"
+            f"\n    SQL: {query_info.get('query')}"
+            f"\n    Execution Plan: {query_info.get('plan_json')}"
+            f"\n    Origin Execution Runtime: {query_info.get('execution_time')}s"
+            f"\n    Components: {format_component_label(case.get('root_causes'))}"
+            f"\n    Tuning_Action: {case.get('fix_action')}"
+            f"\n    Improve: {case.get('approve_time')}"
+        )
     return "\n".join(lines)
-    # try:
-    #     return "\n".join([
-    #         f"• SQL: {c.get('query_info').get('query')}\n Execution Plan: {c.get('query_info').get('plan_json')}\n Execution Runtime: {c.get('query_info').get('execution_time')}s\n RootCauses: {c.get('root_causes')}\n  Fix_Action: {c.get('fix_action')}\n  Improve: {c.get('approve_time')}s" for c in cases
-    #     ])
-    # except Exception:
-    #     return str(cases)
 
 
 def build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives):
     """
     Format a prompt that feeds the LLM with all necessary context and enforces
-    a consistent two-part output: Explanation + SQL Fix.
+    a consistent Appendix A Tuning Agent output contract.
     """
     query_info = base_info.get("query_info")
     db_info = base_info.get("database_info", {})
+    components = normalize_components(root_cause)
+    action_space = (action_space or "None")
 
     positives_text = fmt_cases(positives)
     negatives_text = fmt_cases(negatives)
 
     # Mode prompt
     if mode == "exploit":
-        mode_instruction = """You are now in **EXPLOIT mode**. Refer to the following Positive Cases and Negative Cases, which are derived from historical fixes under the same root cause. 
-    - Positive Cases represent effective fixes. Treat their Fix_Actions as **examples of optimization patterns**, You must **not copy them directly or merely reorder them**. Instead, propose **new fix_actions** that explore additional possibilities. 
-    - Negative Cases represent ineffective fixes. Reflect on which actions led to no improvement or performance degradation, and avoid adopting these fix_actions in your solution.
-        """
+        mode_instruction = """You are now in EXPLOIT mode.
+    - Positive Observations come from historical fixes under the same predicted components.
+    - Negative Observations record ineffective directions and must be avoided.
+    - Treat prior Tuning_Action entries as optimization patterns, not reusable output."""
     else:
-        mode_instruction = """You are now in **EXPLORE mode**. Refer to the following Positive Cases and Negative Cases, which are derived from historical fixes under different root causes.
-    - Positive Cases represent effective fixes. Treat their Fix_Actions as **examples of optimization patterns**, You must **not copy them directly or merely reorder them**. Instead, propose **new fix_actions** that explore additional possibilities under the new root cause(s).
-    - Negative Cases represent ineffective fixes. Reflect on which actions led to no improvement or performance degradation under other root causes, and avoid adopting these fix_actions in your solution.
-        """
+        mode_instruction = """You are now in EXPLORE mode.
+    - Positive Observations come from historical fixes under different predicted components.
+    - Negative Observations capture ineffective directions and must be avoided.
+    - Use them only to inspire new actions inside the allowed action space for the current components."""
 
-    return f"""As an SQL optimization expert, your task is to diagnose and fix the following slow SQL query.
-    You have the context of slow SQL and the root cause of the performance degradation as below:
-
+    return f"""You are an SQL optimization expert. The bottleneck-related tuning components have already been localized by the Detection Agent. Your job is to recommend executable tuning action(s) only within the localized tuning subspace, using the current query context, retrieved historical observations with experiences, and the refined action space.
     ## Context
     1. Query Information:
     • SQL: {query_info.query}
     • Execution Plan: {query_info.plan_json}
     • Execution Runtime: {query_info.execution_time} s
     • Internal Metrics: Tuples Returned:{query_info.internal_metrics[0]}, Blocks Hit:{query_info.internal_metrics[1]}, Blocks Read:{query_info.internal_metrics[2]}, Tuples Fetched:{query_info.internal_metrics[3]}, Index Tuples Fetched:{query_info.internal_metrics[4]}, Sequential Tuples Read:{query_info.internal_metrics[5]}, Sequential Scans:{query_info.internal_metrics[6]}, Index Scans:{query_info.internal_metrics[7]}, Heap Blocks Hit:{query_info.internal_metrics[8]}, Heap Blocks Read:{query_info.internal_metrics[9]}, Index Blocks Hit:{query_info.internal_metrics[10]}, Index Blocks Read:{query_info.internal_metrics[11]}
-
     2. Database Environment Information:
     • Database Type: {db_info.get('db_type')}
     • Workload Type: {db_info.get('workload_type')}
     • Database Size: {db_info.get('size')}
-    • Database Schema: TPC-H
+    • Database Schema: {db_info.get('schema') or db_info.get('dbname') or 'unknown'}
     • CPU: {query_info.external_metrics[0]}
     • Read I/O: {query_info.external_metrics[1]}
     • Write I/O: {query_info.external_metrics[2]}
@@ -62,49 +76,33 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     • Physical Memory: {query_info.external_metrics[4]}
     • Net Received: {query_info.external_metrics[5]}
     • Net Sent: {query_info.external_metrics[6]}
-
-    3. **Identified Root Cause**: {root_cause}
-
-    ## Mode Instruction
+    3. Localized Bottleneck Component(s): {components}
+    4. Tuning Mode
     {mode_instruction}
-    • Positive Cases (effective references): {positives_text}
-    • Negative Cases (ineffective references to avoid): {negatives_text}
-
-    ## Historical Case Reflection
-    Before proposing your optimization solution, analyze the historical cases to understand why certain approaches succeeded or failed, then adapt successful patterns to the current context while avoiding patterns that failed in similar situations.
-
-    ## Action Space
-    - If the root cause is "inappropriate query knobs", you MUST perform actions within Knob Space using SET knob = value.
-    - If the root cause is "suboptimal plan optimizer", you MUST perform actions within Plan Optimizer Space using PostgreSQL comment-style hints ONLY. Output ONLY the hint block like: /*+ Set(knob_name value) Set(knob_name value) ... */. Do NOT include the SQL query.
-    - If the root cause is "missing indexes", you MUST perform actions within Index Space using CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS.
-    - If the root cause is "poorly written queries", you MUST perform actions within Query Rewrite Space using rewrite SQL.
-    - **If multiple root causes are identified, you MUST consider all FIX_ACTION outputs jointly and determine the optimal solution that addresses the combined root causes, while strictly limiting actions to the relevant action spaces of the identified root causes. Do not perform any actions outside of these specified root causes.**
-    - The Action Space defines the operations that allowed to perform, you MUST strictly limit your Fix_Action to these spaces. Do not adjust or introduce any actions beyond what is explicitly defined in the following Action Space.
+    5. Retrieved Historical Observations and Experiences
+    • Positive Observations (historically effective): {positives_text}
+    • Negative Observations (historically ineffective): {negatives_text}
+    6. Reflective Reasoning Guidance
+    Before proposing your optimization solution, analyze the historical observations and experiences to understand why certain approaches succeeded or failed. Adapt successful patterns to the current context while avoiding patterns that failed in similar situations.
+    7. Refined Tuning Subspace
     {action_space}
-
     ## Constraints
-    - Fix action must be executable directly in {db_info.get('db_type')}.
-    - Please ensure that the proposed fix_action strictly addresses the Identified Root Cause and does not deviate from the Action Space.
-    - The fix action should be safe and should not drop or delete data unless explicitly required by the root cause.
-
+    • Tuning_Action must be executable directly in {db_info.get('db_type')}.
+    • The Tuning_Action must only operate on the component(s) listed in {components}.
+    • The Tuning_Action should be safe and should not drop or delete data unless explicitly required by the predicted components.
     ## Output Format
-    You must output ONLY in the following format, with explanation and fix action:
-
+    You must output ONLY in the following format:
     Explanation:
-    <concise technical reason why the root cause is causing the slowdown now>
-
-    Fix_Action:
-    <your fix action here, do not include any other text, if no fix action is needed, output an empty string>
-
+    <concise technical reason why the predicted components are causing the slowdown now>
+    Tuning_Action:
+    <your tuning action here, do not include any other text, if no tuning action is needed, output an empty string>
     Query_Rewrite:
     <yes or no>
-
     ## Output Requirements
-    - "Explanation" must be a short, precise, technical summary — no generic statements.
-    - If the fix rewrites the SQL, "Query_Rewrite" must be "yes", else "no".
-    - If rewriting, provide the optimized SQL under Fix_Action.
-    - If adding indexes or changing knobs, provide the exact SQL or command.
-    - Do not output any extra sections, comments, or steps."""
+    • "Explanation" must be short, precise, and technical.
+    • Tuning_Action must contain only executable tuning statements.
+    • Set Query_Rewrite to yes if the selected action(s) involve query rewriting, and place the full rewritten SQL in Tuning_Action; otherwise, set Query_Rewrite to no.
+    • If multiple executable statements are needed, place all of them in Tuning_Action in executable form."""
 
 
 def build_fix_prompt(fix_action, err):
@@ -113,11 +111,11 @@ def build_fix_prompt(fix_action, err):
     • Non-executable SQL: {fix_action}
     • Database Error Message: {err}
     Your sole objective is to produce a corrected, fully-formed SQL statement (or an ordered sequence of SQL statements) that will run without error.
-    Strict rules — follow exactly:
-    1) OUTPUT NOTHING BUT THE SQL STATEMENT(S). No explanations, no comments, no markdown, no surrounding quotes.
-    2) If a single statement suffices, output exactly that statement, terminated by a single semicolon and a newline.
-    3) If multiple statements are required, output them in execution order, each terminated by a semicolon and a newline.
-    -- Output (strict) --
+    Strict output rules:
+    1. OUTPUT NOTHING BUT THE SQL STATEMENT(S). No explanations, no comments, no markdown, no surrounding quotes.
+    2. If a single statement suffices, output exactly that statement, terminated by a single semicolon and a newline.
+    3. If multiple statements are required, output them in execution order, each terminated by a semicolon and a newline.
+     — Output Format —
     <paste only the corrected fix action statement(s) here, exactly as SQL, nothing else>"""
 
 
@@ -129,25 +127,21 @@ def build_rewrite_prompt(origin_sql, rewrite_sql):
     Your task is to rewrite the Divergent SQL so that its result set matches the Reference SQL exactly.
 
     Strict output rules:
-    1. Output only the corrected SQL statement.
-    2. Do not include explanations, comments, markdown, or any extra text.
-    3. The SQL must be fully executable and self-contained.
-    4. Preserve the original intent and structure of the Divergent SQL as much as possible while ensuring the output matches exactly.
-    5. If you cannot rewrite the SQL, output the original SQL.
+    1. Output only the revised SQL statement, which must be executable and self-contained. Do not include explanations, comments, markdown, or any extra text.
+    2. Preserve the original intent and structure of the Divergent SQL as much as possible while ensuring the output matches exactly.
+    3. If you cannot rewrite the SQL, output the original SQL.
 
     — Output Format —
     <paste only the revised SQL here, exactly as SQL, nothing else>"""
 
 
-def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence, tuning_history=None, timeout=300):
-    """Build prompt for LLM-based root cause diagnosis with per-label confidence map.
-
-    tuning_history: Optional list summarizing per-root-cause success/failure counts, e.g.,
-      [
-        {"label": "missing indexes", "success_count": 2, "fail_count": 3},
-        {"label": "inappropriate query knobs", "success_count": 1, "fail_count": 0}
-      ]
-    """
+def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence, tuning_history=None, database_info=None, timeout=300):
+    """Build prompt for LLM-based component diagnosis with per-label confidence map."""
+    
+    root_causes = normalize_components(root_causes)
+    state_confidence = normalize_component_confidence_map(state_confidence)
+    tuning_history = normalize_tuning_history(tuning_history)
+    database_info = database_info or {}
 
     # Handle timeout case
     execution_time_text = f"{query_info.execution_time} s"
@@ -167,11 +161,12 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
     else:
         history_text = "No previous tuning attempts recorded."
 
-    return f"""As a database performance diagnosis expert, your task is to identify the **most likely root cause(s) and diagnosis confidence** of the following slow SQL query.
-
+    return f"""You are a database performance diagnosis expert. Your task is to localize the most promising tuning component space(s) for the following slow SQL query. Rather than diagnosing generic performance causes from scratch, you should refine the lightweight model's component scores using the current query context, trajectory-level tuning feedback, and DBA-style knowledge to identify a high-impact set of target tuning components.
+    ## Candidate Tuning Components
+    The allowed components are exactly: [index, knob, hint, query]
     ## Context
-    1. Query Information:
-    • SQL: {query_info.query}
+    1. Query Information
+    • SQL Statement: {query_info.query}
     • Execution Plan: {query_info.plan_json}
     • Execution Runtime: {execution_time_text}
     • Internal Metrics: Tuples Returned:{query_info.internal_metrics[0]}, Blocks Hit:{query_info.internal_metrics[1]}, Blocks Read:{query_info.internal_metrics[2]}, Tuples Fetched:{query_info.internal_metrics[3]}, Index Tuples Fetched:{query_info.internal_metrics[4]}, Sequential Tuples Read:{query_info.internal_metrics[5]}, Sequential Scans:{query_info.internal_metrics[6]}, Index Scans:{query_info.internal_metrics[7]}, Heap Blocks Hit:{query_info.internal_metrics[8]}, Heap Blocks Read:{query_info.internal_metrics[9]}, Index Blocks Hit:{query_info.internal_metrics[10]}, Index Blocks Read:{query_info.internal_metrics[11]}
@@ -182,44 +177,46 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
     • Physical Memory: {query_info.external_metrics[4]}
     • Net Received: {query_info.external_metrics[5]}
     • Net Sent: {query_info.external_metrics[6]}
-
-    2. Plan-Aware Exploration:
-    - Analyze execution plan and runtime metrics to guide confidence adjustments:
-     * missing indexes: If the execution plan shows large sequential scans on big tables with selective filters (e.g., WHERE clauses on non-indexed columns), and CPU is high while I/O is moderate, increase confidence for 'missing indexes'.
-     * suboptimal plan optimizer: If the execution plan shows complex joins, nested loops, or inefficient aggregation strategies (e.g., hashed vs. sorted aggregation), especially when the estimated rows differ significantly from actual rows, increase confidence for 'suboptimal plan optimizer'.
-     * inappropriate query knobs: High CPU with low I/O, or repeated parallel workers not utilized efficiently, increase confidence for 'inappropriate query knobs'.
-     * poorly written queries: Large aggregations, complex expressions, unnecessary computations in SELECT/GROUP BY clauses, increase confidence for 'poorly written queries'.
-
-    3. Initial Suggestion:
-    - Initial model suggested root causes: {root_causes}
-    - Initial model confidence (0-1): {state_confidence}
-    - Historical Tuning Summary (per root cause): {history_text}
-
-    4. Root Cause Diagnosis Guidance:
-    Use the **Query Information** and the **Initial Suggestion** to infer the root causes and their confidence, as follows:
-    - If a label has success_count = 0 and fail_count > 0, it is likely incorrect. Gradually reduce its confidence below 0.5, while gradually increasing the confidence of other root causes supported by Query Information until they exceed 0.5. If the label remains low after repeated failures, fully shift confidence to other unexplored candidates root causes.
-    - If a label has success_count > 0 and fail_count = 0, it indicates consistent potential. CONTINUE exploring this root cause. Gradually increase its confidence as evidence accumulates.  
-    - If a label has success_count > 0 and fail_count > 0, it indicates partial benefit but decreasing returns. CONTINUE using this root cause as a reference, and increase the other root causes confidence for exploraiton. Adjust confidence downward if further attempts do not yield improvements.  
-
-    5. Confidence rules Guidance:
-    - Confidence adjustment of each root cause **MUST** be restricted to the range of [0.1,0.3].  
-    - If a root cause shows no improvement after multiple rounds, reduce its confidence below 0.5 to retire it from active diagnosis. In such cases, select a new candidate root cause for exploration, initializing its confidence slightly above 0.5. 
-    - Confidence values should reflect both historical results and current judgment based on Query Information, Ensure the model makes independent judgments about which root causes to explore next, rather than blindly following previous confidence values.  
- 
+    2. Database Environment Information
+    • Database Type: {database_info.get('db_type')}
+    • Workload Type: {database_info.get('workload_type')}
+    • Database Size: {database_info.get('size')}
+    • Database Schema: {database_info.get('schema') or database_info.get('dbname') or 'unknown'}
+    3. Lightweight Model Scores
+    These scores are produced by data-driven model and should be treated as the anchor for reasoning.
+    • suggested tuning spaces: {root_causes}
+    • confidence scores (0-1): {state_confidence}
+    ## Reasoning Guidance
+    1. Historical Tuning Summary
+    {history_text}
+    2. Trajectory-Guided Confidence Refinement
+    Refine the component scores according to the following principles:
+    • If success_count > 0 and fail_count = 0: increase confidence since past interventions validate it as an actionable bottleneck.
+    • If success_count = 0 and fail_count > 0: decrease confidence and encourage exploration of alternative components, since previous interventions have not led to improvement.
+    • If success_count > 0 and fail_count > 0: retain the confidence and make conservative adjustment by jointly considering the data-driven score and knowledge-driven reasoning.
+    3. DBA Knowledge-Guided Reasoning
+    Use DBA-style reasoning over the query context to validate or revise the component scores.
+    • Index bottlenecks: Index bottlenecks are characterized by large-range scans on selective predicates. Typical evidence includes a large gap between scanned and returned rows, predicates that cannot be effectively exploited by indexes, and repeated heap/table access due to non-covering indexes.
+    • Plan suboptimality: A plan bottleneck is usually reflected by expensive operator choices that force unnecessary sorting, temporary materialization, or inefficient joins. Typical evidence includes temporary-table creation and extra sorting due to unordered access paths.
+    • Knob misconfiguration: Knob tuning becomes important when analytical operators spill to disk or lack sufficient memory or parallel resources. Typical evidence includes disk-backed temporary tables, underutilized parallel workers, and high-cost join or aggregation execution under limited resources.
+    • Query formulation inefficiency: Query rewriting is prioritized when the SQL structure itself introduces unnecessary work. Typical evidence includes join patterns missing valid ON conditions or using always-true predicates, deep pagination with large OFFSET, UNION without ALL, overlong IN lists, and join patterns with Cartesian-product risk.
+    4. Confidence Rules
+    • Restrict each component's confidence adjustment to [0.1, 0.3].
+    • If a tuning component shows no improvement after multiple rounds, reduce its confidence below 0.5 and increase the confidence of a new candidate component slightly above 0.5.
+    • Confidence values should reflect both historical tuning feedback and the current query context.
     ## Constraints (STRICT)
-    - You MUST output ALL allowed labels WITH a confidence in [0,1]: missing indexes, inappropriate query knobs, suboptimal plan optimizer, poorly written queries
-    - You MUST also output a separate array `predicted_root_causes` listing the final predicted root cause labels (derived from confidence and considering historical priors above).
-    - `predicted_root_causes` MUST be exactly the set of labels with confidence > 0.5. Labels with confidence ≤ 0.5 MUST NOT appear in `predicted_root_causes`.
-    - You MUST output strict JSON only in the format below. No extra text, no explanation.
-
-    ## Output JSON Example
+    • You MUST output ALL allowed component labels with a confidence score in [0,1]: {", ".join(CANONICAL_COMPONENTS)}.
+    • You MUST also output a separate array predicted_components listing the final selected tuning components.
+    • predicted_components MUST be exactly the set of labels with confidence > 0.5. Labels with confidence <= 0.5 MUST NOT appear in predicted_components.
+    • You MUST output strict JSON only in the format below. No extra text and no explanation.
+    Output JSON Format:
     {{
-      "predicted_root_causes": ["missing indexes"],
-      "root_causes": [
-        {{"label": "missing indexes", "confidence": 0.72}},
-        {{"label": "inappropriate query knobs", "confidence": 0.18}},
-        {{"label": "suboptimal plan optimizer", "confidence": 0.10}},
-        {{"label": "poorly written queries", "confidence": 0.05}}
+      "predicted_components": ["index"],
+      "components": [
+        {{"label": "index", "confidence": 0.72}},
+        {{"label": "knob", "confidence": 0.18}},
+        {{"label": "hint", "confidence": 0.10}},
+        {{"label": "query", "confidence": 0.05}}
       ]
     }}"""
 
@@ -227,64 +224,68 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
 def build_action_space_prompt(root_causes, db, knob_config, current_knob_values, query_info=None):
     """Build action space prompt based on root causes."""
     # Root causes
-    root_causes = root_causes if isinstance(root_causes, list) else [root_causes]
+    root_causes = normalize_components(root_causes)
 
     # Build action space prompt based on root causes
     action_space_prompt = ""
 
     # Index related
-    if "missing indexes" in root_causes:
+    if "index" in root_causes:
         current_indexes = db.get_indexes() if db else []
-        action_space_prompt += f"""
-    • Index Space: 
+        action_space_prompt += f"""• Index Space: 
     - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx.
     - Index creation should be strictly guided by the slow_sql queries.
-    - Consider the query execution plan to identify missing indexes that could improve performance.
+    - Consider the query execution plan to identify beneficial indexes that could improve performance.
     - Avoid generating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
     - Do not conflict with the existing indexes in the database: {current_indexes}
     """
 
     # Knob related
-    if "inappropriate query knobs" in root_causes:
+    if "knob" in root_causes:
         system_knobs_specs = knob_config.get("system_knobs")
         current_values = current_knob_values.get("system_knobs")
 
         knob_lines = []
         for knob_name, spec in system_knobs_specs.items():
             current_val = current_values.get(knob_name)
-            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
+            knob_lines.append(
+                f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, "
+                f"max: {spec.get('max')}, default: {spec.get('default')}, "
+                f"current: {current_val}"
+            )
 
-        action_space_prompt += f"""
-    • Knob Space:  
-    - Knob Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
+        action_space_prompt += f"""• Knob Space:  
+    - Knob Space is strictly limited to the following knobs, you must only use these knobs in your Tuning_Action, and any knob not explicitly listed here must not be used: 
     {knob_lines}
     """
 
     # Execution plan/optimizer related
-    if "suboptimal plan optimizer" in root_causes:
+    if "hint" in root_causes:
         query_knobs_specs = knob_config.get("query_knobs")
         current_values = current_knob_values.get("query_knobs")
 
         knob_lines = []
         for knob_name, spec in query_knobs_specs.items():
             current_val = current_values.get(knob_name)
-            knob_lines.append(f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, max: {spec.get('max')}, default: {spec.get('default')}, current: {current_val}")
+            knob_lines.append(
+                f"{knob_name}: type: {spec.get('type')}, min: {spec.get('min')}, "
+                f"max: {spec.get('max')}, default: {spec.get('default')}, "
+                f"current: {current_val}"
+            )
 
-        action_space_prompt += f"""
-    • Plan Optimizer Space: 
-    - Plan Optimizer Space is strictly limited to the following knobs, you must only use these knobs in your Fix_Action, and any knob not explicitly listed here must not be used: 
+        action_space_prompt += f"""• Hint Space: 
+    - Hint Space is strictly limited to the following knobs, you must only use these knobs in your Tuning_Action, and any knob not explicitly listed here must not be used: 
     {knob_lines}
-    - **IMPORTANT**: When using Plan Optimizer Space, output ONLY the hint block. Do NOT include the original SQL. Example: /*+ Set(enable_hashjoin on) Set(enable_sort on) */"""
+    - **IMPORTANT**: When using Hint Space, output ONLY the hint block. Do NOT include the original SQL. Example: /*+ Set(enable_hashjoin on) Set(enable_sort on) */"""
 
     # SQL readability/rewrite related
-    if "poorly written queries" in root_causes:
+    if "query" in root_causes:
         from agent.action.rule_matcher import SQLRuleMatcher
 
         matcher = SQLRuleMatcher()
         rule_descriptions = matcher.get_rule_descriptions(query_info.query)
 
-        action_space_prompt += f"""
-    • Query Rewrite Space: 
+        action_space_prompt += f"""• Query Rewrite Space: 
     - Query Rewrite need to generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query while improving performance.
     - **Analysis-Based Optimization**: The following rewrite rules have been identified as applicable based on the query structure analysis:
     {rule_descriptions}
@@ -313,9 +314,9 @@ def get_diagnostic_agent_instructions():
     return """You are an expert in database performance diagnosis and SQL optimization.
     Your role is to:
     1. Understand detailed database and query execution context.
-    2. Identify how the root cause leads to performance degradation.
-    3. Output exactly three labeled sections: Explanation, Fix_Action and Query_Rewrite.
-    4. Always make the Fix_Action executable directly in the target database.
+    2. Identify how the predicted components lead to performance degradation.
+    3. Output exactly three labeled sections: Explanation, Tuning_Action and Query_Rewrite.
+    4. Always make the Tuning_Action executable directly in the target database.
     5. Never include extra text, comments, or sections beyond the required format.
     6. Always apply the given MCP APIs when producing fixes, if applicable.
     7. Assume the provided execution plan, metrics, and environment info are accurate.
@@ -324,8 +325,8 @@ def get_diagnostic_agent_instructions():
 
 def get_root_cause_llm_instructions():
     """Get instructions for the root cause diagnosis LLM."""
-    return """You are a database slow SQL root cause diagnosis expert.
-    Only output the allowed root cause label(s) and their confidence in json format, nothing else."""
+    return """You are a database slow SQL bottleneck component diagnosis expert.
+    Only output strict JSON using the fields predicted_components and components, nothing else."""
 
 
 def build_simple_diagnosis_prompt(query_info, base_info):
@@ -346,7 +347,7 @@ def build_simple_diagnosis_prompt(query_info, base_info):
     • Database Type: {db_info.get('db_type')}
     • Workload Type: {db_info.get('workload_type')}
     • Database Size: {db_info.get('size')}
-    • Database Schema: TPC-H
+    • Database Schema: {db_info.get('schema')}
     • CPU: {query_info.external_metrics[0]}
     • Read I/O: {query_info.external_metrics[1]}
     • Write I/O: {query_info.external_metrics[2]}
@@ -362,7 +363,7 @@ def build_simple_diagnosis_prompt(query_info, base_info):
     - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx
     - You MUST use the CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS to create or drop indexes.
     - Index creation should be strictly guided by the slow_sql queries
-    - Consider the query execution plan to identify missing indexes
+    - Consider the query execution plan to identify beneficial indexes
     - Avoid generating duplicate or subsumed indexes
     - Do not drop primary keys, unique indexes, or constraint indexes
     
@@ -371,7 +372,7 @@ def build_simple_diagnosis_prompt(query_info, base_info):
     - Focus on parameters that can improve query performance
     - Be conservative with changes to avoid system instability
     
-    • Plan Optimizer Space: Use PostgreSQL hints to guide query execution
+    • Hint Space: Use PostgreSQL hints to guide query execution
     - Output ONLY the hint block like: /*+ Set(knob_name value) Set(knob_name value) ... */
     - Do NOT include the SQL query when using hints
     - Use hints to force specific join methods, scan types, etc.
@@ -383,8 +384,8 @@ def build_simple_diagnosis_prompt(query_info, base_info):
     - Maintain identical result set and semantic equivalence
 
     ## Constraints
-    - Fix action must be executable directly in {db_info.get('db_type')}
-    - The fix action should be safe and should not drop or delete data unless necessary
+    - Tuning_Action must be executable directly in {db_info.get('db_type')}
+    - The action should be safe and should not drop or delete data unless necessary
     - Ensure all proposed actions are syntactically correct and executable
 
     ## Output Format
@@ -393,7 +394,7 @@ def build_simple_diagnosis_prompt(query_info, base_info):
     Explanation:
     <concise technical reason for the performance issue and proposed solution>
 
-    Fix_Action:
+    Tuning_Action:
     <your fix SQL or optimization action here>
 
     Query_Rewrite:
@@ -402,7 +403,7 @@ def build_simple_diagnosis_prompt(query_info, base_info):
     ## Output Requirements
     - "Explanation" must be a short, precise, technical summary
     - If the fix rewrites the SQL, "Query_Rewrite" must be "yes", else "no"
-    - If rewriting, provide the optimized SQL under Fix_Action
+    - If rewriting, provide the optimized SQL under Tuning_Action
     - If adding indexes or changing knobs, provide the exact SQL or command
     - Do not output any extra sections, comments, or steps
     - Focus on the most impactful optimization for this specific query"""

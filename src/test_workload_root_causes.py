@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from agent.contracts import CANONICAL_COMPONENTS
 from agent.db_agent import DBAgent
 from utils.types import QueryInfo
 
@@ -62,12 +63,7 @@ def parse_args():
 
 def generate_all_root_cause_combinations():
     """Generate all possible root cause combinations"""
-    root_cause_types = [
-        "missing indexes",
-        "inappropriate query knobs",
-        "suboptimal plan optimizer",
-        "poorly written queries",
-    ]
+    root_cause_types = list(CANONICAL_COMPONENTS)
     
     combinations = []
     # Generate all combinations from 1 to len(root_cause_types)

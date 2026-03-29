@@ -15,6 +15,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from numpy.linalg import norm
 
+from agent.contracts import (
+    CANONICAL_COMPONENTS,
+    normalize_component_label,
+)
 # Import soft Q retriever
 from agent.memory.soft_q_retriever import SoftQRetriever
 from agent.plan.RCRank.utils.load_data import (
@@ -81,12 +85,7 @@ class MemoryManager:
 
         self.current_round = 1
 
-        self.root_cause_types = [
-            "missing indexes",
-            "inappropriate query knobs",
-            "suboptimal plan optimizer",
-            "poorly written queries",
-        ]
+        self.root_cause_types = list(CANONICAL_COMPONENTS)
         # Support multiple root cause combinations
         self.island_keys = self._generate_island_keys(self.root_cause_types)
         self.islands = {key: set() for key in self.island_keys}
@@ -124,8 +123,7 @@ class MemoryManager:
             external_metrics = raw.get("external_metrics", [])
             internal_metrics = raw.get("internal_metrics", [])
 
-            roots = info.get("root_causes") or []
-            roots = roots if isinstance(roots, list) else [roots]
+            roots = self._normalize_root_causes_list(info.get("root_causes"))
             label_vec = [1 if r in roots else 0 for r in label_space]
 
             duration = info.get("new_time", 0.0)
@@ -133,7 +131,8 @@ class MemoryManager:
             # Get tuning attempts per component: n_{i,b}
             # tuning_attempts is a dict mapping component (root_cause_type) to number of attempts
             tuning_attempts = info.get("tuning_attempts", {})
-            if not tuning_attempts or not isinstance(tuning_attempts, dict):
+            tuning_attempts = self._normalize_tuning_attempts(tuning_attempts)
+            if not tuning_attempts:
                 # Fallback: if positive case, assume at least 1 attempt per root cause component
                 # For negative cases, assume 0 attempts (unverified)
                 tuning_attempts = {}
@@ -649,18 +648,22 @@ class MemoryManager:
                            If None, will be estimated from root_causes
             round_num: Current round number (if None, uses self.current_round)
         """
-        approve_time = old_time - new_time
+        approve_time = round(old_time - new_time, 3)
 
         # If tuning_attempts not provided, estimate from root_causes
         if tuning_attempts is None:
             tuning_attempts = {}
             # If positive case, assume at least 1 attempt for each root cause component
             if label == "positive":
-                root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
+                root_causes_list = self._normalize_root_causes_list(root_causes)
                 for rc in root_causes_list:
                     if rc in self.root_cause_types:
                         tuning_attempts[rc] = tuning_attempts.get(rc, 0) + 1
             # For negative cases, we can't reliably estimate, so leave as empty dict
+        else:
+            tuning_attempts = self._normalize_tuning_attempts(tuning_attempts)
+
+        root_causes = self._normalize_root_causes_list(root_causes)
 
         # Use provided round_num or current_round
         if round_num is None:
@@ -754,6 +757,9 @@ class MemoryManager:
             self._last_finetune_count = 0
 
     def _build_memory_case_from_info(self, case_id, case_info):
+        case_info = dict(case_info)
+        case_info["root_causes"] = self._normalize_root_causes_list(case_info.get("root_causes"))
+        case_info["tuning_attempts"] = self._normalize_tuning_attempts(case_info.get("tuning_attempts"))
         raw_info = case_info["query_info"]
 
         if "is_rewrite" not in raw_info:
@@ -835,6 +841,7 @@ class MemoryManager:
             return self.retrieve_dynamic_cases(query_info, root_causes, pos_n, neg_n, mode)
 
     def retrieve_dynamic_cases(self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"):
+        root_causes = self._normalize_root_causes_list(root_causes)
         # Get all candidate cases
         all_cases = list(self.cases.values())
         if not all_cases:
@@ -845,14 +852,14 @@ class MemoryManager:
             # Exploit mode: select cases with same root cause
             candidate_cases = []
             for case in all_cases:
-                case_root_causes = case.case_info.get("root_causes")
+                case_root_causes = self._normalize_root_causes_list(case.case_info.get("root_causes"))
                 if any(rc in case_root_causes for rc in root_causes):
                     candidate_cases.append(case.case_info)
         elif mode == "explore":
             # Explore mode: select cases with different root causes
             candidate_cases = []
             for case in all_cases:
-                case_root_causes = case.case_info.get("root_causes")
+                case_root_causes = self._normalize_root_causes_list(case.case_info.get("root_causes"))
                 if not any(rc in case_root_causes for rc in root_causes):
                     candidate_cases.append(case.case_info)
 
@@ -1064,25 +1071,59 @@ class MemoryManager:
     def _normalize_root_causes(self, root_causes):
         if root_causes is None:
             return frozenset()
+        normalized = self._normalize_root_causes_list(root_causes)
+        if normalized == ["normal"]:
+            return frozenset(["normal"])
+        return frozenset(normalized)
+
+    def _normalize_root_causes_list(self, root_causes):
+        if root_causes is None:
+            return []
         if isinstance(root_causes, str):
-            return frozenset([root_causes])
-        try:
-            return frozenset(root_causes)
-        except Exception:
-            return frozenset([str(root_causes)])
+            candidates = [root_causes]
+        else:
+            try:
+                candidates = list(root_causes)
+            except Exception:
+                candidates = [root_causes]
+
+        normalized = []
+        seen = set()
+        for candidate in candidates:
+            label = normalize_component_label(candidate)
+            if label == "normal":
+                return ["normal"]
+            if label in self.root_cause_types and label not in seen:
+                seen.add(label)
+                normalized.append(label)
+
+        normalized.sort(key=lambda item: self.root_cause_types.index(item))
+        return normalized
+
+    def _normalize_tuning_attempts(self, tuning_attempts):
+        if not isinstance(tuning_attempts, dict):
+            return {}
+
+        normalized = {}
+        for label, count in tuning_attempts.items():
+            component = normalize_component_label(label)
+            if component not in self.root_cause_types:
+                continue
+            normalized[component] = normalized.get(component, 0) + int(count)
+        return normalized
 
     def _infer_root_causes_from_action(self, fix_action, query_info):
         fix_action = str(fix_action).lower()
         query_text = query_info.query.lower().strip()
         inferred: Set[str] = set()
         if "index" in fix_action:
-            inferred.add("missing indexes")
+            inferred.add("index")
         if ("set" in fix_action) and ("=" in fix_action):
-            inferred.add("inappropriate query knobs")
+            inferred.add("knob")
         if ("/*+" in query_text) or ("*/" in query_text):
-            inferred.add("suboptimal plan optimizer")
+            inferred.add("hint")
         if query_info.is_rewrite:
-            inferred.add("poorly written queries")
+            inferred.add("query")
         return frozenset(inferred) if inferred else frozenset()
 
     def _validate_and_route_root_causes(self, case):
@@ -1093,7 +1134,11 @@ class MemoryManager:
         inferred = self._infer_root_causes_from_action(case.case_info.get("fix_action"), query_info)
 
         if inferred and (inferred != declared):
-            case.case_info["root_causes"] = list(inferred)
+            case.case_info["root_causes"] = self._normalize_root_causes_list(inferred)
+        else:
+            case.case_info["root_causes"] = self._normalize_root_causes_list(case.case_info.get("root_causes"))
+
+        case.case_info["tuning_attempts"] = self._normalize_tuning_attempts(case.case_info.get("tuning_attempts"))
 
         key = self._normalize_root_causes(case.case_info.get("root_causes"))
         if key not in self.islands:
@@ -1151,7 +1196,7 @@ class MemoryManager:
         exp_dict = {
             "query_info": query_info.__dict__ if hasattr(query_info, '__dict__') else query_info,
             "case_info": case_info,
-            "root_causes": root_causes if isinstance(root_causes, list) else [root_causes] if root_causes else [],
+            "root_causes": self._normalize_root_causes_list(root_causes),
             "reward": reward,
             "next_query_info_id": next_query_info_id if next_query_info_id else "",
             "done": done,

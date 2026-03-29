@@ -15,6 +15,12 @@ import numpy as np
 import pandas as pd
 from agents import Agent, Runner
 from model.modules.QueryFormer.utils import Encoding
+from agent.contracts import (
+    SMALL_MODEL_COMPONENTS,
+    normalize_component_confidence_map,
+    normalize_components,
+    parse_detection_output,
+)
 from RCRank.utils.plan_encoding import PlanEncoder
 
 from agent.prompt import (
@@ -32,11 +38,14 @@ logger = logging.getLogger(__name__)
 
 
 class Planner:
-    def __init__(self, memory_manager, predictor, agent_config):
+    def __init__(self, memory_manager, predictor, agent_config, db=None, database_config=None):
         self.memory_manager = memory_manager
         self.predictor = predictor
         self.agent_config = agent_config
+        self.db = db
+        self.database_config = database_config or {}
         self.device = predictor.device if predictor is not None else "cpu"
+        self._database_info_cache = None
 
         # Initialize encoding components
         self.encoding = Encoding(None, {"NA": 0})
@@ -97,8 +106,9 @@ class Planner:
             root_causes,
             state_confidence=state_confidence,
             tuning_history=tuning_history,
+            database_info=self._build_database_info(),
         )
-        # print("prompt: ", prompt)
+        print("Detection Agent prompt: ", prompt)
 
         run_result = self.diagnosis_agent(prompt)
         usage_metrics = extract_run_usage_metrics(run_result, "diag_llm")
@@ -136,32 +146,27 @@ class Planner:
         )
         return {"root_causes": labels, "confidence": conf_map, "runtime_metrics": runtime_metrics}
 
+    def _build_database_info(self):
+        if self._database_info_cache is not None:
+            return self._database_info_cache
+
+        db_type = getattr(self.db, "db_type", None) or self.database_config.get("db_type") or "unknown"
+        workload_type = self.database_config.get("workload_type") or "unknown"
+        dbname = self.database_config.get("dbname") or "unknown"
+        size = self.db.get_size()[0] or "unknown"
+        schema = dbname or "unknown"
+
+        self._database_info_cache = {
+            "db_type": db_type,
+            "workload_type": workload_type,
+            "dbname": dbname,
+            "size": size,
+            "schema": schema
+        }
+        return self._database_info_cache
+
     def parse_and_validate(self, json_text):
-        try:
-            data = json.loads(json_text)
-            reported_pred = [str(x).lower().strip() for x in data.get("predicted_root_causes", [])]
-            items = data.get("root_causes", [])
-
-            derived_pred = []
-            conf_map = {}
-            for it in items:
-                label = str(it.get("label", "")).lower().strip()
-                conf = float(it.get("confidence", 0.0))
-                if conf > 0.5:
-                    derived_pred.append(label)
-                conf_map[label] = conf
-
-            # check
-            if set(reported_pred) != set(derived_pred):
-                return None
-
-            if len(derived_pred) == 0:
-                derived_pred = ["normal"]
-                conf_map = {"normal": 1.0}
-
-            return derived_pred, conf_map
-        except Exception:
-            return None
+        return parse_detection_output(json_text)
 
     def _build_prediction_input(self, query_info):
 
@@ -180,10 +185,10 @@ class Planner:
 
         # issue type mapping
         issue_types = {
-            0: "missing indexes",
-            1: "suboptimal plan optimizer",
-            2: "inappropriate query knobs",
-            3: "poorly written queries",
+            0: "index",
+            1: "hint",
+            2: "knob",
+            3: "query",
             4: "normal",
         }
 
@@ -223,14 +228,12 @@ class Planner:
             current_root = model_out.get("root_causes")
             print("Small model predicted root cause: ", current_root)
             pred_opt = model_out.get("pred_label_opt")
-            labels = [
-                "missing indexes",
-                "suboptimal plan optimizer",
-                "inappropriate query knobs",
-                "poorly written queries",
-            ]
+            labels = list(SMALL_MODEL_COMPONENTS)
             confidence = np.array(pred_opt).reshape(-1)
             state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
+        else:
+            current_root = normalize_components(current_root)
+            state["confidence"] = normalize_component_confidence_map(state.get("confidence"))
 
         # Pass current root cause and confidence to LLM
         # Build historical success/failure counts aggregated by root cause

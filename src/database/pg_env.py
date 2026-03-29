@@ -50,6 +50,17 @@ class PostgresDB:
             self.connection = psycopg.connect(self.conn_str, autocommit=True, prepare_threshold=None)
         return self.connection
 
+    def _round_metric_value(self, value):
+        if isinstance(value, float):
+            return round(value, 3)
+        return value
+
+    def _round_metric_sequence(self, values):
+        return [self._round_metric_value(value) for value in values]
+
+    def _round_metric_matrix(self, metrics):
+        return [self._round_metric_sequence(metric) for metric in metrics]
+
     def execute(self, sql, conn=None, timeout=None):
         if conn is None:
             conn = self.connect()
@@ -67,13 +78,13 @@ class PostgresDB:
                     result = cur.fetchall()
                 else:
                     result = None
-                return True, result, end_time - start_time, ""
+                return True, result, self._round_metric_value(end_time - start_time), ""
             except psycopg.errors.SyntaxError as e:
-                return False, None, timeout, str(e)
+                return False, None, self._round_metric_value(timeout), str(e)
             except psycopg.errors.QueryCanceled as e:
-                return False, None, timeout, str(e)
+                return False, None, self._round_metric_value(timeout), str(e)
             except Exception as e:
-                return False, None, timeout, str(e)
+                return False, None, self._round_metric_value(timeout), str(e)
 
     def fetch_results(self, sql, as_json=False, timeout=None):
         if timeout is None:
@@ -349,15 +360,18 @@ class PostgresDB:
             net_recv,
             net_sent,
         ) = monitor.get_monitor_data()
-        return (
-            cpu_usage,
-            read_io,
-            write_io,
-            virtual_memory,
-            physical_memory,
-            net_recv,
-            net_sent,
+        rounded_metrics = self._round_metric_matrix(
+            [
+                cpu_usage,
+                read_io,
+                write_io,
+                virtual_memory,
+                physical_memory,
+                net_recv,
+                net_sent,
+            ]
         )
+        return tuple(rounded_metrics)
 
     def get_plan(self, sql):
         """
@@ -491,8 +505,8 @@ class PostgresDB:
         metrics_list.append(statio_metrics.get("idx_blks_hit", 0))
         metrics_list.append(statio_metrics.get("idx_blks_read", 0))
         # 4. execution_time
-        metrics_list.append(execution_time)
-        return metrics_list
+        metrics_list.append(self._round_metric_value(execution_time))
+        return self._round_metric_sequence(metrics_list)
 
     def get_log_diff(self, log_before, log_after):
         diff = {}
@@ -575,7 +589,7 @@ class PostgresDB:
             net_recv = [0.0] * 9
             net_sent = [0.0] * 9
         
-        metrics = [
+        metrics = self._round_metric_matrix([
             cpu_usage,
             read_io,
             write_io,
@@ -583,7 +597,7 @@ class PostgresDB:
             physical_memory,
             net_recv,
             net_sent,
-        ]
+        ])
 
         log_after = self.collect_metrics(conn)
 
