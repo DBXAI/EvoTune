@@ -86,9 +86,9 @@
   },
   "MEMORY_MANAGER_CONFIG": {
     "db_path": "/root/DREAM/src/memory_results_tpcds",
-    "archive_size": 20,
-    "finetune_threshold": 220,
-    "finetune_epochs": 50,
+    "archive_size": ,
+    "finetune_threshold": 99,
+    "finetune_epochs": 3,
     "finetune_batch_size": 8,
     "finetune_device": "cpu",
     "model_output_dir": "/root/DREAM/src/agent/plan/model_res",

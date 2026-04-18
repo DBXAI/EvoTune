@@ -35,6 +35,8 @@ from utils.runtime_metrics import (
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = True
 
 
 class Planner:
@@ -108,7 +110,11 @@ class Planner:
             tuning_history=tuning_history,
             database_info=self._build_database_info(),
         )
-        print("Detection Agent prompt: ", prompt)
+        logger.info(
+            "[Prompt][Detection][SQL %s]\n%s",
+            getattr(query_info, "query_id", "unknown"),
+            prompt,
+        )
 
         run_result = self.diagnosis_agent(prompt)
         usage_metrics = extract_run_usage_metrics(run_result, "diag_llm")

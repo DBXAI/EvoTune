@@ -38,7 +38,13 @@ class DBAgent:
         predictor = RCRankPredictor(planner_config)
 
         memory_config = configs.get("MEMORY_MANAGER_CONFIG")
-        self.memory_manager = MemoryManager(memory_config, predictor=predictor)
+        self.memory_manager = MemoryManager(
+            memory_config,
+            predictor=predictor,
+            planner_config=planner_config,
+            agent_config=self.agent_config,
+            api_settings=configs.get("API_SETTINGS"),
+        )
 
         self.planner = Planner(
             self.memory_manager,
@@ -62,6 +68,7 @@ class DBAgent:
         self.epsilon_max = 0.8
         self.kappa = 0.5
         self.N_th = 3
+        self.exploration_mode = str(self.agent_config.get("exploration_mode", "both")).lower()
 
     def calculate_dynamic_epsilon(self, root_cause_key, state):
         s_r = state.get("successes").get(root_cause_key, 0)  # successes
@@ -97,6 +104,11 @@ class DBAgent:
         Returns:
             mode: 'explore' or 'exploit'
         """
+        if self.exploration_mode in {"none", "exploit", "exploit_only"}:
+            return "exploit"
+        if self.exploration_mode in {"explore", "explore_only"}:
+            return "explore"
+
         predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)
 
         # Calculate dynamic epsilon for the predicted root cause
@@ -384,6 +396,7 @@ class DBAgent:
                         new_time,
                         "negative",
                         tuning_attempts=state["component_attempts"].copy(),
+                        used_cases=evaluation_result.get("used_cases"),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)
@@ -407,6 +420,7 @@ class DBAgent:
                         new_time,
                         "positive",
                         tuning_attempts=state["component_attempts"].copy(),
+                        used_cases=evaluation_result.get("used_cases"),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)
@@ -436,6 +450,7 @@ class DBAgent:
                         new_time,
                         "negative",
                         tuning_attempts=state["component_attempts"].copy(),
+                        used_cases=evaluation_result.get("used_cases"),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)

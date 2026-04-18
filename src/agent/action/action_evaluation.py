@@ -1,8 +1,14 @@
+import logging
 import re
 
 from agents import Runner
 
 from agent.prompt import build_fix_prompt, build_rewrite_prompt
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = True
 
 
 def _round_time_value(value):
@@ -29,6 +35,12 @@ async def evaluate_action(fix_action, rewrite_sql, query_info, *, db, fix_timeou
     max_retry = 5
     while not success and retry_count < max_retry:
         prompt = build_fix_prompt(fix_action, err)
+        # logger.info(
+        #     "[Prompt][Fix][SQL %s][Retry %s]\n%s",
+        #     getattr(query_info, "query_id", "unknown"),
+        #     retry_count,
+        #     prompt,
+        # )
         result = await Runner.run(starting_agent=fix_agent, input=prompt)
         new_fix_action = result.final_output
         print(f"new_fix_action: {new_fix_action}")
@@ -173,6 +185,11 @@ async def check_sql_rewrite(origin_sql, rewrite_sql, *, db, fix_agent):
 
     while not match and retry_count < max_retry:
         prompt = build_rewrite_prompt(origin_sql, rewrite_sql)
+        # logger.info(
+        #     "[Prompt][Rewrite][Retry %s]\n%s",
+        #     retry_count,
+        #     prompt,
+        # )
         result = await Runner.run(starting_agent=fix_agent, input=prompt)
         new_rewrite_sql = result.final_output
         print(f"new_rewrite_sql: {new_rewrite_sql}")

@@ -88,7 +88,7 @@
     "db_path": "/root/DREAM/src/memory_results_job",
     "archive_size": 20,
     "finetune_threshold": 220,
-    "finetune_epochs": 50,
+    "finetune_epochs": 10,
     "finetune_batch_size": 8,
     "finetune_device": "cpu",
     "model_output_dir": "/root/DREAM/src/agent/plan/model_res",

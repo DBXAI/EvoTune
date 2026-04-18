@@ -1,11 +1,9 @@
 import asyncio
 import logging
-import os
 import time
 
 import nest_asyncio
 from agents import Agent, Runner
-from agents._config import set_default_openai_api
 
 from agent.action.action_evaluation import evaluate_action
 from agent.action.action_space import action_space_collect
@@ -22,27 +20,34 @@ from utils.runtime_metrics import (
     format_runtime_metrics,
     merge_runtime_metrics,
 )
+from utils.openai_agents import configure_openai_agents
 
 nest_asyncio.apply()
 
 
-# Avoid printing retry logs during LLM API calls
-def delete_all_loggers():
-    import logging
+# Avoid noisy third-party retry logs during LLM API calls without muting project logs.
+def quiet_external_loggers():
+    project_prefixes = ("agent", "database", "utils", "__main__")
 
-    loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
-    for logger in loggers:
-        handlers = logger.handlers[:]
+    for name, logger_obj in logging.root.manager.loggerDict.items():
+        if not isinstance(logger_obj, logging.Logger):
+            continue
+        if name.startswith(project_prefixes):
+            continue
+
+        handlers = logger_obj.handlers[:]
         for handler in handlers:
-            logger.removeHandler(handler)
-        logger.propagate = True
-        logger.setLevel(logging.CRITICAL)
+            logger_obj.removeHandler(handler)
+        logger_obj.propagate = True
+        logger_obj.setLevel(logging.ERROR)
 
 
-delete_all_loggers()
+quiet_external_loggers()
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = True
 
 
 class ActionManager:
@@ -64,16 +69,16 @@ class ActionManager:
 
         # Ablation experiment parameters
         self.enable_retrieval = self.agent_config.get("enable_retrieval", True)
+        self.retrieval_content = self._normalize_retrieval_content(
+            self.agent_config.get("retrieval_content", "all")
+        )
         self.enable_action_define = self.agent_config.get("enable_action_define", True)
         self.enable_action_pruning = self.agent_config.get("enable_action_pruning", True)
 
         self.api_settings = self.configs.get("API_SETTINGS")
 
         if self.api_settings:
-            openai_config = self.api_settings.get("openai")
-            os.environ["OPENAI_API_KEY"] = openai_config.get("api_key")
-            os.environ["OPENAI_BASE_URL"] = openai_config.get("base_url")
-            set_default_openai_api("chat_completions")
+            configure_openai_agents(self.api_settings)
 
         self.fixAgent = Agent(
             name="FixAgent",
@@ -112,6 +117,39 @@ class ActionManager:
     def extract_knob_names(self, sql):
         return extract_knob_names(sql)
 
+    def _normalize_retrieval_content(self, value):
+        normalized = str(value or "all").strip().lower()
+        alias_map = {
+            "all": "all",
+            "full": "all",
+            "both": "all",
+            "case_only": "case_only",
+            "cases_only": "case_only",
+            "case": "case_only",
+            "cases": "case_only",
+            "experience_only": "experience_only",
+            "experiences_only": "experience_only",
+            "experience": "experience_only",
+            "experiences": "experience_only",
+            "none": "none",
+            "off": "none",
+            "disabled": "none",
+        }
+        return alias_map.get(normalized, "all")
+
+    def _build_prompt_retrieval_context(self, retrieval):
+        raw_positives = retrieval.get("positive", [])
+        raw_negatives = retrieval.get("negative", [])
+        raw_experiences = retrieval.get("experiences", "None.")
+
+        if self.retrieval_content == "none":
+            return [], [], "None."
+        if self.retrieval_content == "experience_only":
+            return [], [], raw_experiences
+        if self.retrieval_content == "case_only":
+            return raw_positives, raw_negatives, "None."
+        return raw_positives, raw_negatives, raw_experiences
+
     async def step(self, query_info, root_cause, mode="exploit"):
         """Analyze slow query and generate fix action workflow"""
         if not self.agent:
@@ -133,11 +171,10 @@ class ActionManager:
         retrieval_start = time.perf_counter()
         if self.enable_retrieval:
             retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
-            positives = retrieval.get("positive", [])
-            negatives = retrieval.get("negative", [])
         else:
-            positives = []
-            negatives = []
+            retrieval = {"positive": [], "negative": [], "experiences": "None."}
+        positives, negatives, experiences = self._build_prompt_retrieval_context(retrieval)
+        retrieved_cases = retrieval.get("positive", []) + retrieval.get("negative", [])
         runtime_metrics["T_retrieval_infer"] = time.perf_counter() - retrieval_start
 
         action_space_start = time.perf_counter()
@@ -153,7 +190,7 @@ class ActionManager:
         runtime_metrics["T_action_space"] = time.perf_counter() - action_space_start
 
         action_gen_start = time.perf_counter()
-        action_run_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives)
+        action_run_result = await self.action_generate(root_cause, base_info, action_space, mode, positives, negatives, experiences)
         runtime_metrics["T_action_gen"] = time.perf_counter() - action_gen_start
         runtime_metrics = merge_runtime_metrics(
             runtime_metrics,
@@ -184,7 +221,7 @@ class ActionManager:
         # Use approve_time as reward (performance improvement: old_time - new_time)
         # approve_time represents the time saved, which is the actual reward signal
         reward = evaluation_result.get("approve_time", 0.0)
-        case = positives + negatives
+        case = retrieved_cases
 
         # Save experience (independent of retrieval mode, only based on enable_save_samples)
         if self.memory_manager.enable_save_samples and case:
@@ -230,6 +267,10 @@ class ActionManager:
             evaluation_result.get("runtime_metrics"),
             runtime_metrics,
         )
+        evaluation_result["used_cases"] = {
+            "positive": retrieval.get("positive", []),
+            "negative": retrieval.get("negative", []),
+        }
         logger.info(
             "[Runtime][SQL %s] Action summary: %s",
             getattr(query_info, "query_id", "unknown"),
@@ -263,9 +304,14 @@ class ActionManager:
                 self.db.connection.rollback()
                 print(f"Failed to restore {knob_name}: {e}")
 
-    async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives):
-        prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives)
-        print("Tuning Agent Prompt:", prompt)
+    async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives, experiences):
+        prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives, experiences)
+        query_info = base_info.get("query_info")
+        logger.info(
+            "[Prompt][Tuning][SQL %s]\n%s",
+            getattr(query_info, "query_id", "unknown"),
+            prompt,
+        )
         return await Runner.run(starting_agent=self.agent, input=prompt)
 
     def extract_fix_action(self, action_result):

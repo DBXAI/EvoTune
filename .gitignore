@@ -28,7 +28,6 @@ config/job_config.json
 config/tpch_config.json
 config/tpcds_config.json
 config/tpch_tidb_config.json
-appendix.pdf
 DREAM.pdf
 # test_sql_gen/data/hint/**
 # test_sql_gen/data/hint_normal/**

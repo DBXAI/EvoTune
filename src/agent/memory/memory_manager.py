@@ -6,24 +6,33 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from agents import Agent, Runner
 from numpy.linalg import norm
+from sklearn.cluster import HDBSCAN
 
 from agent.contracts import (
     CANONICAL_COMPONENTS,
     normalize_component_label,
+)
+from agent.prompt import (
+    build_case_reflection_prompt,
+    build_experience_summary_prompt,
+    get_reflection_agent_instructions,
+    get_summary_agent_instructions,
 )
 # Import soft Q retriever
 from agent.memory.soft_q_retriever import SoftQRetriever
 from agent.plan.RCRank.utils.load_data import (
     load_dataset_valid as load_dataset_tensor_valid,
 )
+from utils.openai_agents import configure_openai_agents
 from utils.types import CaseInfo, QueryInfo
 
 logger = logging.getLogger(__name__)
@@ -43,13 +52,98 @@ class MemoryCase:
     action_embedding: Optional[List[float]] = None
 
 
+@dataclass
+class ClusterExperience:
+    id: str
+    case_ids: List[str]
+    summary: str = ""
+    prototype: Optional[List[float]] = None
+    radius: float = 0.0
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "case_ids": list(self.case_ids),
+            "summary": self.summary,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            id=data["id"],
+            case_ids=list(data.get("case_ids", [])),
+            summary=data.get("summary", ""),
+        )
+
+
+class SummaryAgent:
+    def __init__(self, summary_model):
+        self.summaryAgent = Agent(
+            name="SummaryAgent",
+            model=summary_model,
+            instructions=get_summary_agent_instructions(),
+        )
+        self.reflectionAgent = Agent(
+            name="ReflectionAgent",
+            model=summary_model,
+            instructions=get_reflection_agent_instructions(),
+        )
+
+    def reflect_case(self, case_info):
+        prompt = build_case_reflection_prompt(case_info)
+        query_info = case_info.get("query_info", {}) or {}
+        # logger.info(
+        #     "[Prompt][Reflection][SQL %s]\n%s",
+        #     query_info.get("query_id", "unknown"),
+        #     prompt,
+        # )
+        try:
+            result = Runner.run_sync(
+                starting_agent=self.reflectionAgent,
+                input=prompt,
+            )
+            return re.sub(r"\s+", " ", str(result.final_output or "")).strip()
+        except Exception as exc:
+            logger.warning(
+                "Case reflection failed for SQL %s: %s",
+                query_info.get("query_id", "unknown"),
+                exc,
+                exc_info=True,
+            )
+            return ""
+
+    def summarize_cases(self, root_causes, cases, previous_summary=None):
+        prompt = build_experience_summary_prompt(root_causes, cases, previous_summary)
+        # logger.info(
+        #     "[Prompt][ExperienceSummary][Cases %s]\n%s",
+        #     [case.id for case in cases],
+        #     prompt,
+        # )
+        try:
+            result = Runner.run_sync(
+                starting_agent=self.summaryAgent,
+                input=prompt,
+            )
+            return re.sub(r"\s+", " ", str(result.final_output or "")).strip()
+        except Exception as exc:
+            logger.warning(
+                "Experience summarization failed for cases %s: %s",
+                [case.id for case in cases],
+                exc,
+                exc_info=True,
+            )
+            return previous_summary or ""
+
+
 class MemoryManager:
-    def __init__(self, config, predictor=None, planner_config=None):
+    def __init__(self, config, predictor=None, planner_config=None, agent_config=None, api_settings=None):
         self.db_path = config.get("db_path")
         self.archive_size = config.get("archive_size")
         self.cases = {}
         self.archive = set()
         self.best_case_id = None
+        self.agent_config = agent_config or {}
+        self.api_settings = api_settings or {}
 
         self.enable_finetune = config.get("enable_finetune")
         self.finetune_threshold = config.get("finetune_threshold")
@@ -66,12 +160,22 @@ class MemoryManager:
         self.eta = config.get("eta", 3)  # Minimum exploration threshold η
         
         # Contrastive loss negative pair weights: λ_4 < λ_3 < λ_2 < λ_1
-        self.lambda_1 = config.get("lambda_1", 1.0)  # N1: uncertain negatives (insufficient exploration)
-        self.lambda_2 = config.get("lambda_2", 0.8)   # N2: verified negatives (sufficient exploration)
-        self.lambda_3 = config.get("lambda_3", 0.5)   # N3: verified negatives (different bottlenecks)
+        self.lambda_1 = config.get("lambda_1", 0.8)  # N1: uncertain negatives (insufficient exploration)
+        self.lambda_2 = config.get("lambda_2", 0.6)   # N2: verified negatives (sufficient exploration)
+        self.lambda_3 = config.get("lambda_3", 0.4)   # N3: verified negatives (different bottlenecks)
         self.lambda_4 = config.get("lambda_4", 0.2)   # N4: remaining pairs
 
         self.bert_model_path = config.get("bert_model_path")
+        self.experience_path = config.get("experience_path") or f"{self.db_path}_experiences.json"
+        self.pending_buffer_threshold = config.get(
+            "pending_buffer_threshold",
+            config.get("experience_distill_threshold", 20),
+        )
+        self.hdbscan_min_cluster_size = config.get("hdbscan_min_cluster_size", 5)
+        self.hdbscan_min_samples = config.get("hdbscan_min_samples", 5)
+        self.experience_top_k = config.get("experience_top_k", 2)
+        self.summary_agent_model = config.get("summary_agent_model")
+        
 
         # Retrieval mode configuration: static or dynamic
         self.retrieval_mode = config.get("retrieval_mode", "dynamic")
@@ -99,6 +203,16 @@ class MemoryManager:
 
         # Initialize soft Q retriever
         self.retriever = SoftQRetriever(memory_manager=self)
+
+        if self.api_settings:
+            configure_openai_agents(self.api_settings)
+
+        self.summary_agent = SummaryAgent(self.summary_agent_model)
+        self.experiences = {}
+        self.pending_case_ids = []
+        self.case_to_experience = {}
+        self.next_experience_index = 1
+        self._case_embedding_cache = {}
 
         # Load the saved retriever model
         if os.path.exists(self.retriever_model_path):
@@ -590,6 +704,245 @@ class MemoryManager:
             keys.extend([frozenset(pair) for pair in itertools.combinations(root_cause_types, i)])
         return keys
 
+    def _build_case_reflection(self, case_info):
+        return self.summary_agent.reflect_case(case_info)
+
+    def _get_case_cluster_embedding(self, case):
+        if case.id in self._case_embedding_cache:
+            return self._case_embedding_cache[case.id]
+
+        embedding = self.retriever._build_case_embedding(case.case_info)
+        if hasattr(embedding, "detach"):
+            embedding = embedding.detach().cpu().numpy().tolist()
+        else:
+            embedding = list(embedding)
+        self._case_embedding_cache[case.id] = embedding
+        return embedding
+
+    def _infer_next_experience_index(self):
+        max_idx = 0
+        for exp_id in self.experiences.keys():
+            match = re.match(r"^experience-(\d+)$", str(exp_id))
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
+        return max_idx + 1
+
+    def _load_experiences(self):
+        self.experiences = {}
+        self.pending_case_ids = []
+        self.case_to_experience = {}
+        self.next_experience_index = 1
+
+        if not self.experience_path or not os.path.exists(self.experience_path):
+            return
+
+        with open(self.experience_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        self.experiences = {
+            exp_id: ClusterExperience.from_dict(exp_info)
+            for exp_id, exp_info in payload.get("experiences", {}).items()
+        }
+        self.next_experience_index = self._infer_next_experience_index()
+        self._rebuild_case_to_experience_map()
+
+    def _save_experiences(self):
+        if not self.experience_path:
+            return
+
+        directory = os.path.dirname(self.experience_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        payload = {
+            "experiences": {
+                exp_id: experience.to_dict()
+                for exp_id, experience in self.experiences.items()
+            },
+        }
+        with open(self.experience_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def _rebuild_case_to_experience_map(self):
+        self.case_to_experience = {}
+        for exp_id, experience in self.experiences.items():
+            for case_id in experience.case_ids:
+                self.case_to_experience[case_id] = exp_id
+
+    def _refresh_experience(self, exp_id, experience=None):
+        experience = experience or self.experiences[exp_id]
+        cases = [self.cases[cid] for cid in experience.case_ids if cid in self.cases]
+        if not cases:
+            return None
+
+        embeddings = [self._get_case_cluster_embedding(case) for case in cases]
+        prototype = np.mean(np.asarray(embeddings, dtype=float), axis=0).astype(float).tolist()
+        distances = [float(np.linalg.norm(np.asarray(embedding, dtype=float) - np.asarray(prototype, dtype=float))) for embedding in embeddings]
+        experience.prototype = prototype
+        experience.radius = max(distances) if distances else 0.0
+        self.experiences[exp_id] = experience
+        self._rebuild_case_to_experience_map()
+        return experience
+
+    def _update_experience_summary(self, experience):
+        cases = [self.cases[cid] for cid in experience.case_ids if cid in self.cases]
+        if not cases:
+            return experience
+        merged_root_causes = []
+        for case in cases:
+            merged_root_causes.extend(case.case_info.get("root_causes", []))
+        experience.summary = self.summary_agent.summarize_cases(
+            self._normalize_root_causes_list(merged_root_causes),
+            cases,
+            experience.summary,
+        )
+        self.experiences[experience.id] = experience
+        return experience
+
+    def _create_experience(self, case_ids):
+        experience = ClusterExperience(
+            id=f"experience-{self.next_experience_index:04d}",
+            case_ids=list(case_ids),
+        )
+        self.next_experience_index += 1
+        experience = self._refresh_experience(experience.id, experience=experience)
+        if experience is None:
+            return None
+        return self._update_experience_summary(experience)
+
+    def _distill_case_ids(self, case_ids):
+        candidate_case_ids = [
+            case_id for case_id in dict.fromkeys(case_ids)
+            if case_id in self.cases and case_id not in self.case_to_experience
+        ]
+        if len(candidate_case_ids) < self.hdbscan_min_cluster_size:
+            return candidate_case_ids
+
+        matrix = np.asarray(
+            [self._get_case_cluster_embedding(self.cases[case_id]) for case_id in candidate_case_ids],
+            dtype=float,
+        )
+        clusterer = HDBSCAN(
+            min_cluster_size=self.hdbscan_min_cluster_size,
+            min_samples=self.hdbscan_min_samples,
+            metric="euclidean",
+            allow_single_cluster=True,
+        )
+        labels = clusterer.fit_predict(matrix)
+
+        unresolved = []
+        cluster_groups = {}
+        for idx, label in enumerate(labels):
+            case_id = candidate_case_ids[idx]
+            if int(label) == -1:
+                unresolved.append(case_id)
+                continue
+            cluster_groups.setdefault(int(label), []).append(case_id)
+
+        for member_ids in cluster_groups.values():
+            if len(member_ids) < self.hdbscan_min_cluster_size:
+                unresolved.extend(member_ids)
+                continue
+            self._create_experience(member_ids)
+
+        self._rebuild_case_to_experience_map()
+        return list(dict.fromkeys(unresolved))
+
+    def _bootstrap_experiences(self):
+        self._load_experiences()
+        for exp_id in list(self.experiences.keys()):
+            self._refresh_experience(exp_id)
+
+        assigned_case_ids = set(self.case_to_experience.keys())
+        self.pending_case_ids = [
+            case_id for case_id in self.cases.keys()
+            if case_id not in assigned_case_ids
+        ]
+
+        if len(self.pending_case_ids) >= self.pending_buffer_threshold:
+            unresolved = self._distill_case_ids(self.pending_case_ids)
+            self.pending_case_ids = [
+                case_id for case_id in unresolved
+                if case_id not in self.case_to_experience
+            ]
+            self._save_experiences()
+
+    def _merge_case_into_nearest_experience(self, case):
+        candidates = list(self.experiences.values())
+        if not candidates:
+            return False
+
+        case_embedding = self._get_case_cluster_embedding(case)
+        nearest_experience = None
+        nearest_distance = float("inf")
+
+        for experience in candidates:
+            prototype = experience.prototype or []
+            if not prototype:
+                continue
+            distance = float(np.linalg.norm(np.asarray(case_embedding, dtype=float) - np.asarray(prototype, dtype=float)))
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest_experience = experience
+
+        if nearest_experience is None or nearest_distance > nearest_experience.radius:
+            return False
+
+        if case.id not in nearest_experience.case_ids:
+            nearest_experience.case_ids.append(case.id)
+        refreshed = self._refresh_experience(nearest_experience.id, experience=nearest_experience)
+        if refreshed is not None:
+            self._update_experience_summary(refreshed)
+        return True
+
+    def _sync_case_to_experiences(self, case):
+        try:
+            if self._merge_case_into_nearest_experience(case):
+                self._save_experiences()
+                return
+
+            if case.id not in self.pending_case_ids and case.id not in self.case_to_experience:
+                self.pending_case_ids.append(case.id)
+            if len(self.pending_case_ids) >= self.pending_buffer_threshold:
+                unresolved = self._distill_case_ids(self.pending_case_ids)
+                self.pending_case_ids = [
+                    case_id for case_id in unresolved
+                    if case_id not in self.case_to_experience
+                ]
+                self._save_experiences()
+        except Exception as exc:
+            logger.warning("Failed to update experience clusters for case %s: %s", case.id, exc)
+
+    def retrieve_experiences(self, case_ids):
+        if not case_ids:
+            return {"items": [], "summary": "None."}
+
+        selected = []
+        seen_experience_ids = set()
+        for case_id in case_ids:
+            experience_id = self.case_to_experience.get(case_id)
+            if not experience_id or experience_id in seen_experience_ids:
+                continue
+            experience = self.experiences.get(experience_id)
+            if experience is None:
+                continue
+            selected.append(experience)
+            seen_experience_ids.add(experience_id)
+            if len(selected) >= self.experience_top_k:
+                break
+
+        if not selected:
+            return {"items": [], "summary": "None."}
+
+        lines = []
+        for idx, experience in enumerate(selected, 1):
+            lines.append(f"\n    Experience {idx}: {experience.summary}")
+
+        return {
+            "items": selected,
+            "summary": "".join(lines).strip() or "None.",
+        }
+
     def add_case(self, case):
         self._validate_and_route_root_causes(case)
         self.cases[case.id] = case
@@ -605,6 +958,7 @@ class MemoryManager:
             self.islands[root_causes_key] = set([case.id])
 
         self.save_to_memory(case)
+        self._sync_case_to_experiences(case)
         logger.debug(f"Added case {case.id} to island {root_causes_key}")
 
         try:
@@ -612,6 +966,37 @@ class MemoryManager:
         except Exception as e:
             print(f"Online finetune failed: {e}")
         return case.id
+
+    def _build_used_case_snapshot(self, case_info):
+        if not isinstance(case_info, dict):
+            return {}
+
+        query_info = case_info.get("query_info", {}) or {}
+        return {
+            "case_id": case_info.get("case_id"),
+            "query_id": query_info.get("query_id"),
+            "query": query_info.get("query"),
+            "execution_time": query_info.get("execution_time"),
+            "label": case_info.get("label"),
+            "root_causes": self._normalize_root_causes_list(case_info.get("root_causes")),
+            "approve_time": case_info.get("approve_time"),
+            "fix_action": case_info.get("fix_action"),
+        }
+
+    def _normalize_used_cases(self, used_cases):
+        if not isinstance(used_cases, dict):
+            return {"positive": [], "negative": []}
+
+        return {
+            "positive": [
+                self._build_used_case_snapshot(case_info)
+                for case_info in used_cases.get("positive", [])
+            ],
+            "negative": [
+                self._build_used_case_snapshot(case_info)
+                for case_info in used_cases.get("negative", [])
+            ],
+        }
 
     def save_to_memory(self, new_case=None):
         if new_case is not None:
@@ -633,7 +1018,18 @@ class MemoryManager:
                     data_to_save[cid] = case.case_info
                 json.dump(data_to_save, f)
 
-    def save_case(self, query_info, fix_action, root_causes, old_time, new_time, label, tuning_attempts=None, round_num=None):
+    def save_case(
+        self,
+        query_info,
+        fix_action,
+        root_causes,
+        old_time,
+        new_time,
+        label,
+        tuning_attempts=None,
+        round_num=None,
+        used_cases=None,
+    ):
         """
         Save a case to memory
         
@@ -686,14 +1082,20 @@ class MemoryManager:
             "label": label,
             "approve_time": approve_time,
             "tuning_attempts": tuning_attempts,
+            "used_cases": self._normalize_used_cases(used_cases),
         }
+        case_info["reflection"] = self._build_case_reflection(case_info)
+        case_info["reflection_source"] = "summary_agent"
+
+        sql_embedding = self.build_sql_embedding(query_info)
+        action_embedding = self.build_action_embedding(str(fix_action))
 
         case = MemoryCase(
             id=case_id,
             case_info=case_info,
-            metrics={},
-            sql_embedding=None,
-            action_embedding=None,
+            metrics={"performance": new_time, "approve_time": approve_time},
+            sql_embedding=sql_embedding,
+            action_embedding=action_embedding,
         )
         self.add_case(case)
         
@@ -751,6 +1153,7 @@ class MemoryManager:
                 positive_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
                 self.archive = set([c.id for c in positive_cases[: self.archive_size]])
             self._last_finetune_count = len(self.cases)
+            self._bootstrap_experiences()
             # self._last_finetune_count = 0
             # self._maybe_finetune()
         else:
@@ -760,6 +1163,9 @@ class MemoryManager:
         case_info = dict(case_info)
         case_info["root_causes"] = self._normalize_root_causes_list(case_info.get("root_causes"))
         case_info["tuning_attempts"] = self._normalize_tuning_attempts(case_info.get("tuning_attempts"))
+        if "reflection" not in case_info:
+            case_info["reflection"] = self._build_case_reflection(case_info)
+            case_info["reflection_source"] = "summary_agent"
         raw_info = case_info["query_info"]
 
         if "is_rewrite" not in raw_info:
@@ -836,9 +1242,19 @@ class MemoryManager:
         Unified case retrieval interface, selects static or dynamic retrieval based on configured retrieval_mode
         """
         if self.retrieval_mode == "static":
-            return self.retrieve_static_cases(query_info, root_causes, pos_n, neg_n, mode)
+            retrieval = self.retrieve_static_cases(query_info, root_causes, pos_n, neg_n, mode)
         else:
-            return self.retrieve_dynamic_cases(query_info, root_causes, pos_n, neg_n, mode)
+            retrieval = self.retrieve_dynamic_cases(query_info, root_causes, pos_n, neg_n, mode)
+
+        retrieved_case_ids = []
+        for case_info in retrieval.get("positive", []) + retrieval.get("negative", []):
+            case_id = case_info.get("case_id")
+            if case_id:
+                retrieved_case_ids.append(case_id)
+
+        experience_payload = self.retrieve_experiences(retrieved_case_ids)
+        retrieval["experiences"] = experience_payload.get("summary", "None.")
+        return retrieval
 
     def retrieve_dynamic_cases(self, query_info, root_causes, pos_n=2, neg_n=2, mode="exploit"):
         root_causes = self._normalize_root_causes_list(root_causes)
@@ -854,14 +1270,18 @@ class MemoryManager:
             for case in all_cases:
                 case_root_causes = self._normalize_root_causes_list(case.case_info.get("root_causes"))
                 if any(rc in case_root_causes for rc in root_causes):
-                    candidate_cases.append(case.case_info)
+                    case_info = dict(case.case_info)
+                    case_info["case_id"] = case.id
+                    candidate_cases.append(case_info)
         elif mode == "explore":
             # Explore mode: select cases with different root causes
             candidate_cases = []
             for case in all_cases:
                 case_root_causes = self._normalize_root_causes_list(case.case_info.get("root_causes"))
                 if not any(rc in case_root_causes for rc in root_causes):
-                    candidate_cases.append(case.case_info)
+                    case_info = dict(case.case_info)
+                    case_info["case_id"] = case.id
+                    candidate_cases.append(case_info)
 
         # If no candidate cases, return empty result
         if not candidate_cases:
@@ -961,14 +1381,127 @@ class MemoryManager:
             selected_neg = neg_all
 
         # Export case_info
-        pos_infos = [c.case_info for c in selected_pos]
-        neg_infos = [c.case_info for c in selected_neg]
+        pos_infos = []
+        for case in selected_pos:
+            case_info = dict(case.case_info)
+            case_info["case_id"] = case.id
+            pos_infos.append(case_info)
+
+        neg_infos = []
+        for case in selected_neg:
+            case_info = dict(case.case_info)
+            case_info["case_id"] = case.id
+            neg_infos.append(case_info)
 
         return {"mode": mode, "positive": pos_infos, "negative": neg_infos}
 
+    def retrieve_similar_cases(self, query_info, pos_n=2, neg_n=2, top_n=None):
+        """
+        Static case retrieval without diagnosis/root-cause filtering.
+        Retrieve globally similar historical cases based on SQL embedding,
+        while prioritizing exact same-SQL matches when available.
+        """
+        if not self.cases:
+            return {"mode": "static_simple", "positive": [], "negative": []}
+
+        normalized_query = str(getattr(query_info, "query", "") or "").strip().lower()
+        candidate_count = top_n or min(len(self.cases), max((pos_n + neg_n) * 6, 20))
+
+        same_sql_cases = []
+        for case in self.cases.values():
+            stored_query = (
+                ((case.case_info.get("query_info") or {}).get("query") or "").strip().lower()
+            )
+            if stored_query and stored_query == normalized_query:
+                same_sql_cases.append(case)
+
+        same_sql_cases.sort(
+            key=lambda case: (
+                case.case_info.get("label") == "positive",
+                case.case_info.get("approve_time") or case.metrics.get("approve_time", 0.0),
+            ),
+            reverse=True,
+        )
+
+        similar_cases = self.retrieve_embedding(query_info, top_n=candidate_count)
+
+        ranked_cases = []
+        seen_case_ids = set()
+
+        for case in same_sql_cases:
+            if case.id not in seen_case_ids:
+                ranked_cases.append(case)
+                seen_case_ids.add(case.id)
+
+        for case in similar_cases:
+            if case.id not in seen_case_ids:
+                ranked_cases.append(case)
+                seen_case_ids.add(case.id)
+
+        positive_cases = []
+        negative_cases = []
+        for case in ranked_cases:
+            case_info = dict(case.case_info)
+            case_info["case_id"] = case.id
+            if case.case_info.get("label") == "positive":
+                if len(positive_cases) < pos_n:
+                    positive_cases.append(case_info)
+            else:
+                if len(negative_cases) < neg_n:
+                    negative_cases.append(case_info)
+
+            if len(positive_cases) >= pos_n and len(negative_cases) >= neg_n:
+                break
+
+        return {
+            "mode": "static_simple",
+            "positive": positive_cases,
+            "negative": negative_cases,
+        }
+
+    def _normalize_plan_json_for_encoder(self, query_plan):
+        if query_plan is None:
+            return None
+
+        if isinstance(query_plan, str):
+            normalized = query_plan.strip()
+            return normalized or None
+
+        if isinstance(query_plan, dict):
+            if "Plan" in query_plan:
+                return json.dumps([[query_plan]], ensure_ascii=False)
+            return json.dumps([[{"Plan": query_plan}]], ensure_ascii=False)
+
+        if isinstance(query_plan, list):
+            if not query_plan:
+                return None
+            if isinstance(query_plan[0], dict) and "Plan" in query_plan[0]:
+                return json.dumps([query_plan], ensure_ascii=False)
+            return json.dumps(query_plan, ensure_ascii=False)
+
+        try:
+            normalized = json.dumps(query_plan, ensure_ascii=False)
+        except TypeError:
+            normalized = str(query_plan).strip()
+        return normalized or None
+
     def retrieve_embedding(self, query_info, top_n=5, metric="cosine", case_ids=None):
-        query_emb = np.array(self.build_sql_embedding(query_info))
-        if norm(query_emb) == 0:
+        try:
+            query_embedding = self.build_sql_embedding(query_info)
+        except Exception as exc:
+            logger.warning(
+                "Failed to build query embedding for SQL %s: %s",
+                getattr(query_info, "query_id", "unknown"),
+                exc,
+                exc_info=True,
+            )
+            return []
+
+        if not query_embedding:
+            return []
+
+        query_emb = np.array(query_embedding, dtype=float)
+        if query_emb.size == 0 or norm(query_emb) == 0:
             return []
 
         # the embedding similarity
@@ -978,11 +1511,46 @@ class MemoryManager:
         else:
             candidates = list(self.cases.values())
         for case in candidates:
-            if case.sql_embedding is None:
+            if case is None or case.sql_embedding is None:
                 continue
-            case_emb = np.array(case.sql_embedding)
+            case_emb = np.array(case.sql_embedding, dtype=float)
+            if case_emb.size == 0:
+                logger.warning(
+                    "Skipping case %s in retrieval because sql_embedding is empty",
+                    getattr(case, "id", "unknown"),
+                )
+                continue
+            if case_emb.ndim != 1 or query_emb.ndim != 1:
+                logger.warning(
+                    "Skipping case %s in retrieval because embedding rank is invalid: query_ndim=%s case_ndim=%s",
+                    getattr(case, "id", "unknown"),
+                    query_emb.ndim,
+                    case_emb.ndim,
+                )
+                continue
+            if case_emb.shape[0] != query_emb.shape[0]:
+                logger.warning(
+                    "Skipping case %s in retrieval because embedding dimensions do not match: query_dim=%s case_dim=%s",
+                    getattr(case, "id", "unknown"),
+                    query_emb.shape[0],
+                    case_emb.shape[0],
+                )
+                continue
+            if not np.isfinite(case_emb).all():
+                logger.warning(
+                    "Skipping case %s in retrieval because sql_embedding contains non-finite values",
+                    getattr(case, "id", "unknown"),
+                )
+                continue
+            case_norm = norm(case_emb)
+            if case_norm == 0:
+                logger.warning(
+                    "Skipping case %s in retrieval because sql_embedding norm is zero",
+                    getattr(case, "id", "unknown"),
+                )
+                continue
             if metric == "cosine":
-                sim = np.dot(query_emb, case_emb) / (norm(query_emb) * norm(case_emb) + 1e-8)
+                sim = np.dot(query_emb, case_emb) / (norm(query_emb) * case_norm + 1e-8)
             elif metric == "euclidean":
                 sim = -norm(query_emb - case_emb)
             else:
@@ -1017,12 +1585,33 @@ class MemoryManager:
         encoding = Encoding(None, {"NA": 0})
 
         query = query_info.query
-        query_plan = query_info.plan_json
+        normalized_plan_json = self._normalize_plan_json_for_encoder(query_info.plan_json)
+        if not normalized_plan_json:
+            logger.warning(
+                "SQL %s has empty or invalid plan_json; skipping archive embedding retrieval",
+                getattr(query_info, "query_id", "unknown"),
+            )
+            return []
 
-        df = pd.DataFrame([{"plan_json": (json.dumps({"Plan": query_plan}) if isinstance(query_plan, dict) else query_plan)}])
-        plan_encoder = PlanEncoder(df=df, encoding=encoding)
-        encoded_df = plan_encoder.df
-        plan_tensor = encoded_df["json_plan_tensor"].iloc[0]
+        try:
+            df = pd.DataFrame([{"plan_json": normalized_plan_json}])
+            plan_encoder = PlanEncoder(df=df, encoding=encoding)
+            encoded_df = plan_encoder.df
+            if encoded_df.empty:
+                logger.warning(
+                    "Plan encoding returned no rows for SQL %s; skipping archive embedding retrieval",
+                    getattr(query_info, "query_id", "unknown"),
+                )
+                return []
+            plan_tensor = encoded_df["json_plan_tensor"].iloc[0]
+        except Exception as exc:
+            logger.warning(
+                "Plan encoding failed for SQL %s: %s",
+                getattr(query_info, "query_id", "unknown"),
+                exc,
+                exc_info=True,
+            )
+            return []
 
         sql = predictor.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512).to(predictor.device)
 
@@ -1158,7 +1747,16 @@ class MemoryManager:
         if not archive_cases:
             return None
 
-        similar_cases = self.retrieve_embedding(query_info, top_n=len(archive_cases), case_ids=list(self.archive))
+        try:
+            similar_cases = self.retrieve_embedding(query_info, top_n=len(archive_cases), case_ids=list(self.archive))
+        except Exception as exc:
+            logger.warning(
+                "Archive exploration failed for SQL %s: %s",
+                getattr(query_info, "query_id", "unknown"),
+                exc,
+                exc_info=True,
+            )
+            return None
 
         for case in similar_cases:
             case_root_str = str(self._normalize_root_causes(case.case_info.get("root_causes")))
