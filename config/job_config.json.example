@@ -92,9 +92,6 @@
     "finetune_batch_size": 8,
     "finetune_device": "cpu",
     "model_output_dir": "/root/DREAM/src/agent/plan/model_res",
-    "bce_weight": 0.7,
-    "contrastive_weight": 0.3,
-    "lambda_neg": 1.0,
     "enable_finetune": true,
     "retrieval_mode": "dynamic",
     "enable_save_samples": true,
@@ -104,12 +101,10 @@
   },
   "AGENT_CONFIG": {
     "no_improvement_threshold": 3,
-    "epsilon": 0.1,
     "fix_timeout": 600,
     "diagnostic_agent_model": "gpt-4.1",
     "fix_agent_model": "gpt-4.1",
-    "root_cause_llm_model": "gpt-4.1",
-    "action_server_config": "/root/DREAM/src/agent/action/mcp_tools/action_server_config.yaml"
+    "root_cause_llm_model": "gpt-4.1"
   }
 }
 

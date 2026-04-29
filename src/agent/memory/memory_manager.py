@@ -11,8 +11,6 @@ from typing import Dict, List, Optional, Set
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from agents import Agent, Runner
 from numpy.linalg import norm
 from sklearn.cluster import HDBSCAN
@@ -21,12 +19,18 @@ from agent.contracts import (
     CANONICAL_COMPONENTS,
     normalize_component_label,
 )
+from agent.memory.localization_refinement import (
+    build_component_labels,
+    masked_bce_loss,
+    parse_attempt_vector,
+)
 from agent.prompt import (
     build_case_reflection_prompt,
     build_experience_summary_prompt,
     get_reflection_agent_instructions,
     get_summary_agent_instructions,
 )
+
 # Import soft Q retriever
 from agent.memory.soft_q_retriever import SoftQRetriever
 from agent.plan.RCRank.utils.load_data import (
@@ -152,18 +156,8 @@ class MemoryManager:
         self.finetune_device = config.get("finetune_device")
         self.model_output_dir = config.get("model_output_dir")
 
-        self.bce_weight = config.get("bce_weight")
-        self.contrastive_weight = config.get("contrastive_weight")
-        self.lambda_neg = config.get("lambda_neg", 1.0)
-        
         # Exploration threshold for verified supervision
         self.eta = config.get("eta", 3)  # Minimum exploration threshold η
-        
-        # Contrastive loss negative pair weights: λ_4 < λ_3 < λ_2 < λ_1
-        self.lambda_1 = config.get("lambda_1", 0.8)  # N1: uncertain negatives (insufficient exploration)
-        self.lambda_2 = config.get("lambda_2", 0.6)   # N2: verified negatives (sufficient exploration)
-        self.lambda_3 = config.get("lambda_3", 0.4)   # N3: verified negatives (different bottlenecks)
-        self.lambda_4 = config.get("lambda_4", 0.2)   # N4: remaining pairs
 
         self.bert_model_path = config.get("bert_model_path")
         self.experience_path = config.get("experience_path") or f"{self.db_path}_experiences.json"
@@ -175,7 +169,6 @@ class MemoryManager:
         self.hdbscan_min_samples = config.get("hdbscan_min_samples", 5)
         self.experience_top_k = config.get("experience_top_k", 2)
         self.summary_agent_model = config.get("summary_agent_model")
-        
 
         # Retrieval mode configuration: static or dynamic
         self.retrieval_mode = config.get("retrieval_mode", "dynamic")
@@ -193,10 +186,6 @@ class MemoryManager:
         # Support multiple root cause combinations
         self.island_keys = self._generate_island_keys(self.root_cause_types)
         self.islands = {key: set() for key in self.island_keys}
-
-        # Create island for "normal" root cause as well
-        normal_island_key = self._normalize_root_causes(["normal"])
-        self.islands[normal_island_key] = set()
 
         self._rcrank_predictor = predictor
         self._planner_config = planner_config  # Store planner config for lazy initialization
@@ -238,10 +227,11 @@ class MemoryManager:
             internal_metrics = raw.get("internal_metrics", [])
 
             roots = self._normalize_root_causes_list(info.get("root_causes"))
-            label_vec = [1 if r in roots else 0 for r in label_space]
+            label_vec = build_component_labels(roots, info.get("label", "positive"), label_space)
+            selected_vec = [1 if r in roots else 0 for r in label_space]
 
             duration = info.get("new_time", 0.0)
-            
+
             # Get tuning attempts per component: n_{i,b}
             # tuning_attempts is a dict mapping component (root_cause_type) to number of attempts
             tuning_attempts = info.get("tuning_attempts", {})
@@ -254,10 +244,10 @@ class MemoryManager:
                     for rc in roots:
                         if rc in label_space:
                             tuning_attempts[rc] = tuning_attempts.get(rc, 0) + 1
-            
+
             # Build attempts vector: [n_{i,b}] for each component b in label_space
             attempts_vec = [tuning_attempts.get(rc, 0) for rc in label_space]
-            
+
             rows.append(
                 {
                     "sql_file": self.db_path,
@@ -270,6 +260,7 @@ class MemoryManager:
                     "error": None,
                     "case_label": info.get("label", "positive"),
                     "tuning_attempts": json.dumps(attempts_vec),  # n_{i,b} for each component b
+                    "selected_components": json.dumps(selected_vec),
                 }
             )
         return pd.DataFrame(rows)
@@ -287,15 +278,13 @@ class MemoryManager:
         device,
         epochs,
         batch_size,
-        bce_weight=0.7,
-        contrastive_weight=0.3,
-        lambda_neg=1.0,
     ):
-        # Use the hybrid loss (Masked BCE + enhanced contrastive learning) to finetune the RCRank model
-        # According to paper: L_total = λ_b * L_b + λ_c * L_c
+        # Use EvoTune's localization refinement objective: masked BCE over reliable labels.
         os.makedirs(output_dir, exist_ok=True)
 
-        train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(csv_path, batch_size=batch_size, device=device)
+        train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(
+            csv_path, batch_size=batch_size, device=device
+        )
 
         if not hasattr(self, "_rcrank_predictor") or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
@@ -305,257 +294,25 @@ class MemoryManager:
         model = predictor.model.to(device)
         model.train()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)  # Important parameter, try 1e-4 or 3e-4
-        temperature = 0.07
         eta = self.eta  # Minimum exploration threshold
 
-        def masked_bce_loss(pred_label, labels, case_labels, tuning_attempts, eta, device):
-            """
-            Masked Binary Cross-Entropy Loss according to paper:
-            L_b(B) = -1/(sum m_{i,b}) * sum_{i,b} m_{i,b} [Y_{i,b}*log(Ŷ_{i,b}) + (1-Y_{i,b})*log(1-Ŷ_{i,b})]
-            
-            Supervision mask m_{i,b}:
-            - If case_label is "positive": m_{i,b} = 1 for all components (entire label vector is kept)
-            - If case_label is "negative": 
-              - m_{i,b} = 1 if n_{i,b} >= η (verified negative, keep this component)
-              - m_{i,b} = 0 if n_{i,b} < η (unverified negative, mask this component)
-            
-            Args:
-                pred_label: [B, K] - predicted probabilities
-                labels: [B, K] - true labels (multi-label)
-                case_labels: [B] - case labels ("positive" or "negative")
-                tuning_attempts: [B, K] - number of tuning attempts n_{i,b} for each component
-                eta: minimum exploration threshold η
-                device: device for tensors
-            """
-            batch_size = pred_label.size(0)
-            num_components = pred_label.size(1)
-            
-            # Convert case_labels to boolean tensor
-            is_positive_case = torch.tensor(
-                [label == "positive" for label in case_labels],
-                device=device,
-                dtype=torch.bool
-            )  # [B]
-            
-            # Initialize supervision mask
-            supervision_mask = torch.zeros_like(pred_label, dtype=torch.bool, device=device)  # [B, K]
-            
-            # For positive cases: all components are kept (m_{i,b} = 1 for all b)
-            for i in range(batch_size):
-                if is_positive_case[i]:
-                    supervision_mask[i, :] = True
-                else:
-                    # For negative cases: keep only components where n_{i,b} >= η
-                    supervision_mask[i, :] = tuning_attempts[i, :] >= eta
-            
-            # If no valid supervision, return zero loss
-            if not supervision_mask.any():
-                return torch.tensor(0.0, device=device, requires_grad=True)
-            
-            # Compute BCE loss only for masked positions
-            bce_per_element = -(
-                labels * torch.log(pred_label + 1e-12) + 
-                (1 - labels) * torch.log(1 - pred_label + 1e-12)
-            )
-            
-            # Apply mask and compute mean
-            masked_bce = bce_per_element * supervision_mask.float()
-            total_mask_sum = supervision_mask.float().sum()
-            
-            if total_mask_sum > 0:
-                loss = masked_bce.sum() / total_mask_sum
-            else:
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
-            
-            return loss
-
-        def enhanced_contrastive_loss(emb, labels, case_labels, tuning_attempts, temperature, eta, lambda_1, lambda_2, lambda_3, lambda_4, device):
-            """
-            Enhanced contrastive learning loss according to paper:
-            L_c(B) = -1/|I_B| * sum_{i in I_B} (1/|P(i)|) * sum_{j in P(i)} log(exp(s_ij/τ) / sum_{t=1}^4 sum_{k in N_t(i)} λ_t * exp(s_ik/τ))
-            
-            Positive pairs P(i): {j | Y_j=1, B_i=B_j} (both positive, same bottleneck)
-            
-            Negative pairs:
-            - N1(i): {j | Y_j=0, B_i=B_j, n_j < η} (uncertain negatives, insufficient exploration)
-            - N2(i): {j | Y_j=0, B_i=B_j, n_j >= η} (verified negatives, sufficient exploration)
-            - N3(i): {j | Y_j=1, B_i∩B_j=∅} (verified negatives, different bottlenecks)
-            - N4(i): I_B \ (P(i) ∪ N1(i) ∪ N2(i) ∪ N3(i)) (remaining pairs)
-            
-            Weights: λ_4 < λ_3 < λ_2 < λ_1
-            
-            Args:
-                emb: [B, D] - sample embeddings
-                labels: [B, K] - multi-label one-hot vectors (root cause labels)
-                case_labels: [B] - case labels ("positive" or "negative")
-                tuning_attempts: [B, K] - number of tuning attempts n_{i,b}
-                temperature: temperature parameter τ
-                eta: minimum exploration threshold η
-                lambda_1, lambda_2, lambda_3, lambda_4: weights for negative pair types
-                device: device for tensors
-            """
-            batch_size = emb.size(0)
-            emb = F.normalize(emb, dim=1)
-            
-            # Compute similarity matrix: s_ij = (e_i^T e_j) / (||e_i|| ||e_j||)
-            # Since embeddings are normalized, s_ij = e_i^T e_j
-            similarity_matrix = torch.matmul(emb, emb.T)  # [B, B]
-            
-            # Scale by temperature: s_ij / τ
-            logits = similarity_matrix / temperature  # [B, B]
-            
-            # Mask: exclude self
-            self_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
-            logits_mask = ~self_mask
-            
-            # Stabilization: subtract max for numerical stability
-            logits_max, _ = torch.max(logits.masked_fill(~logits_mask, float("-inf")), dim=1, keepdim=True)
-            logits = logits - logits_max.detach()
-            exp_logits = torch.exp(logits) * logits_mask.float()  # [B, B]
-            
-            # Convert case_labels to boolean tensor
-            is_positive = torch.tensor(
-                [label == "positive" for label in case_labels], 
-                device=device, 
-                dtype=torch.bool
-            )  # [B]
-            
-            # Compute bottleneck sets for each sample
-            # B_i is the set of components where labels[i, b] = 1
-            bottleneck_sets = labels > 0.5  # [B, K] boolean
-            
-            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            valid_anchors = 0
-            
-            for i in range(batch_size):
-                # Only compute loss for positive anchors
-                if not is_positive[i]:
-                    continue
-                
-                valid_anchors += 1
-                B_i = bottleneck_sets[i]  # [K] boolean vector
-                
-                # Build positive pairs P(i): {j | Y_j=1, B_i=B_j}
-                P_i = []
-                for j in range(batch_size):
-                    if i == j:
-                        continue
-                    if is_positive[j]:
-                        B_j = bottleneck_sets[j]
-                        # Check if B_i = B_j (same bottleneck set)
-                        if torch.equal(B_i, B_j):
-                            P_i.append(j)
-                
-                if len(P_i) == 0:
-                    continue
-                
-                # Build negative pairs
-                N1_i = []  # {j | Y_j=0, B_i=B_j, n_j < η}
-                N2_i = []  # {j | Y_j=0, B_i=B_j, n_j >= η}
-                N3_i = []  # {j | Y_j=1, B_i∩B_j=∅}
-                N4_i = []  # remaining pairs
-                
-                for j in range(batch_size):
-                    if i == j:
-                        continue
-                    
-                    B_j = bottleneck_sets[j]
-                    # Check if B_i = B_j (same bottleneck set)
-                    same_bottleneck = torch.equal(B_i, B_j)
-                    # Check if B_i ∩ B_j = ∅ (no shared components)
-                    no_intersection = (B_i & B_j).sum() == 0
-                    
-                    if not is_positive[j] and same_bottleneck:
-                        # N1: {j | Y_j=0, B_i=B_j, n_j < η}
-                        # N2: {j | Y_j=0, B_i=B_j, n_j >= η}
-                        # Check exploration threshold: for all b in B_i, check if n_{j,b} >= η
-                        # Get attempts for components in B_i
-                        attempts_for_B_i = tuning_attempts[j][B_i]
-                        # If all components in B_i have attempts >= eta, it's N2, else N1
-                        if (attempts_for_B_i >= eta).all():
-                            N2_i.append(j)
-                        else:
-                            N1_i.append(j)
-                    elif is_positive[j] and no_intersection:
-                        N3_i.append(j)
-                    else:
-                        # Remaining pairs
-                        N4_i.append(j)
-                
-                # Compute denominator: sum_{t=1}^4 sum_{k in N_t(i)} λ_t * exp(s_ik/τ)
-                denominator = torch.tensor(0.0, device=device)
-                for k in N1_i:
-                    denominator = denominator + lambda_1 * exp_logits[i, k]
-                for k in N2_i:
-                    denominator = denominator + lambda_2 * exp_logits[i, k]
-                for k in N3_i:
-                    denominator = denominator + lambda_3 * exp_logits[i, k]
-                for k in N4_i:
-                    denominator = denominator + lambda_4 * exp_logits[i, k]
-                
-                # Add small epsilon for numerical stability
-                denominator = denominator + 1e-12
-                
-                # Compute loss for each positive pair
-                pair_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                for j in P_i:
-                    numerator = exp_logits[i, j]
-                    pair_loss = pair_loss + (-torch.log(numerator / denominator))
-                
-                # Average over positive pairs
-                if len(P_i) > 0:
-                    total_loss = total_loss + (pair_loss / len(P_i))
-            
-            # Average over valid anchors
-            if valid_anchors > 0:
-                return total_loss / valid_anchors
-            else:
-                return torch.tensor(0.0, device=device, requires_grad=True)
-
-        def hybrid_loss(
-            emb,
+        def localization_refinement_loss(
             labels,
             pred_label,
-            case_labels,
             tuning_attempts,
-            bce_weight=0.7,
-            contrastive_weight=0.3,
-            temperature=0.07,
+            selected_components,
             eta=3,
-            lambda_1=1.0,
-            lambda_2=0.8,
-            lambda_3=0.5,
-            lambda_4=0.2,
         ):
-            """
-            Hybrid loss according to paper: L(B) = λ_b * L_b(B) + λ_c * L_c(B)
-            
-            Where:
-            - L_b: Masked Binary Cross-Entropy loss with supervision mask
-            - L_c: Enhanced contrastive learning loss with 4 types of negative pairs
-            """
-            device = pred_label.device
-            
-            # 1. Masked BCE classification loss
-            bce_loss = masked_bce_loss(pred_label, labels, case_labels, tuning_attempts, eta, device)
-
-            # 2. Enhanced contrastive learning loss
-            contrastive_loss = enhanced_contrastive_loss(
-                emb, labels, case_labels, tuning_attempts, 
-                temperature, eta, lambda_1, lambda_2, lambda_3, lambda_4, device
-            )
-
-            # 3. Weighted combination: L_total = λ_b * L_b + λ_c * L_c
-            total_loss = bce_weight * bce_loss + contrastive_weight * contrastive_loss
-
-            return total_loss, bce_loss, contrastive_loss
+            bce_loss = masked_bce_loss(pred_label, labels, selected_components, tuning_attempts, eta)
+            auxiliary_loss = pred_label.sum() * 0.0
+            return bce_loss, bce_loss, auxiliary_loss
 
         # 3) Training loop
         print("Starting finetune")
         for epoch_idx in range(epochs):
             epoch_total_loss = 0.0
             epoch_bce_loss = 0.0
-            epoch_contrastive_loss = 0.0
+            epoch_auxiliary_loss = 0.0
 
             print(f"Finetune epoch {epoch_idx}")
             for batch in train_dataloader:
@@ -566,32 +323,20 @@ class MemoryManager:
                 timeseries = batch["timeseries"].to(device)
                 labels = batch["multilabel"].to(device).float()
 
-                # Get case_labels (positive/negative labels)
-                # Get case_label information from batch
-                if "case_label" in batch:
-                    case_labels = batch["case_label"]
-                else:
-                    # If no case_label column, use default value
-                    case_labels = ["positive"] * len(sql_texts)
-                
                 # Get tuning_attempts n_{i,b} for each component
                 if "tuning_attempts" in batch:
-                    # Parse JSON string if needed
-                    tuning_attempts_list = batch["tuning_attempts"]
-                    if isinstance(tuning_attempts_list[0], str):
-                        tuning_attempts_list = [json.loads(ta) for ta in tuning_attempts_list]
-                    tuning_attempts = torch.tensor(tuning_attempts_list, device=device, dtype=torch.float32)  # [B, K]
+                    tuning_attempts_list = [parse_attempt_vector(ta, labels.size(1)) for ta in batch["tuning_attempts"]]
+                    tuning_attempts = torch.tensor(tuning_attempts_list, device=device, dtype=torch.float32)
                 else:
-                    # Default fallback when tuning_attempts are not available
-                    # For positive labels: assume at least 1 attempt (verified)
-                    # For negative labels with positive case_label: assume at least 1 attempt (tried but failed)
-                    # For negative labels with negative case_label: assume 0 attempts (unverified)
-                    default_attempts = labels.clone()  # Start with labels as base
-                    for i, case_label in enumerate(case_labels):
-                        if case_label == "positive" and labels[i].sum() == 0:
-                            # Positive case but no positive labels - assume at least 1 attempt per component
-                            default_attempts[i] = torch.ones_like(default_attempts[i])
-                    tuning_attempts = default_attempts.to(device)
+                    tuning_attempts = torch.zeros_like(labels, device=device)
+
+                if "selected_components" in batch:
+                    selected_components_list = [
+                        parse_attempt_vector(sc, labels.size(1)) for sc in batch["selected_components"]
+                    ]
+                    selected_components = torch.tensor(selected_components_list, device=device, dtype=torch.float32)
+                else:
+                    selected_components = labels.clone().to(device)
 
                 # Text encoding
                 sql = predictor.tokenizer(
@@ -611,26 +356,16 @@ class MemoryManager:
 
                 optimizer.zero_grad()
                 with torch.set_grad_enabled(True):
-                    # Always use hybrid loss
-                    emb = model.get_embedding(sql, plan, timeseries, logs)  # [B, D]
                     pred_label, _ = model(sql, plan, timeseries, logs)  # [B, K]
-                    total_loss, bce_loss, contrastive_loss = hybrid_loss(
-                        emb,
+                    total_loss, bce_loss, auxiliary_loss = localization_refinement_loss(
                         labels,
                         pred_label,
-                        case_labels,
                         tuning_attempts,
-                        bce_weight,
-                        contrastive_weight,
-                        temperature,
+                        selected_components,
                         eta,
-                        self.lambda_1,
-                        self.lambda_2,
-                        self.lambda_3,
-                        self.lambda_4,
                     )
                     epoch_bce_loss += bce_loss.item()
-                    epoch_contrastive_loss += contrastive_loss.item()
+                    epoch_auxiliary_loss += auxiliary_loss.item()
 
                     total_loss.backward()
                     optimizer.step()
@@ -639,9 +374,12 @@ class MemoryManager:
             # Record training logs
             avg_total_loss = epoch_total_loss / max(1, len(train_dataloader))
             avg_bce_loss = epoch_bce_loss / max(1, len(train_dataloader))
-            avg_contrastive_loss = epoch_contrastive_loss / max(1, len(train_dataloader))
+            avg_auxiliary_loss = epoch_auxiliary_loss / max(1, len(train_dataloader))
 
-            print(f"Hybrid finetune epoch {epoch_idx}: total_loss={avg_total_loss:.6f}, " f"bce_loss={avg_bce_loss:.6f}, contrastive_loss={avg_contrastive_loss:.6f}")
+            print(
+                f"Masked-BCE finetune epoch {epoch_idx}: total_loss={avg_total_loss:.6f}, "
+                f"bce_loss={avg_bce_loss:.6f}, auxiliary_loss={avg_auxiliary_loss:.6f}"
+            )
 
         # 4) Save weights
         best_path = os.path.join(output_dir, "best_model.pt")
@@ -652,7 +390,9 @@ class MemoryManager:
         if not hasattr(self, "_rcrank_predictor") or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
 
-            self._rcrank_predictor = RCRankPredictor(model_path=model_path, train_data_path=stats_data_path, device=device)
+            self._rcrank_predictor = RCRankPredictor(
+                model_path=model_path, train_data_path=stats_data_path, device=device
+            )
             self._rcrank_predictor.model.eval()
             return
 
@@ -684,9 +424,6 @@ class MemoryManager:
             self.finetune_device,
             self.finetune_epochs,
             self.finetune_batch_size,
-            self.bce_weight,
-            self.contrastive_weight,
-            self.lambda_neg,
         )
 
         # reload predictor
@@ -740,8 +477,7 @@ class MemoryManager:
             payload = json.load(f)
 
         self.experiences = {
-            exp_id: ClusterExperience.from_dict(exp_info)
-            for exp_id, exp_info in payload.get("experiences", {}).items()
+            exp_id: ClusterExperience.from_dict(exp_info) for exp_id, exp_info in payload.get("experiences", {}).items()
         }
         self.next_experience_index = self._infer_next_experience_index()
         self._rebuild_case_to_experience_map()
@@ -755,10 +491,7 @@ class MemoryManager:
             os.makedirs(directory, exist_ok=True)
 
         payload = {
-            "experiences": {
-                exp_id: experience.to_dict()
-                for exp_id, experience in self.experiences.items()
-            },
+            "experiences": {exp_id: experience.to_dict() for exp_id, experience in self.experiences.items()},
         }
         with open(self.experience_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
@@ -777,7 +510,10 @@ class MemoryManager:
 
         embeddings = [self._get_case_cluster_embedding(case) for case in cases]
         prototype = np.mean(np.asarray(embeddings, dtype=float), axis=0).astype(float).tolist()
-        distances = [float(np.linalg.norm(np.asarray(embedding, dtype=float) - np.asarray(prototype, dtype=float))) for embedding in embeddings]
+        distances = [
+            float(np.linalg.norm(np.asarray(embedding, dtype=float) - np.asarray(prototype, dtype=float)))
+            for embedding in embeddings
+        ]
         experience.prototype = prototype
         experience.radius = max(distances) if distances else 0.0
         self.experiences[exp_id] = experience
@@ -812,7 +548,8 @@ class MemoryManager:
 
     def _distill_case_ids(self, case_ids):
         candidate_case_ids = [
-            case_id for case_id in dict.fromkeys(case_ids)
+            case_id
+            for case_id in dict.fromkeys(case_ids)
             if case_id in self.cases and case_id not in self.case_to_experience
         ]
         if len(candidate_case_ids) < self.hdbscan_min_cluster_size:
@@ -854,17 +591,11 @@ class MemoryManager:
             self._refresh_experience(exp_id)
 
         assigned_case_ids = set(self.case_to_experience.keys())
-        self.pending_case_ids = [
-            case_id for case_id in self.cases.keys()
-            if case_id not in assigned_case_ids
-        ]
+        self.pending_case_ids = [case_id for case_id in self.cases.keys() if case_id not in assigned_case_ids]
 
         if len(self.pending_case_ids) >= self.pending_buffer_threshold:
             unresolved = self._distill_case_ids(self.pending_case_ids)
-            self.pending_case_ids = [
-                case_id for case_id in unresolved
-                if case_id not in self.case_to_experience
-            ]
+            self.pending_case_ids = [case_id for case_id in unresolved if case_id not in self.case_to_experience]
             self._save_experiences()
 
     def _merge_case_into_nearest_experience(self, case):
@@ -880,7 +611,9 @@ class MemoryManager:
             prototype = experience.prototype or []
             if not prototype:
                 continue
-            distance = float(np.linalg.norm(np.asarray(case_embedding, dtype=float) - np.asarray(prototype, dtype=float)))
+            distance = float(
+                np.linalg.norm(np.asarray(case_embedding, dtype=float) - np.asarray(prototype, dtype=float))
+            )
             if distance < nearest_distance:
                 nearest_distance = distance
                 nearest_experience = experience
@@ -905,10 +638,7 @@ class MemoryManager:
                 self.pending_case_ids.append(case.id)
             if len(self.pending_case_ids) >= self.pending_buffer_threshold:
                 unresolved = self._distill_case_ids(self.pending_case_ids)
-                self.pending_case_ids = [
-                    case_id for case_id in unresolved
-                    if case_id not in self.case_to_experience
-                ]
+                self.pending_case_ids = [case_id for case_id in unresolved if case_id not in self.case_to_experience]
                 self._save_experiences()
         except Exception as exc:
             logger.warning("Failed to update experience clusters for case %s: %s", case.id, exc)
@@ -988,14 +718,8 @@ class MemoryManager:
             return {"positive": [], "negative": []}
 
         return {
-            "positive": [
-                self._build_used_case_snapshot(case_info)
-                for case_info in used_cases.get("positive", [])
-            ],
-            "negative": [
-                self._build_used_case_snapshot(case_info)
-                for case_info in used_cases.get("negative", [])
-            ],
+            "positive": [self._build_used_case_snapshot(case_info) for case_info in used_cases.get("positive", [])],
+            "negative": [self._build_used_case_snapshot(case_info) for case_info in used_cases.get("negative", [])],
         }
 
     def save_to_memory(self, new_case=None):
@@ -1032,7 +756,7 @@ class MemoryManager:
     ):
         """
         Save a case to memory
-        
+
         Args:
             query_info: Query information
             fix_action: Fix action applied
@@ -1064,9 +788,9 @@ class MemoryManager:
         # Use provided round_num or current_round
         if round_num is None:
             round_num = self.current_round
-        
+
         query_id_str = str(query_info.query_id)
-        match = re.match(r'^(\d+)(.*)$', query_id_str)
+        match = re.match(r"^(\d+)(.*)$", query_id_str)
         if match:
             numeric_part = match.group(1)
             suffix = match.group(2)
@@ -1098,34 +822,34 @@ class MemoryManager:
             action_embedding=action_embedding,
         )
         self.add_case(case)
-        
+
         if self.retriever is not None:
             self.retriever.check_and_add_pending_experiences(case_id)
 
         return case.id
-    
+
     def generate_next_query_info_id(self, query_id, round_num=None):
         """
         Generate next_query_info_id in format "round-query_id"
-        
+
         Args:
             query_id: Query ID
             round_num: Next round number (if None, uses current_round + 1)
-        
+
         Returns:
             next_query_info_id string, e.g., "2-01"
         """
         if round_num is None:
             round_num = self.current_round + 1
-        
+
         query_id_str = str(query_id)
-        match = re.match(r'^(\d+)(.*)$', query_id_str)
+        match = re.match(r"^(\d+)(.*)$", query_id_str)
         if match:
             numeric_part = match.group(1)
             suffix = match.group(2)  # Could be empty or letters like 'c', 'b'
             query_id_str = numeric_part.zfill(2) + suffix
         return f"{round_num}-{query_id_str}"
-    
+
     def set_current_round(self, round_num):
         """Set current round number"""
         self.current_round = round_num
@@ -1288,7 +1012,9 @@ class MemoryManager:
             return {"mode": mode, "positive": [], "negative": []}
 
         # Use Soft Q Learning retriever to select cases
-        selected_cases = self.retriever.select_cases(query_info.__dict__, candidate_cases, root_causes, top_k=pos_n + neg_n)
+        selected_cases = self.retriever.select_cases(
+            query_info.__dict__, candidate_cases, root_causes, top_k=pos_n + neg_n
+        )
 
         # Classify by label
         positive_cases = []
@@ -1409,9 +1135,7 @@ class MemoryManager:
 
         same_sql_cases = []
         for case in self.cases.values():
-            stored_query = (
-                ((case.case_info.get("query_info") or {}).get("query") or "").strip().lower()
-            )
+            stored_query = ((case.case_info.get("query_info") or {}).get("query") or "").strip().lower()
             if stored_query and stored_query == normalized_query:
                 same_sql_cases.append(case)
 
@@ -1572,7 +1296,7 @@ class MemoryManager:
                     "model_path": "/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
                     "train_data_path": "/root/DREAM/src/agent/plan/slow_sql_data_gen.csv",
                     "opt_threshold": 0.5,
-                    "num_classes": 4
+                    "num_classes": 4,
                 }
             self._rcrank_predictor = RCRankPredictor(self._planner_config)
         predictor = self._rcrank_predictor
@@ -1613,7 +1337,9 @@ class MemoryManager:
             )
             return []
 
-        sql = predictor.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512).to(predictor.device)
+        sql = predictor.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512).to(
+            predictor.device
+        )
 
         plan = {
             "x": plan_tensor["x"].to(predictor.device).to(torch.float32),
@@ -1625,7 +1351,9 @@ class MemoryManager:
         timeseries = torch.tensor(query_info.external_metrics)
         if len(timeseries.shape) == 2:
             timeseries = timeseries.unsqueeze(0)
-        timeseries = (timeseries - predictor.timeseries_train_mean.unsqueeze(1)) / (predictor.timeseries_train_std.unsqueeze(1) + 1e-6)
+        timeseries = (timeseries - predictor.timeseries_train_mean.unsqueeze(1)) / (
+            predictor.timeseries_train_std.unsqueeze(1) + 1e-6
+        )
         timeseries = timeseries.to(predictor.device)
 
         log = torch.tensor(query_info.internal_metrics)
@@ -1661,8 +1389,6 @@ class MemoryManager:
         if root_causes is None:
             return frozenset()
         normalized = self._normalize_root_causes_list(root_causes)
-        if normalized == ["normal"]:
-            return frozenset(["normal"])
         return frozenset(normalized)
 
     def _normalize_root_causes_list(self, root_causes):
@@ -1680,8 +1406,6 @@ class MemoryManager:
         seen = set()
         for candidate in candidates:
             label = normalize_component_label(candidate)
-            if label == "normal":
-                return ["normal"]
             if label in self.root_cause_types and label not in seen:
                 seen.add(label)
                 normalized.append(label)
@@ -1768,9 +1492,9 @@ class MemoryManager:
     def save_experience(self, query_info, case_info, root_causes, reward, next_query_info_id=None, done=False):
         """
         Save single experience to file (JSONL format, append mode)
-        
+
         Experience tuple: (s_t, o_t, B_t, r_t, next_query_info_id, done)
-        
+
         Args:
             query_info: s_t - current state (query_info)
             case_info: o_t - retrieved observation from memory
@@ -1792,7 +1516,7 @@ class MemoryManager:
 
         # Prepare current experience dict
         exp_dict = {
-            "query_info": query_info.__dict__ if hasattr(query_info, '__dict__') else query_info,
+            "query_info": query_info.__dict__ if hasattr(query_info, "__dict__") else query_info,
             "case_info": case_info,
             "root_causes": self._normalize_root_causes_list(root_causes),
             "reward": reward,

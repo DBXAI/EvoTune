@@ -16,10 +16,18 @@ import pandas as pd
 from agents import Agent, Runner
 from model.modules.QueryFormer.utils import Encoding
 from agent.contracts import (
-    SMALL_MODEL_COMPONENTS,
+    CANONICAL_COMPONENTS,
     normalize_component_confidence_map,
     normalize_components,
     parse_detection_output,
+)
+from agent.plan.localization import (
+    EXPERT_LIGHTWEIGHT,
+    EXPERT_LLM,
+    EXPERT_RANDOM,
+    LocalizationExpertSelector,
+    build_tuning_history,
+    random_component_subset,
 )
 from RCRank.utils.plan_encoding import PlanEncoder
 
@@ -48,6 +56,7 @@ class Planner:
         self.database_config = database_config or {}
         self.device = predictor.device if predictor is not None else "cpu"
         self._database_info_cache = None
+        self.localization_selector = LocalizationExpertSelector(agent_config)
 
         # Initialize encoding components
         self.encoding = Encoding(None, {"NA": 0})
@@ -55,7 +64,9 @@ class Planner:
         self.root_cause_model = self.agent_config.get("root_cause_llm_model")
 
     def encode_plan(self, query_plan):
-        df = pd.DataFrame([{"plan_json": (json.dumps({"Plan": query_plan}) if isinstance(query_plan, dict) else query_plan)}])
+        df = pd.DataFrame(
+            [{"plan_json": (json.dumps({"Plan": query_plan}) if isinstance(query_plan, dict) else query_plan)}]
+        )
 
         plan_encoder = PlanEncoder(df=df, encoding=self.encoding)
         encoded_df = plan_encoder.df
@@ -63,6 +74,8 @@ class Planner:
         return encoded_df["json_plan_tensor"].iloc[0]
 
     def model_predict(self, query_info):
+        if self.predictor is None:
+            raise RuntimeError("Lightweight localization model is not configured")
         start_time = time.perf_counter()
         query, plan, timeseries, log = self._build_prediction_input(query_info)
 
@@ -90,7 +103,7 @@ class Planner:
             input=prompt,
         )
 
-    def llm_predict(self, query_info, root_causes, state_confidence, tuning_history=None):
+    def llm_predict(self, query_info, tuning_history=None):
         start_time = time.perf_counter()
         llm_usage_metrics = {
             "diag_llm_requests": 0,
@@ -98,15 +111,8 @@ class Planner:
             "diag_llm_output_tokens": 0,
             "diag_llm_total_tokens": 0,
         }
-        # ε-greedy retrieval structure: {"positive", "negative"}
-        # retrieval = self.memory_manager.retrieve_cases(query_info, root_causes)
-        # positives = retrieval.get('positive', [])
-        # negatives = retrieval.get('negative', [])
-
         prompt = build_root_cause_diagnosis_prompt(
             query_info,
-            root_causes,
-            state_confidence=state_confidence,
             tuning_history=tuning_history,
             database_info=self._build_database_info(),
         )
@@ -137,8 +143,8 @@ class Planner:
             retry += 1
 
         if labels is None:
-            labels = ["normal"]
-            conf_map = {"normal": 1.0}
+            labels = random_component_subset()
+            conf_map = {component: (0.6 if component in labels else 0.0) for component in CANONICAL_COMPONENTS}
 
         runtime_metrics = {
             "T_diag_llm": time.perf_counter() - start_time,
@@ -167,7 +173,7 @@ class Planner:
             "workload_type": workload_type,
             "dbname": dbname,
             "size": size,
-            "schema": schema
+            "schema": schema,
         }
         return self._database_info_cache
 
@@ -195,81 +201,100 @@ class Planner:
             1: "hint",
             2: "knob",
             3: "query",
-            4: "normal",
         }
 
-        print("pred_label: ", pred_label)
-        print("pred_label_opt: ", pred_label_opt)
-
-        if pred_label.sum() == 0:
-            return {"root_causes": "normal"}
+        confidence_map = {
+            issue_types[class_idx]: float(pred_label_opt[0][class_idx])
+            for class_idx in range(min(pred_label_opt.shape[1], len(issue_types)))
+        }
 
         predicted_classes = np.where(pred_label[0] == 1)[0]
         if len(predicted_classes) == 0:
-            return {"root_causes": "normal"}
-            # return {"root_cause": "normal", "confidence": pred_label_opt}
+            best_idx = int(np.argmax(pred_label_opt[0][: len(issue_types)]))
+            predicted_classes = np.array([best_idx])
 
         root_causes = []
-        root_causes_confidence = []
         for class_idx in predicted_classes:
             root_cause = issue_types.get(class_idx)
             if root_cause not in root_causes:
                 root_causes.append(root_cause)
-                root_causes_confidence.append(pred_label_opt[0][class_idx])
 
-        return {"root_causes": root_causes}
-        # root_cause = {
-        #     "root_cause": root_causes,
-        #     "confidence": root_causes_confidence
-        # }
+        return {"root_causes": root_causes, "confidence": confidence_map}
+
+    def _allowed_localization_experts(self):
+        model_type = str(self.agent_config.get("model_type", "hybrid")).lower()
+        if model_type in {"small", "small_model", "lm"}:
+            return [EXPERT_LIGHTWEIGHT] if self.predictor is not None else [EXPERT_RANDOM]
+        if model_type in {"large", "large_model", "llm"}:
+            return [EXPERT_LLM]
+        if model_type in {"random", "rand"}:
+            return [EXPERT_RANDOM]
+        experts = []
+        if self.predictor is not None:
+            experts.append(EXPERT_LIGHTWEIGHT)
+        experts.extend([EXPERT_LLM, EXPERT_RANDOM])
+        return experts
+
+    def _ensure_nonempty_components(self, root_causes, confidence=None):
+        root_causes = normalize_components(root_causes)
+        if root_causes:
+            return root_causes
+
+        confidence = normalize_component_confidence_map(confidence)
+        if confidence:
+            return [max(CANONICAL_COMPONENTS, key=lambda label: confidence.get(label, 0.0))]
+        return random_component_subset()
+
+    def _predict_with_random_expert(self, state):
+        exclude_roots = state.get("root_tried", set())
+        root_causes = random_component_subset(exclude_roots=exclude_roots)
+        confidence = {component: (0.6 if component in root_causes else 0.0) for component in CANONICAL_COMPONENTS}
+        return {"root_causes": root_causes, "confidence": confidence, "runtime_metrics": {}}
 
     def predict(self, query_info, state, memory_manager):
         runtime_metrics = {}
-        # If current_root already exists, reuse it; otherwise call small model + LLM to get new root cause
-        current_root = state.get("current_root")
-        if current_root is None:
-            # Small model initial prediction + confidence
-            model_out = self.model_predict(query_info)
-            runtime_metrics = merge_runtime_metrics(runtime_metrics, model_out.get("runtime_metrics"))
-            current_root = model_out.get("root_causes")
-            print("Small model predicted root cause: ", current_root)
-            pred_opt = model_out.get("pred_label_opt")
-            labels = list(SMALL_MODEL_COMPONENTS)
-            confidence = np.array(pred_opt).reshape(-1)
-            state["confidence"] = {labels[i]: float(confidence[i]) for i in range(confidence.shape[0])}
-        else:
-            current_root = normalize_components(current_root)
-            state["confidence"] = normalize_component_confidence_map(state.get("confidence"))
+        active_decision = self.localization_selector.active_decision(state)
+        if active_decision is not None:
+            state["current_root"] = active_decision.root_causes
+            state["confidence"] = active_decision.confidence
+            state["localization_expert"] = active_decision.expert
+            state["last_runtime_metrics"] = runtime_metrics
+            return active_decision.root_causes, state
 
-        # Pass current root cause and confidence to LLM
-        # Build historical success/failure counts aggregated by root cause
-        tuning_history = []
-        union_keys = set(state.get("attempts", {}).keys()) | set(state.get("successes", {}).keys())
-        for k in union_keys:
-            # Normalize to frozenset or single element set
-            label = list(k)
-            tuning_history.append(
-                {
-                    "label": label,
-                    "success_count": int(state.get("successes", {}).get(k, 0)),
-                    "fail_count": int(state.get("attempts", {}).get(k, 0)),
-                }
+        expert, samples = self.localization_selector.select_expert(state, self._allowed_localization_experts())
+        state.setdefault("localization", {})["last_samples"] = samples
+
+        if expert == EXPERT_LIGHTWEIGHT:
+            result = self.model_predict(query_info)
+        elif expert == EXPERT_LLM:
+            result = self.llm_predict(
+                query_info,
+                tuning_history=build_tuning_history(state),
             )
+        else:
+            result = self._predict_with_random_expert(state)
 
-        llm_result = self.llm_predict(
-            query_info,
-            current_root,
-            state_confidence=state.get("confidence"),
-            tuning_history=tuning_history,
-        )
-        runtime_metrics = merge_runtime_metrics(runtime_metrics, llm_result.get("runtime_metrics"))
-        predicted_root = llm_result.get("root_causes")
-        state["confidence"] = llm_result.get("confidence")
+        runtime_metrics = merge_runtime_metrics(runtime_metrics, result.get("runtime_metrics"))
+        confidence = normalize_component_confidence_map(result.get("confidence"))
+        predicted_root = self._ensure_nonempty_components(result.get("root_causes"), confidence)
+        predicted_key = frozenset(predicted_root)
+        if predicted_key in state.get("root_tried", set()) and expert != EXPERT_RANDOM:
+            result = self._predict_with_random_expert(state)
+            confidence = normalize_component_confidence_map(result.get("confidence"))
+            predicted_root = self._ensure_nonempty_components(result.get("root_causes"), confidence)
+            expert = EXPERT_RANDOM
+        decision = self.localization_selector.start_decision(state, expert, predicted_root, confidence)
+        state["localization_expert"] = decision.expert
         state["last_runtime_metrics"] = runtime_metrics
         logger.info(
-            "[Runtime][SQL %s] Diagnosis summary: %s",
+            "[Runtime][SQL %s] Localization summary: expert=%s components=%s %s",
             getattr(query_info, "query_id", "unknown"),
+            expert,
+            predicted_root,
             format_runtime_metrics(runtime_metrics),
         )
 
         return predicted_root, state
+
+    def update_localization_feedback(self, state, success):
+        return self.localization_selector.record_feedback(state, success)

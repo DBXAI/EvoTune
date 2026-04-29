@@ -25,7 +25,9 @@ from transformers import BertModel, BertTokenizer
 
 
 class RCRankPredictor:
-    def __init__(self, config):
+    def __init__(self, config=None, **kwargs):
+        config = dict(config or {})
+        config.update(kwargs)
         self.device = config.get("device", "cpu")
         self.num_classes = config.get("num_classes", 4)
         self.model_path = config.get("model_path")
@@ -145,7 +147,7 @@ class RCRankPredictor:
 
     def predict(self, query, plan, timeseries, log):
         self.model.eval()
-        
+
         with torch.no_grad():
             sql = self.tokenizer(
                 query,
@@ -166,7 +168,9 @@ class RCRankPredictor:
             if len(timeseries.shape) == 2:
                 timeseries = timeseries.unsqueeze(0)  # add batch dimension
             # standardize
-            timeseries = (timeseries - self.timeseries_train_mean.unsqueeze(1)) / (self.timeseries_train_std.unsqueeze(1) + 1e-6)
+            timeseries = (timeseries - self.timeseries_train_mean.unsqueeze(1)) / (
+                self.timeseries_train_std.unsqueeze(1) + 1e-6
+            )
             timeseries = timeseries.to(self.device)
 
             log = torch.tensor(log)

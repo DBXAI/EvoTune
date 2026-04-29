@@ -1,9 +1,14 @@
 import re
+from collections import defaultdict
 
 from agent.action.action_utils import extract_index_names
-from agent.contracts import normalize_components
 from agent.action.rule_matcher import SQLRuleMatcher
+from agent.contracts import normalize_components
 from agent.prompt import build_action_space_prompt
+
+
+DEFAULT_IMPROVEMENT_THRESHOLD = 0.0
+DEFAULT_REFINEMENT_MIN_CASES = 10
 
 
 async def action_space_collect(
@@ -21,9 +26,7 @@ async def action_space_collect(
     if enable_action_define:
         knob_config = configs.get("KNOB_CONFIG")
         current_knob_values = db.get_current_knob_values(knob_config)
-        base_action_space = build_action_space_prompt(
-            root_causes, db, knob_config, current_knob_values, query_info
-        )
+        base_action_space = build_action_space_prompt(root_causes, db, knob_config, current_knob_values, query_info)
     else:
         base_action_space = _build_basic_action_space(root_causes)
 
@@ -41,191 +44,137 @@ async def action_space_collect(
 
 def action_pruning(root_causes, query_info, memory_manager):
     root_causes = normalize_components(root_causes)
-    has_index_root = "index" in root_causes
-    has_query_root = "query" in root_causes
-
-    if not has_index_root and not has_query_root:
-        return ""
-
     pruning_guidance = []
-    pruning_guidance.append(
-        "    • Action Pruning: Based on historical failure cases with the same root cause, "
-        "the following discrete operations have been proven ineffective, please avoid using them:"
-    )
 
-    if has_index_root:
-        failed_index_actions = _get_failed_index_actions(root_causes, query_info, memory_manager)
+    if "index" in root_causes:
+        failed_index_actions = _get_failed_index_actions(query_info, memory_manager)
         if failed_index_actions:
-            pruning_guidance.append("The ineffective indexes:")
+            pruning_guidance.append(
+                "- Index Pruning: Based on historical failure cases with the same tuning component, "
+                "the following indexes have been proven ineffective, please avoid using them:"
+            )
             for index_name in sorted(failed_index_actions):
-                pruning_guidance.append(f"{index_name}")
+                pruning_guidance.append(f"  {index_name}")
 
-    if has_query_root:
-        applicable_rules = _get_applicable_rewrite_rules(query_info, memory_manager)
-        if applicable_rules:
-            pruning_guidance.append("The ineffective query rewrite rules:")
-            for rule in applicable_rules:
-                pruning_guidance.append(f"{rule}")
-
-    if len(pruning_guidance) == 1:
-        pruning_guidance.append("None")
+    if "query" in root_causes:
+        failed_rules = _get_applicable_rewrite_rules(query_info, memory_manager)
+        if failed_rules:
+            pruning_guidance.append(
+                "- Query Pruning: Based on historical failure cases with the same tuning component, "
+                "the following query rewrite rules have been proven ineffective, please avoid using them:"
+            )
+            for rule in failed_rules:
+                pruning_guidance.append(f"  {rule['name']}: {rule.get('conditions', '')}")
 
     return "\n".join(pruning_guidance)
 
 
-def _get_failed_index_actions(root_causes, query_info, memory_manager):
-    target_root = memory_manager._normalize_root_causes(root_causes)
-    target_island_ids = list(memory_manager.islands.get(target_root, set()))
+def _get_failed_index_actions(query_info, memory_manager):
+    threshold = _get_improvement_threshold(memory_manager)
+    cases = _component_cases(memory_manager, "index")
+    same_query_cases = _same_query_cases(cases, query_info)
+    if same_query_cases:
+        cases = same_query_cases
 
-    if not target_island_ids:
-        return set()
-
-    same_root_cases = memory_manager.ids_to_cases(target_island_ids)
-
-    query_id = query_info.query_id
-    same_sql_cases = []
-    for case in same_root_cases:
-        if case.case_info.get("query_info").get("query_id") == query_id:
-            same_sql_cases.append(case)
-
-    if not same_sql_cases:
-        return set()
+    index_improvements = defaultdict(list)
+    for case in cases:
+        fix_action = case.case_info.get("fix_action")
+        if not fix_action:
+            continue
+        for index_name in extract_index_names(str(fix_action)):
+            index_improvements[index_name].append(_case_improvement(case))
 
     failed_index_actions = set()
-    for case in same_sql_cases:
-        case_label = case.case_info.get("label")
-        if case_label == "negative":
-            fix_action = case.case_info.get("fix_action")
-            if fix_action:
-                index_names = extract_index_names(str(fix_action))
-                for index_name in index_names:
-                    failed_index_actions.add(index_name)
+    for index_name, improvements in index_improvements.items():
+        if improvements and _average(improvements) <= threshold:
+            failed_index_actions.add(index_name)
 
     return failed_index_actions
 
 
 def _get_applicable_rewrite_rules(query_info, memory_manager):
-    target_root = memory_manager._normalize_root_causes(["query"])
-    target_island_ids = list(memory_manager.islands.get(target_root, set()))
-
-    if not target_island_ids:
+    if query_info is None:
         return []
 
-    same_root_cases = memory_manager.ids_to_cases(target_island_ids)
-
-    query_id = query_info.query_id
-    same_sql_cases = []
-    for case in same_root_cases:
-        if case.case_info.get("query_info").get("query_id") == query_id:
-            same_sql_cases.append(case)
-
-    if not same_sql_cases:
+    threshold = _get_improvement_threshold(memory_manager)
+    cases = _same_query_cases(_component_cases(memory_manager, "query"), query_info)
+    if not cases:
         return []
 
-    failed_rules = set()
-    original_query = query_info.query
+    rule_matcher = SQLRuleMatcher()
+    original_query = getattr(query_info, "query", "") or ""
+    applicable_rules = rule_matcher.match_rules(original_query)
+    if not applicable_rules:
+        return []
 
-    for case in same_sql_cases:
-        case_label = case.case_info.get("label")
-        if case_label == "negative":
-            rewritten_query = case.case_info.get("query_info").get("query")
-
-            rule_matcher = SQLRuleMatcher()
-
-            applicable_rules = rule_matcher.match_rules(original_query)
-            for rule in applicable_rules:
-                if rule_matcher._rule_used_in_rewrite(rule, original_query, rewritten_query):
-                    failed_rules.add(rule["name"])
+    rule_improvements = defaultdict(list)
+    for case in cases:
+        rewritten_query = _case_query_info(case).get("query") or case.case_info.get("fix_action") or ""
+        if not rewritten_query:
+            continue
+        for rule in applicable_rules:
+            if rule_matcher._rule_used_in_rewrite(rule, original_query, str(rewritten_query)):
+                rule_improvements[rule["name"]].append(_case_improvement(case))
 
     failed_rule_info = []
-    for rule_name in failed_rules:
-        rule_matcher = SQLRuleMatcher()
-        rule_info = rule_matcher.get_rule_info(rule_name)
-        if rule_info:
-            failed_rule_info.append(rule_info)
+    for rule_name, improvements in rule_improvements.items():
+        if improvements and _average(improvements) <= threshold:
+            rule_info = rule_matcher.get_rule_info(rule_name)
+            if rule_info:
+                failed_rule_info.append(rule_info)
 
+    failed_rule_info.sort(key=lambda rule: rule["name"])
     return failed_rule_info
 
 
 def action_refinement(root_causes, query_info, memory_manager):
     root_causes = normalize_components(root_causes)
-    has_knob_root = "knob" in root_causes
-    has_hint_root = "hint" in root_causes
-
-    if not has_knob_root and not has_hint_root:
-        return ""
-
     refinement_guidance = []
-    refinement_guidance.append(
-        "    • Action Refinement: Based on historical success cases with the same root cause, "
-        "the following continuous operations have been proven effective, suggest prioritizing exploration:"
-    )
 
-    if has_knob_root:
-        knob_guidance = _get_knob_refinement_guidance(root_causes, query_info, memory_manager)
+    if "knob" in root_causes:
+        knob_guidance = _get_knob_refinement_guidance(query_info, memory_manager)
         if knob_guidance:
             refinement_guidance.append(knob_guidance)
 
-    if has_hint_root:
-        hint_guidance = _get_hint_refinement_guidance(root_causes, query_info, memory_manager)
+    if "hint" in root_causes:
+        hint_guidance = _get_hint_refinement_guidance(query_info, memory_manager)
         if hint_guidance:
             refinement_guidance.append(hint_guidance)
-
-    if len(refinement_guidance) == 1:
-        refinement_guidance.append("None")
 
     return "\n".join(refinement_guidance)
 
 
-def _get_knob_refinement_guidance(root_causes, query_info, memory_manager, min_threshold=10):
-    target_root = memory_manager._normalize_root_causes(root_causes)
-    target_island_ids = list(memory_manager.islands.get(target_root))
+def _get_knob_refinement_guidance(query_info, memory_manager, min_threshold=None):
+    threshold = _get_improvement_threshold(memory_manager)
+    min_cases = min_threshold or _get_refinement_min_cases(memory_manager)
+    cases = _component_cases(memory_manager, "knob")
+    similar_cases = _retrieve_similar_component_cases(query_info, memory_manager, "knob")
+    if similar_cases:
+        cases = similar_cases
 
-    if not target_island_ids:
-        return ""
-
-    similar_cases = memory_manager.retrieve_embedding(query_info, top_n=50)
-    similar_same_root_cases = []
-    for case in similar_cases:
-        case_root = memory_manager._normalize_root_causes(case.case_info.get("root_causes"))
-        if case_root == target_root:
-            similar_same_root_cases.append(case)
-
-    if not similar_same_root_cases:
-        return ""
-
-    positive_cases = []
-    for case in similar_same_root_cases:
-        approve_time = case.case_info.get("approve_time")
-        if approve_time and approve_time > 0:
-            positive_cases.append(case)
-
-    if len(positive_cases) < min_threshold:
+    positive_cases = [case for case in cases if _case_improvement(case) > threshold]
+    if len(positive_cases) < min_cases:
         return ""
 
     knob_data = _extract_knob_data(positive_cases)
-
     if not knob_data:
         return ""
 
-    guidance = []
-    guidance.append(
-        "• Knob Tuning Space Refinement: Based on historical successful cases, "
-        "the following knob value ranges are recommended for exploration:"
-    )
+    guidance = [
+        "- Knob Refinement: Based on historical success cases with high-quality configurations, "
+        "the following knob domains are recommended for focused exploration:"
+    ]
 
-    for knob_name in knob_data.keys():
+    for knob_name in sorted(knob_data.keys()):
         values = knob_data[knob_name]["values"]
-
-        if len(values) < min_threshold:
+        improvements = knob_data[knob_name]["performance"]
+        if len(values) < min_cases or _average(improvements) <= threshold:
             continue
 
-        min_value = min(values)
-        max_value = max(values)
-
+        domain = _format_value_domain(values)
         guidance.append(
-            f"- Knob '{knob_name}': Recommended range [{min_value}, {max_value}],  "
-            f"Based on {len(values)} successful historical cases"
+            f"  <KNOB_NAME={knob_name}, RANGE={domain}, NUM_CASES={len(values)}, "
+            f"AVG_IMPROVEMENT={_average(improvements):.3f}>"
         )
 
     if len(guidance) <= 1:
@@ -233,47 +182,148 @@ def _get_knob_refinement_guidance(root_causes, query_info, memory_manager, min_t
     return "\n".join(guidance)
 
 
-def _get_hint_refinement_guidance(root_causes, query_info, memory_manager):
-    target_root = memory_manager._normalize_root_causes(root_causes)
-    target_island_ids = list(memory_manager.islands.get(target_root))
+def _get_hint_refinement_guidance(query_info, memory_manager):
+    threshold = _get_improvement_threshold(memory_manager)
+    cases = _component_cases(memory_manager, "hint")
+    same_query_cases = _same_query_cases(cases, query_info)
+    if same_query_cases:
+        cases = same_query_cases
 
-    if not target_island_ids:
-        return ""
-
-    same_root_cases = memory_manager.ids_to_cases(target_island_ids)
-
-    query_id = query_info.query_id
-    same_sql_cases = []
-    for case in same_root_cases:
-        if case.case_info.get("query_info").get("query_id") == query_id:
-            same_sql_cases.append(case)
-
-    if not same_sql_cases:
-        return ""
-
-    hint_data = _extract_hint_usage_data(same_sql_cases)
-
+    hint_data = _extract_hint_usage_data(cases)
     if not hint_data:
         return ""
 
-    guidance = []
+    positive_hints = _select_positive_hints(hint_data, threshold)
+    if not positive_hints:
+        return ""
 
-    positive_hints = []
-    for hint_key, hint_stats in hint_data.items():
-        if hint_stats["avg_improvement"] > 0:
-            positive_hints.append((hint_key, hint_stats))
-
-    if positive_hints:
+    guidance = [
+        "- Hint Refinement: Based on historical success cases with the same tuning component, "
+        "the following optimizer hints are recommended as positive hint choices:"
+    ]
+    for hint_key, hint_stats in positive_hints:
         guidance.append(
-            "• Query Hint Refinement: Based on historical hint usage data, the "
-            "following hints have shown positive performance impact:"
+            f"  <POSITIVE_HINT={hint_key}, AVG_IMPROVEMENT={hint_stats['avg_improvement']:.3f}, "
+            f"NUM_CASES={hint_stats['usage_count']}>"
         )
-        positive_hints.sort(key=lambda x: x[1]["avg_improvement"], reverse=True)
-
-        for hint_key, hint_stats in positive_hints:
-            guidance.append(f"- Hint '{hint_key}': Average improvement {hint_stats['avg_improvement']:.1f}%")
 
     return "\n".join(guidance)
+
+
+def _component_cases(memory_manager, component):
+    cases = list(getattr(memory_manager, "cases", {}).values())
+    if cases:
+        return [case for case in cases if component in normalize_components(case.case_info.get("root_causes"))]
+
+    if hasattr(memory_manager, "_normalize_root_causes") and hasattr(memory_manager, "ids_to_cases"):
+        target_root = memory_manager._normalize_root_causes([component])
+        target_island_ids = list(getattr(memory_manager, "islands", {}).get(target_root, set()))
+        return memory_manager.ids_to_cases(target_island_ids)
+
+    return []
+
+
+def _retrieve_similar_component_cases(query_info, memory_manager, component):
+    if query_info is None or not hasattr(memory_manager, "retrieve_embedding"):
+        return []
+    try:
+        cases = memory_manager.retrieve_embedding(query_info, top_n=50)
+    except Exception:
+        return []
+    return [case for case in cases if component in normalize_components(case.case_info.get("root_causes"))]
+
+
+def _same_query_cases(cases, query_info):
+    query_id = getattr(query_info, "query_id", None)
+    if query_id is None:
+        return []
+    return [case for case in cases if str(_case_query_info(case).get("query_id")) == str(query_id)]
+
+
+def _case_query_info(case):
+    query_info = case.case_info.get("query_info") or {}
+    if isinstance(query_info, dict):
+        return query_info
+    return getattr(query_info, "__dict__", {}) or {}
+
+
+def _case_improvement(case):
+    value = case.case_info.get("approve_time")
+    if value is None:
+        value = getattr(case, "metrics", {}).get("approve_time", 0.0)
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _get_improvement_threshold(memory_manager):
+    config = getattr(memory_manager, "agent_config", {}) or {}
+    value = config.get("refinement_improvement_threshold", config.get("pruning_improvement_threshold"))
+    if value is None:
+        value = getattr(memory_manager, "improvement_threshold", DEFAULT_IMPROVEMENT_THRESHOLD)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_IMPROVEMENT_THRESHOLD
+
+
+def _get_refinement_min_cases(memory_manager):
+    config = getattr(memory_manager, "agent_config", {}) or {}
+    value = config.get("refinement_min_cases", DEFAULT_REFINEMENT_MIN_CASES)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return DEFAULT_REFINEMENT_MIN_CASES
+
+
+def _average(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def _format_value_domain(values):
+    numeric_values = []
+    for value in values:
+        try:
+            numeric_values.append(float(str(value).strip("'\"")))
+        except (TypeError, ValueError):
+            numeric_values = []
+            break
+
+    if numeric_values and len(numeric_values) == len(values):
+        return f"[{_format_number(min(numeric_values))}, {_format_number(max(numeric_values))}]"
+
+    unique_values = sorted({str(value) for value in values})
+    return "{" + ", ".join(unique_values) + "}"
+
+
+def _format_number(value):
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def _select_positive_hints(hint_data, threshold):
+    by_knob = defaultdict(list)
+    for hint_key, hint_stats in hint_data.items():
+        by_knob[hint_stats["knob"]].append((hint_key, hint_stats))
+
+    selected = []
+    for hints in by_knob.values():
+        hints.sort(key=lambda item: item[1]["avg_improvement"], reverse=True)
+        if len(hints) == 1:
+            if hints[0][1]["avg_improvement"] > threshold:
+                selected.append(hints[0])
+            continue
+
+        best_avg = hints[0][1]["avg_improvement"]
+        worst_avg = hints[-1][1]["avg_improvement"]
+        if best_avg - worst_avg > threshold:
+            if best_avg > threshold:
+                selected.append(hints[0])
+        else:
+            selected.extend([item for item in hints if item[1]["avg_improvement"] > threshold])
+
+    selected.sort(key=lambda item: item[1]["avg_improvement"], reverse=True)
+    return selected
 
 
 def _extract_knob_data(cases):
@@ -282,7 +332,7 @@ def _extract_knob_data(cases):
     for case in cases:
         fix_action = case.case_info.get("fix_action")
         knob_settings = _extract_knob_settings(str(fix_action))
-        approve_time = case.case_info.get("approve_time")
+        approve_time = _case_improvement(case)
 
         for knob_name, knob_value in knob_settings.items():
             if knob_name not in knob_data:
@@ -307,13 +357,15 @@ def _extract_hint_usage_data(cases):
     hint_data = {}
 
     for case in cases:
-        query = case.case_info.get("query_info").get("query")
+        query = _case_query_info(case).get("query") or ""
+        fix_action = case.case_info.get("fix_action") or ""
+        action_text = f"{fix_action}\n{query}"
 
-        hints = _extract_hints_from_action(str(query))
+        hints = _extract_hints_from_action(str(action_text))
         if not hints:
             continue
 
-        performance_improvement = case.case_info.get("approve_time")
+        performance_improvement = _case_improvement(case)
 
         for hint in hints:
             hint_key = hint["full_hint"]
@@ -323,14 +375,12 @@ def _extract_hint_usage_data(cases):
                     "value": hint["value"],
                     "improvements": [],
                     "usage_count": 0,
-                    "avg_improvement": 0,
+                    "avg_improvement": 0.0,
                 }
 
             hint_data[hint_key]["improvements"].append(performance_improvement)
             hint_data[hint_key]["usage_count"] += 1
-            hint_data[hint_key]["avg_improvement"] = sum(hint_data[hint_key]["improvements"]) / len(
-                hint_data[hint_key]["improvements"]
-            )
+            hint_data[hint_key]["avg_improvement"] = _average(hint_data[hint_key]["improvements"])
 
     return hint_data
 
@@ -338,11 +388,11 @@ def _extract_hint_usage_data(cases):
 def _extract_knob_settings(action_str):
     knob_settings = {}
 
-    set_pattern = r"set\s+(\w+)\s*=\s*([^\s;]+)"
-    matches = re.findall(set_pattern, action_str.lower())
+    set_pattern = r"set\s+([a-zA-Z0-9_]+)\s*=\s*([^\s;]+)"
+    matches = re.findall(set_pattern, action_str, re.IGNORECASE)
 
     for knob_name, knob_value in matches:
-        knob_settings[knob_name] = knob_value
+        knob_settings[knob_name.lower()] = knob_value.strip().strip("'").strip('"')
 
     return knob_settings
 
@@ -355,7 +405,7 @@ def _extract_hints_from_action(action_str):
 
     for match in matches:
         set_pattern = r"Set\(([^)]+)\)"
-        set_matches = re.findall(set_pattern, match)
+        set_matches = re.findall(set_pattern, match, re.IGNORECASE)
 
         for set_match in set_matches:
             parts = set_match.strip().split()
@@ -380,11 +430,10 @@ def _build_basic_action_space(root_causes):
     if "index" in root_causes:
         action_space_prompt += """
     • Index Space: 
-    - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx.
-    - Index creation should be strictly guided by the slow_sql queries.
-    - Consider the query execution plan to identify beneficial indexes that could improve performance.
-    - Avoid generating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
     - Use CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS to create or drop indexes.
+    - Name newly created indexes using the pattern <table_name>_<col>_idx, extending it naturally for composite indexes.
+    - Derive query-specific candidate indexes from the database schema and execution plan; consider composite indexes when supported by predicates, joins, grouping, or ordering.
+    - Avoid duplicate, subsumed, existing, primary-key, unique, or constraint indexes.
     """
 
     if "knob" in root_causes:
@@ -408,8 +457,8 @@ def _build_basic_action_space(root_causes):
     if "query" in root_causes:
         action_space_prompt += """
     • Query Rewrite Space: 
-    - Query Rewrite need to generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query while improving performance.
-    - Ensure the rewritten query maintains identical result set and semantic equivalence.
+    - Generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query.
+    - Apply only rewrite rules that are applicable to the current query structure.
     - Prioritize rules that reduce computational complexity, eliminate redundant operations, or optimize data access patterns.
     - The final output must be a complete, executable SQL statement that preserves all original query semantics while demonstrating measurable performance improvements.
     """

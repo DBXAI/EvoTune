@@ -222,7 +222,7 @@ class SimpleDBAgent:
             return []
         inferred = self.memory_manager._infer_root_causes_from_action(fix_action, query_info)
         normalized = self.memory_manager._normalize_root_causes_list(inferred)
-        return normalized or ["normal"]
+        return normalized
 
     def retrieve_static_cases(self, query_info):
         if not self.memory_manager:

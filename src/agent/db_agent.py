@@ -2,12 +2,10 @@ import asyncio
 import copy
 import logging
 import os
-import random
 import re
 import time
-import numpy as np
-from scipy.stats import beta
 from agent.action.action_manager import ActionManager
+from agent.plan.localization import EXPERT_RANDOM
 from agent.memory.memory_manager import MemoryManager
 from agent.plan.online_predict import RCRankPredictor
 from agent.plan.planner import Planner
@@ -59,67 +57,6 @@ class DBAgent:
             planner=self.planner,
             configs=configs,
         )
-
-        # Dynamic epsilon-greedy parameters
-        self.alpha_0 = 1.0
-        self.beta_0 = 1.0
-        self.p_crit = 0.5
-        self.epsilon_min = self.agent_config.get("epsilon", 0.1)
-        self.epsilon_max = 0.8
-        self.kappa = 0.5
-        self.N_th = 3
-        self.exploration_mode = str(self.agent_config.get("exploration_mode", "both")).lower()
-
-    def calculate_dynamic_epsilon(self, root_cause_key, state):
-        s_r = state.get("successes").get(root_cause_key, 0)  # successes
-        n_r = state.get("attempts").get(root_cause_key, 0)  # total attempts
-
-        # Calculate reliability score P_r = 1 - F_Beta(p_crit; alpha_0 + s_r, beta_0 + n_r - s_r)
-        if n_r == 0:
-            # No attempts yet, use prior
-            alpha = self.alpha_0
-            beta_param = self.beta_0
-        else:
-            alpha = self.alpha_0 + s_r
-            beta_param = self.beta_0 + n_r - s_r
-
-        P_r = 1 - beta.cdf(self.p_crit, alpha, beta_param)
-        U_r = 1 - P_r
-
-        G_nr = 1 / (1 + np.exp(-self.kappa * (n_r - self.N_th)))
-
-        epsilon_r = self.epsilon_min + (self.epsilon_max - self.epsilon_min) * G_nr * U_r
-
-        return epsilon_r
-
-    def decide_exploration_mode(self, query_info, predicted_root, state):
-        """
-        Decide between exploration and exploitation based on dynamic epsilon-greedy
-
-        Args:
-            query_info: Current query information
-            predicted_root: Predicted root cause
-            state: Current SQL state
-
-        Returns:
-            mode: 'explore' or 'exploit'
-        """
-        if self.exploration_mode in {"none", "exploit", "exploit_only"}:
-            return "exploit"
-        if self.exploration_mode in {"explore", "explore_only"}:
-            return "explore"
-
-        predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)
-
-        # Calculate dynamic epsilon for the predicted root cause
-        epsilon_r = self.calculate_dynamic_epsilon(predicted_root_key, state)
-        print(f"epsilon_r: {epsilon_r}")
-
-        # Sample p ~ U(0,1) and decide
-        p = random.random()
-        mode = "explore" if p < epsilon_r else "exploit"
-
-        return mode
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -192,8 +129,7 @@ class DBAgent:
         best_sql_times = {}
         best_sql_texts = {}
 
-        # Track simplified state for each SQL
-        # {query_id: {"root_tried": set[str], "current_root": Any, "mode": 'exploit'|'explore', "confidence": Dict[str,float], "attempts": Dict[str,int], "successes": Dict[str,int]}}
+        # Track query-local localization state and feedback.
         sql_root_cause_states = {}
 
         # Record start time
@@ -281,6 +217,8 @@ class DBAgent:
                         "attempts": {},
                         "successes": {},
                         "component_attempts": {},
+                        "component_successes": {},
+                        "component_failures": {},
                     }
 
                 state = sql_root_cause_states[query_id]
@@ -299,32 +237,22 @@ class DBAgent:
                     logger.info(f"SQL {query_id} skipping current SQL, continuing to next")
                     continue
 
-                # Check if predicted root cause is already in root_tried
                 predicted_root_key = self.memory_manager._normalize_root_causes(predicted_root)
                 if predicted_root_key in state["root_tried"]:
-                    logger.info(f"SQL {query_id} predicted root cause already in root_tried, forcing exploration mode")
-                    state["mode"] = "explore"
-                else:
-                    # Dynamic epsilon-greedy decision
-                    state["mode"] = self.decide_exploration_mode(query_info, predicted_root, state)
-                    logger.info(f"SQL {query_id} dynamic epsilon decision")
+                    logger.info(
+                        f"SQL {query_id} predicted root cause already in root_tried; resetting active localization"
+                    )
+                    self.planner.localization_selector.reset_active(state)
+                    state["current_root"] = None
+                    continue
 
-                if state["mode"] == "explore":
-                    logger.info(f"SQL {query_id} entering exploration mode (archive similar root causes)")
-                    exclude = {str(self.memory_manager._normalize_root_causes(k)) for k in state["root_tried"]}
-                    next_root = self.memory_manager.explore_root_from_archive(query_info, exclude_roots=exclude)
-                    if not next_root:
-                        all_roots = [list(r) for r in self.memory_manager.island_keys]  # List[List[str]]
-                        candidates = [r for r in all_roots if str(self.memory_manager._normalize_root_causes(r)) not in exclude]
-                        if candidates == []:
-                            logger.info(f"SQL {query_id} all root causes have been explored, ending exploration")
-                            continue
-                        else:
-                            next_root = random.choice(candidates)
-                    state["current_root"] = next_root
-                else:
-                    logger.info(f"SQL {query_id} entering exploitation mode (using predicted root cause)")
-                    state["current_root"] = predicted_root
+                state["mode"] = "explore" if state.get("localization_expert") == EXPERT_RANDOM else "exploit"
+                logger.info(
+                    "SQL %s localized by %s in %s mode",
+                    query_id,
+                    state.get("localization_expert"),
+                    state["mode"],
+                )
 
                 root_causes = state["current_root"]
                 if not root_causes:
@@ -386,8 +314,9 @@ class DBAgent:
 
                     root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
                     for rc in root_causes_list:
-                            state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
-                    
+                        state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
+                        state["component_failures"][rc] = state["component_failures"].get(rc, 0) + 1
+
                     case_id = self.memory_manager.save_case(
                         query_info,
                         fix_action,
@@ -404,13 +333,15 @@ class DBAgent:
                     # Record one invalid attempt for this root cause
                     key = self.memory_manager._normalize_root_causes(root_causes)
                     state["attempts"][key] = state["attempts"].get(key, 0) + 1
+                    self.planner.update_localization_feedback(state, success=False)
                 elif evaluation_result.get("status") == 1:
                     logger.info(f"SQL {query_id} fix successful")
                     new_time = evaluation_result.get("new_time")
 
                     root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
                     for rc in root_causes_list:
-                            state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
+                        state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
+                        state["component_successes"][rc] = state["component_successes"].get(rc, 0) + 1
 
                     case_id = self.memory_manager.save_case(
                         query_info,
@@ -430,9 +361,7 @@ class DBAgent:
                     key = self.memory_manager._normalize_root_causes(root_causes)
                     state["attempts"][key] = state["attempts"].get(key, 0) + 1
                     state["successes"][key] = state["successes"].get(key, 0) + 1
-                    # After success, clear current_root to allow small model to re-diagnose next time (refresh root cause)
-                    state["current_root"] = None
-                    # state["confidence"] = {}
+                    self.planner.update_localization_feedback(state, success=True)
                 else:
                     # Fix ineffective: record negative case and advance source (try again next round)
                     logger.info(f"SQL {query_id} fix ineffective, recording negative case")
@@ -440,8 +369,9 @@ class DBAgent:
 
                     root_causes_list = root_causes if isinstance(root_causes, list) else [root_causes]
                     for rc in root_causes_list:
-                            state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
-                    
+                        state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
+                        state["component_failures"][rc] = state["component_failures"].get(rc, 0) + 1
+
                     case_id = self.memory_manager.save_case(
                         query_info,
                         fix_action,
@@ -458,9 +388,12 @@ class DBAgent:
                     # Record one invalid attempt for this root cause
                     key = self.memory_manager._normalize_root_causes(root_causes)
                     state["attempts"][key] = state["attempts"].get(key, 0) + 1
+                    self.planner.update_localization_feedback(state, success=False)
 
                 # When invalid attempt count reaches threshold, mark root cause as tried and clear current_root
-                if state.get("attempts", {}).get(key, 0) >= no_improvement_threshold:
+                if state.get("attempts", {}).get(key, 0) >= no_improvement_threshold and not state.get(
+                    "successes", {}
+                ).get(key, 0):
                     state["root_tried"].add(key)
 
                 # Update best records only if fix is successful and better

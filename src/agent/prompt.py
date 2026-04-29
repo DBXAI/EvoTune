@@ -7,7 +7,6 @@ from agent.contracts import (
     CANONICAL_COMPONENTS,
     COMPONENT_ACTION_SPACE_NAMES,
     format_component_label,
-    normalize_component_confidence_map,
     normalize_components,
     normalize_tuning_history,
 )
@@ -302,7 +301,7 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     query_info = base_info.get("query_info")
     db_info = base_info.get("database_info", {})
     components = normalize_components(root_cause)
-    action_space = (action_space or "None")
+    action_space = action_space or "None"
 
     positives_text = fmt_cases(positives)
     negatives_text = fmt_cases(negatives)
@@ -320,7 +319,7 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     - Negative Observations capture ineffective directions and must be avoided.
     - Use them only to inspire new actions inside the allowed action space for the current components."""
 
-    return f"""You are an SQL optimization expert. The bottleneck-related tuning components have already been localized by the Detection Agent. Your job is to recommend executable tuning action(s) only within the localized tuning subspace, using the current query context, retrieved historical observations with experiences, and the refined action space.
+    return f"""You are an SQL optimization expert. The bottleneck-related tuning components have already been localized. Your job is to recommend executable tuning action(s) only within the localized tuning subspace, using the current query context, retrieved historical observations with experiences, and the refined action space.
     ## Context
     1. Query Information:
     • SQL: {query_info.query}
@@ -353,17 +352,14 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     ## Constraints
     • Tuning_Action must be executable directly in {db_info.get('db_type')}.
     • The Tuning_Action must only operate on the component(s) listed in {components}.
-    • The Tuning_Action should be safe and should not drop or delete data unless explicitly required by the predicted components.
+    • The Tuning_Action should be safe and must not drop or delete data.
     ## Output Format
     You must output ONLY in the following format:
-    Explanation:
-    <concise technical reason why the predicted components are causing the slowdown now>
     Tuning_Action:
     <your tuning action here, do not include any other text, if no tuning action is needed, output an empty string>
     Query_Rewrite:
     <yes or no>
     ## Output Requirements
-    • "Explanation" must be short, precise, and technical.
     • Tuning_Action must contain only executable tuning statements.
     • Set Query_Rewrite to yes if the selected action(s) involve query rewriting, and place the full rewritten SQL in Tuning_Action; otherwise, set Query_Rewrite to no.
     • If multiple executable statements are needed, place all of them in Tuning_Action in executable form."""
@@ -399,11 +395,9 @@ def build_rewrite_prompt(origin_sql, rewrite_sql):
     <paste only the revised SQL here, exactly as SQL, nothing else>"""
 
 
-def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence, tuning_history=None, database_info=None, timeout=300):
-    """Build prompt for LLM-based component diagnosis with per-label confidence map."""
-    
-    root_causes = normalize_components(root_causes)
-    state_confidence = normalize_component_confidence_map(state_confidence)
+def build_root_cause_diagnosis_prompt(query_info, tuning_history=None, database_info=None, timeout=300):
+    """Build prompt for the Detection Agent in tuning-space localization."""
+
     tuning_history = normalize_tuning_history(tuning_history)
     database_info = database_info or {}
 
@@ -425,7 +419,7 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
     else:
         history_text = "No previous tuning attempts recorded."
 
-    return f"""You are a database performance diagnosis expert. Your task is to localize the most promising tuning component space(s) for the following slow SQL query. Rather than diagnosing generic performance causes from scratch, you should refine the lightweight model's component scores using the current query context, trajectory-level tuning feedback, and DBA-style knowledge to identify a high-impact set of target tuning components.
+    return f"""You are a database performance diagnosis expert. Your task is to identify the most promising tuning component space(s) for the following slow SQL query. To do so, reason directly from the current query context, trajectory-level tuning feedback, and DBA-style knowledge, and determine which component space(s) are most likely to deliver substantial performance improvement.
     ## Candidate Tuning Components
     The allowed components are exactly: [index, knob, hint, query]
     ## Context
@@ -446,43 +440,26 @@ def build_root_cause_diagnosis_prompt(query_info, root_causes, state_confidence,
     • Workload Type: {database_info.get('workload_type')}
     • Database Size: {database_info.get('size')}
     • Database Schema: {database_info.get('schema') or database_info.get('dbname') or 'unknown'}
-    3. Lightweight Model Scores
-    These scores are produced by data-driven model and should be treated as the anchor for reasoning.
-    • suggested tuning spaces: {root_causes}
-    • confidence scores (0-1): {state_confidence}
     ## Reasoning Guidance
     1. Historical Tuning Summary
     {history_text}
-    2. Trajectory-Guided Confidence Refinement
-    Refine the component scores according to the following principles:
-    • If success_count > 0 and fail_count = 0: increase confidence since past interventions validate it as an actionable bottleneck.
-    • If success_count = 0 and fail_count > 0: decrease confidence and encourage exploration of alternative components, since previous interventions have not led to improvement.
-    • If success_count > 0 and fail_count > 0: retain the confidence and make conservative adjustment by jointly considering the data-driven score and knowledge-driven reasoning.
+    2. Trajectory-Guided Reasoning
+    Guide component reasoning according to the following principles:
+    • If success_count > 0 and fail_count = 0: prioritize the component since past interventions consistently validate it as a bottleneck.
+    • If success_count = 0 and fail_count > 0: deprioritize the component and encourage exploration of alternative components, since previous interventions have not led to improvement.
+    • If success_count > 0 and fail_count > 0: keep the component under consideration and make a more nuanced judgment based on DBA knowledge and the available evidence.
     3. DBA Knowledge-Guided Reasoning
-    Use DBA-style reasoning over the query context to validate or revise the component scores.
+    Use DBA-style knowledge to reason over the query context to identify target tuning components.
+    • Plan suboptimality: A plan bottleneck typically arises from suboptimal access paths, join orders, or join strategies that introduce unnecessary overhead, such as redundant sorting, full table scans, or excessive intermediate results. Typical evidence includes cases where the optimizer prefers sequential scans despite the presence of indexes under high selectivity, incurs extra sorting due to unordered access paths, or exhibits hash join spill-to-disk behavior.
     • Index bottlenecks: Index bottlenecks are characterized by large-range scans on selective predicates. Typical evidence includes a large gap between scanned and returned rows, predicates that cannot be effectively exploited by indexes, and repeated heap/table access due to non-covering indexes.
-    • Plan suboptimality: A plan bottleneck is usually reflected by expensive operator choices that force unnecessary sorting, temporary materialization, or inefficient joins. Typical evidence includes temporary-table creation and extra sorting due to unordered access paths.
     • Knob misconfiguration: Knob tuning becomes important when analytical operators spill to disk or lack sufficient memory or parallel resources. Typical evidence includes disk-backed temporary tables, underutilized parallel workers, and high-cost join or aggregation execution under limited resources.
-    • Query formulation inefficiency: Query rewriting is prioritized when the SQL structure itself introduces unnecessary work. Typical evidence includes join patterns missing valid ON conditions or using always-true predicates, deep pagination with large OFFSET, UNION without ALL, overlong IN lists, and join patterns with Cartesian-product risk.
-    4. Confidence Rules
-    • Restrict each component's confidence adjustment to [0.1, 0.3].
-    • If a tuning component shows no improvement after multiple rounds, reduce its confidence below 0.5 and increase the confidence of a new candidate component slightly above 0.5.
-    • Confidence values should reflect both historical tuning feedback and the current query context.
+    • Query formulation issues: Query rewriting is prioritized when the SQL structure itself introduces unnecessary work. Typical evidence includes implicit type conversions that block B-Tree access and trigger full scans, and overlong IN lists.
     ## Constraints (STRICT)
-    • You MUST output ALL allowed component labels with a confidence score in [0,1]: {", ".join(CANONICAL_COMPONENTS)}.
-    • You MUST also output a separate array predicted_components listing the final selected tuning components.
-    • predicted_components MUST be exactly the set of labels with confidence > 0.5. Labels with confidence <= 0.5 MUST NOT appear in predicted_components.
-    • You MUST output strict JSON only in the format below. No extra text and no explanation.
+    • You MUST select tuning components only from the following labels: {", ".join(CANONICAL_COMPONENTS)}.
+    • You MUST output strict JSON only, containing a single field predicted_components. No extra text and no explanation.
+    • predicted_components MUST be a non-empty array of the final selected tuning components.
     Output JSON Format:
-    {{
-      "predicted_components": ["index"],
-      "components": [
-        {{"label": "index", "confidence": 0.72}},
-        {{"label": "knob", "confidence": 0.18}},
-        {{"label": "hint", "confidence": 0.10}},
-        {{"label": "query", "confidence": 0.05}}
-      ]
-    }}"""
+    {{"predicted_components": ["index", "knob"]}}"""
 
 
 def build_action_space_prompt(root_causes, db, knob_config, current_knob_values, query_info=None):
@@ -497,11 +474,9 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
     if "index" in root_causes:
         current_indexes = db.get_indexes() if db else []
         action_space_prompt += f"""• Index Space: 
-    - The naming convention for newly created indexes must follow the pattern: (table_name)_(col1)_(col2)_idx.
-    - Index creation should be strictly guided by the slow_sql queries.
-    - Consider the query execution plan to identify beneficial indexes that could improve performance.
-    - Avoid generating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
-    - Do not conflict with the existing indexes in the database: {current_indexes}
+    - Use CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS, and name each newly created index using the pattern <table_name>_<col>_idx.
+    - Derive query-specific index candidates from the database schema and current execution plan; consider composite indexes when supported by the query structure and execution plan.
+    - Given the existing indexes in the DBMS ({current_indexes}), avoid creating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
     """
 
     # Knob related
@@ -552,15 +527,9 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
         rule_descriptions = matcher.get_rule_descriptions(query_info.query)
 
         action_space_prompt += f"""• Query Rewrite Space: 
-    - Query Rewrite need to generate a semantically equivalent SELECT statement that produces exactly the same result set as the original query while improving performance.
-    - **Analysis-Based Optimization**: The following rewrite rules have been identified as applicable based on the query structure analysis:
+    - Query rewriting must generate a semantically equivalent SELECT statement that preserves the original result set.
+    - Consider only the rewrite rules provided below as the initial rewrite space. Apply only rules that are applicable to the current query, and prioritize rewrites that simplify execution, eliminate redundant operations, or improve data access efficiency:
     {rule_descriptions}
-    - **Implementation Guidelines**:
-      * Apply only the rules that match the specific query structure and are expected to improve performance
-      * Ensure the rewritten query maintains identical result set and semantic equivalence
-      * Prioritize rules that reduce computational complexity, eliminate redundant operations, or optimize data access patterns
-      * Test the rewritten query to verify it produces the same results as the original
-    - **Quality Assurance**: The final output must be a complete, executable SQL statement that preserves all original query semantics while demonstrating measurable performance improvements.
     """
 
     return action_space_prompt
@@ -581,12 +550,12 @@ def get_diagnostic_agent_instructions():
     Your role is to:
     1. Understand detailed database and query execution context.
     2. Identify how the predicted components lead to performance degradation.
-    3. Output exactly three labeled sections: Explanation, Tuning_Action and Query_Rewrite.
+    3. Output exactly two labeled sections: Tuning_Action and Query_Rewrite.
     4. Always make the Tuning_Action executable directly in the target database.
     5. Never include extra text, comments, or sections beyond the required format.
     6. Always apply the given MCP APIs when producing fixes, if applicable.
     7. Assume the provided execution plan, metrics, and environment info are accurate.
-    8. Keep the Explanation concise and technical, avoiding generic descriptions."""
+    8. Do not include explanations, markdown, comments, or extra sections."""
 
 
 def get_simple_retrieval_agent_instructions():
@@ -605,7 +574,7 @@ def get_simple_retrieval_agent_instructions():
 def get_root_cause_llm_instructions():
     """Get instructions for the root cause diagnosis LLM."""
     return """You are a database slow SQL bottleneck component diagnosis expert.
-    Only output strict JSON using the fields predicted_components and components, nothing else."""
+    Only output strict JSON with a single field predicted_components, nothing else."""
 
 
 def get_summary_agent_instructions():
@@ -652,10 +621,7 @@ def build_experience_summary_prompt(root_causes, cases, previous_summary=None):
     lines = []
     for idx, case in enumerate(cases, 1):
         case_info = case.case_info
-        lines.append(
-            f"Case {idx}: "
-            f"reflection={case_info.get('reflection', 'None.')}"
-        )
+        lines.append(f"Case {idx}: " f"reflection={case_info.get('reflection', 'None.')}")
 
     cases_text = "\n".join(lines) if lines else "None."
     return f"""Summarize the following cluster of tuning cases into one reusable cluster-level experience.
@@ -670,6 +636,7 @@ def build_experience_summary_prompt(root_causes, cases, previous_summary=None):
     - You may summarize only success patterns, only failure patterns, or both, depending on what is supported by the cluster.
     - Prefer one coherent experience that explains the boundary between effective and ineffective actions under similar conditions.
     - Output only the experience summary text only."""
+
 
 def build_simple_diagnosis_prompt(query_info, base_info):
     """Build prompt for simple LLM-based diagnosis without root cause prediction."""

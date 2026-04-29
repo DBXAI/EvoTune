@@ -18,7 +18,6 @@ LEGACY_COMPONENT_LABELS = {
     "query": "query",
     "poorly written queries": "query",
     "poorly written query": "query",
-    "normal": "normal",
 }
 
 COMPONENT_ACTION_SPACE_NAMES = {
@@ -121,15 +120,23 @@ def parse_detection_output(json_text):
     predicted_raw = data.get("predicted_components")
     if predicted_raw is None:
         predicted_raw = data.get("predicted_root_causes", [])
+    predicted_components = normalize_components(predicted_raw)
 
     components_raw = data.get("components")
     if components_raw is None:
-        components_raw = data.get("root_causes", [])
+        components_raw = data.get("root_causes")
+
+    if components_raw is None:
+        if not predicted_components:
+            return None
+        confidence_map = {label: 0.0 for label in CANONICAL_COMPONENTS}
+        for label in predicted_components:
+            confidence_map[label] = 1.0
+        return predicted_components, confidence_map
 
     if not isinstance(components_raw, list):
         return None
 
-    predicted_components = normalize_components(predicted_raw)
     confidence_map = {}
 
     for item in components_raw:
@@ -151,15 +158,17 @@ def parse_detection_output(json_text):
     if set(confidence_map.keys()) != set(CANONICAL_COMPONENTS):
         return None
 
-    derived_components = [
-        label for label in CANONICAL_COMPONENTS if confidence_map[label] > 0.5
-    ]
+    derived_components = [label for label in CANONICAL_COMPONENTS if confidence_map[label] > 0.5]
+
+    if not derived_components:
+        best_label = max(CANONICAL_COMPONENTS, key=lambda label: confidence_map[label])
+        derived_components = [best_label]
+        confidence_map[best_label] = max(confidence_map[best_label], 0.51)
+        if not predicted_components:
+            predicted_components = derived_components
 
     if set(predicted_components) != set(derived_components):
         return None
-
-    if not derived_components:
-        return ["normal"], confidence_map
 
     return derived_components, confidence_map
 
