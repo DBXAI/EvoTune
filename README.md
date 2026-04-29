@@ -1,6 +1,6 @@
 # DREAM
 
-Source code for the DREAM framework, proposed in "From Anomalies to Actions: An Anomaly-Aware Approach for Multi-Component Tuning in DBMSs". Please refer to the paper for the experimental details.
+Source code for the EvoTune framework, proposed in "From Blind Search to Memory-Aware Evolution: Efficient DBMS Tuning via Collaborative Diagnosis and Utility-Aware Retrieval". Please refer to the paper for the experimental details.
 
 ## Setup and Run
 
