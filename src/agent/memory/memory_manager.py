@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import json
 import logging
@@ -5,6 +6,7 @@ import os
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -93,6 +95,16 @@ class SummaryAgent:
             instructions=get_reflection_agent_instructions(),
         )
 
+    def _run_agent_sync(self, agent, prompt):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return Runner.run_sync(starting_agent=agent, input=prompt)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(Runner.run_sync, starting_agent=agent, input=prompt)
+            return future.result()
+
     def reflect_case(self, case_info):
         prompt = build_case_reflection_prompt(case_info)
         query_info = case_info.get("query_info", {}) or {}
@@ -102,10 +114,7 @@ class SummaryAgent:
         #     prompt,
         # )
         try:
-            result = Runner.run_sync(
-                starting_agent=self.reflectionAgent,
-                input=prompt,
-            )
+            result = self._run_agent_sync(self.reflectionAgent, prompt)
             return re.sub(r"\s+", " ", str(result.final_output or "")).strip()
         except Exception as exc:
             logger.warning(
@@ -124,10 +133,7 @@ class SummaryAgent:
         #     prompt,
         # )
         try:
-            result = Runner.run_sync(
-                starting_agent=self.summaryAgent,
-                input=prompt,
-            )
+            result = self._run_agent_sync(self.summaryAgent, prompt)
             return re.sub(r"\s+", " ", str(result.final_output or "")).strip()
         except Exception as exc:
             logger.warning(

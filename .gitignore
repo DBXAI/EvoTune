@@ -29,6 +29,7 @@ config/tpch_config.json
 config/tpcds_config.json
 config/tpch_tidb_config.json
 DREAM.pdf
+_drive_assets/**
 # test_sql_gen/data/hint/**
 # test_sql_gen/data/hint_normal/**
 # test_sql_gen/data/hint+index/**

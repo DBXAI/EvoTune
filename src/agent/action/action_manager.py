@@ -307,18 +307,18 @@ class ActionManager:
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives, experiences):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives, experiences)
         query_info = base_info.get("query_info")
-        logger.info(
-            "[Prompt][Tuning][SQL %s]\n%s",
-            getattr(query_info, "query_id", "unknown"),
-            prompt,
-        )
+        # logger.info(
+        #     "[Prompt][Tuning][SQL %s]\n%s",
+        #     getattr(query_info, "query_id", "unknown"),
+        #     prompt,
+        # )
         return await Runner.run(starting_agent=self.agent, input=prompt)
 
     def extract_fix_action(self, action_result):
         """Extract fix_action and rewrite_sql from action_result"""
         explanation, fix_action, is_rewrite = self.parse_action_result(action_result)
-        print("Diagnosis output:")
-        print("Explanation:", explanation)
+        # print("Diagnosis output:")
+        # print("Explanation:", explanation)
         print("Fix action:", fix_action)
         print("Is rewrite:", is_rewrite)
         if is_rewrite == "yes":

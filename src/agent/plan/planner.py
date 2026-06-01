@@ -1,10 +1,14 @@
+import asyncio
 import os
 import sys
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Add RCRank to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 rcrank_path = os.path.join(current_dir, "RCRank")
 if rcrank_path not in sys.path:
     sys.path.append(rcrank_path)
@@ -63,6 +67,16 @@ class Planner:
 
         self.root_cause_model = self.agent_config.get("root_cause_llm_model")
 
+    def _run_agent_sync(self, agent, prompt):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return Runner.run_sync(starting_agent=agent, input=prompt)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(Runner.run_sync, starting_agent=agent, input=prompt)
+            return future.result()
+
     def encode_plan(self, query_plan):
         df = pd.DataFrame(
             [{"plan_json": (json.dumps({"Plan": query_plan}) if isinstance(query_plan, dict) else query_plan)}]
@@ -94,14 +108,12 @@ class Planner:
         return result
 
     def diagnosis_agent(self, prompt):
-        return Runner.run_sync(
-            starting_agent=Agent(
-                name="RootCauseLLM",
-                model=self.root_cause_model,
-                instructions=get_root_cause_llm_instructions(),
-            ),
-            input=prompt,
+        agent = Agent(
+            name="RootCauseLLM",
+            model=self.root_cause_model,
+            instructions=get_root_cause_llm_instructions(),
         )
+        return self._run_agent_sync(agent, prompt)
 
     def llm_predict(self, query_info, tuning_history=None):
         start_time = time.perf_counter()
@@ -116,11 +128,11 @@ class Planner:
             tuning_history=tuning_history,
             database_info=self._build_database_info(),
         )
-        logger.info(
-            "[Prompt][Detection][SQL %s]\n%s",
-            getattr(query_info, "query_id", "unknown"),
-            prompt,
-        )
+        # logger.info(
+        #     "[Prompt][Detection][SQL %s]\n%s",
+        #     getattr(query_info, "query_id", "unknown"),
+        #     prompt,
+        # )
 
         run_result = self.diagnosis_agent(prompt)
         usage_metrics = extract_run_usage_metrics(run_result, "diag_llm")
