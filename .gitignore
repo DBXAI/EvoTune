@@ -1,0 +1,61 @@
+# Ignore Python bytecode cache directories
+__pycache__/
+**/__pycache__/
+diagnostic_results/**
+# Ignore pytest cache directory
+.pytest_cache/
+src/agent/plan/model_res/**
+config/base_config.py
+config/base_config.json
+config/base_config.yaml
+config/tidb_config.json
+config/tidb_config.py
+src/agent/plan/RCRank/bert-base-uncased/**
+src/memory_results*
+test_sql_gen/data/**
+test_sql_gen/logs/**
+test_sql_gen/rubbish/**
+test_sql_gen/slow_queries/**
+logs/**
+src/agent/plan/slow_sql_data_gen.csv
+config/ablation_experiments_config.json
+src/ablation_main.py
+src/agent/ablation_db_agent.py
+ablation.md
+src/agent/memory/experience/**
+src/agent/memory/model/**
+config/job_config.json
+config/tpch_config.json
+config/tpcds_config.json
+config/tpch_tidb_config.json
+DREAM.pdf
+_drive_assets/**
+# test_sql_gen/data/hint/**
+# test_sql_gen/data/hint_normal/**
+# test_sql_gen/data/hint+index/**
+# test_sql_gen/data/hint+knob/**
+# test_sql_gen/data/hint+query/**
+# test_sql_gen/data/hint+query+index/**
+# test_sql_gen/data/index/**
+# test_sql_gen/data/index_normal/**
+# test_sql_gen/data/index+knob/**
+# test_sql_gen/data/knob/**
+
+# Local papers, experiments, test utilities, and generated run artifacts
+/EvoTune.pdf
+/EvoTune_ICDE.pdf
+/tests/
+/test_sql_gen/
+/scripts/
+/runs/
+/config/job_no_retriever_30h_v1.json
+/config/job_retriever_train_config_v1.json
+/config/job_retriever_train_config_v2.json
+/config/job_rl_30h_v1.json
+/config/job_similarity_collect_config_v1.json
+/config/job_similarity_collect_config_v2.json
+/config/job_similarity_collect_config.json
+/config/job_similarity_continue_config_v1.json
+/config/job_supervised_retriever_30h_v1.json
+/config/job_supervised_retriever_30h_v2.json
+/config/ossinsight_tidb_config.json
