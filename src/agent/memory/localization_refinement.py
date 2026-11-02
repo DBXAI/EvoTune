@@ -5,9 +5,14 @@ from typing import Iterable, Sequence
 import torch
 
 
-def build_component_labels(root_causes: Iterable[str], case_label: str, label_space: Sequence[str]):
-    """Build Eq. 5 component labels from selected components and tuning outcome."""
-    selected = set(root_causes or [])
+def build_component_labels(
+    root_causes: Iterable[str],
+    case_label: str,
+    label_space: Sequence[str],
+    modified_components: Iterable[str] = None,
+):
+    """Build AAWS labels from the components actually modified by an action."""
+    selected = set(modified_components if modified_components is not None else (root_causes or []))
     is_positive = str(case_label).lower() == "positive"
     return [1 if is_positive and component in selected else 0 for component in label_space]
 
@@ -34,7 +39,15 @@ def parse_attempt_vector(value, num_components: int):
     return [int(item) for item in parsed[:num_components]]
 
 
-def masked_bce_loss(pred_label, labels, selected_mask, tuning_attempts, eta):
+def masked_bce_loss(
+    pred_label,
+    labels,
+    selected_mask,
+    tuning_attempts,
+    eta,
+    modified_counts=None,
+    rho=0.5,
+):
     """Masked BCE for EvoTune localization refinement.
 
     Positive labels are always supervised. Negative labels are supervised only for
@@ -53,4 +66,9 @@ def masked_bce_loss(pred_label, labels, selected_mask, tuning_attempts, eta):
         return pred_label.sum() * 0.0
 
     bce_per_element = -(labels * torch.log(pred_label + 1e-12) + (1 - labels) * torch.log(1 - pred_label + 1e-12))
-    return (bce_per_element * supervision_mask.float()).sum() / supervision_mask.float().sum()
+    weights = supervision_mask.float()
+    if modified_counts is not None:
+        modified_counts = modified_counts.to(device=pred_label.device).reshape(-1, 1)
+        multi_component = (modified_counts > 1) & positive_mask
+        weights = torch.where(multi_component, weights * float(rho), weights)
+    return (bce_per_element * weights).sum() / weights.sum().clamp_min(1.0)

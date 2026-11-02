@@ -9,11 +9,15 @@ from agent.db_agent import DBAgent
 
 def setup_logging():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_dir = os.path.join(project_root, "logs")
+    log_dir = os.environ.get("DREAM_LOG_DIR", os.path.join(project_root, "logs"))
     os.makedirs(log_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"dream_diagnosis_{timestamp}.log")
+    log_file = os.environ.get(
+        "DREAM_LOG_FILE",
+        os.path.join(log_dir, f"dream_diagnosis_{timestamp}.log"),
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
 
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -31,7 +35,7 @@ def setup_logging():
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
@@ -47,6 +51,12 @@ def parse_args():
     parser.add_argument("--order", type=str, required=True, help="Slow query execution order")
     parser.add_argument("--duration", type=int, default=30, help="Optimization duration in hours")
     parser.add_argument("--config", type=str, required=True, help="Configuration file path")
+    parser.add_argument(
+        "--resume-state",
+        type=str,
+        default=None,
+        help="Optional JSON checkpoint containing best per-query state for continuation",
+    )
 
     return parser.parse_args()
 
@@ -75,6 +85,7 @@ async def main():
             order=args.order,
             duration=args.duration,
             no_improvement_threshold=configs["AGENT_CONFIG"]["no_improvement_threshold"],
+            resume_state_path=args.resume_state,
         )
 
 if __name__ == "__main__":

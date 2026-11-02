@@ -1,20 +1,27 @@
 import re
 
 from database.pg_env import PostgresDB
+from database.tidb_env import TiDB
 
 
 def base_information_collect(query_info, database_config):
-    postgres_db = PostgresDB(database_config)
-    dbname = getattr(postgres_db, "dbname", None) or database_config.get("dbname") or "unknown"
+    db_type = str(database_config.get("db_type", "postgres")).lower()
+    database = TiDB(database_config) if db_type == "tidb" else PostgresDB(database_config)
+    dbname = (
+        getattr(database, "database", None)
+        or getattr(database, "dbname", None)
+        or database_config.get("dbname")
+        or "unknown"
+    )
 
-    size = postgres_db.get_size()
+    size = database.get_db_size() if db_type == "tidb" else database.get_size()
     if isinstance(size, list) and len(size) == 1:
         size = size[0]
     size = size or "unknown"
 
     db_info = {
-        "db_type": postgres_db.db_type,
-        "workload_type": postgres_db.workload_type,
+        "db_type": getattr(database, "db_type", db_type),
+        "workload_type": database_config.get("workload_type", "OLAP"),
         "dbname": dbname,
         "size": size,
         "schema": dbname,

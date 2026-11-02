@@ -28,7 +28,6 @@ from agent.contracts import (
 from agent.plan.localization import (
     EXPERT_LIGHTWEIGHT,
     EXPERT_LLM,
-    EXPERT_RANDOM,
     LocalizationExpertSelector,
     build_tuning_history,
     random_component_subset,
@@ -107,6 +106,18 @@ class Planner:
         )
         return result
 
+    def context_embedding(self, query_info):
+        """Encode the current query state for contextual expert selection."""
+        if self.predictor is None:
+            return None
+        query, plan, timeseries, log = self._build_prediction_input(query_info)
+        return self.predictor.get_context_embedding(
+            query=query,
+            plan=plan,
+            timeseries=timeseries,
+            log=log,
+        )
+
     def diagnosis_agent(self, prompt):
         agent = Agent(
             name="RootCauseLLM",
@@ -115,7 +126,7 @@ class Planner:
         )
         return self._run_agent_sync(agent, prompt)
 
-    def llm_predict(self, query_info, tuning_history=None):
+    def llm_predict(self, query_info, tuning_history=None, consecutive_no_improvement=0):
         start_time = time.perf_counter()
         llm_usage_metrics = {
             "diag_llm_requests": 0,
@@ -127,6 +138,7 @@ class Planner:
             query_info,
             tuning_history=tuning_history,
             database_info=self._build_database_info(),
+            consecutive_no_improvement=consecutive_no_improvement,
         )
         # logger.info(
         #     "[Prompt][Detection][SQL %s]\n%s",
@@ -210,8 +222,8 @@ class Planner:
         # issue type mapping
         issue_types = {
             0: "index",
-            1: "hint",
-            2: "knob",
+            1: "knob",
+            2: "hint",
             3: "query",
         }
 
@@ -236,15 +248,13 @@ class Planner:
     def _allowed_localization_experts(self):
         model_type = str(self.agent_config.get("model_type", "hybrid")).lower()
         if model_type in {"small", "small_model", "lm"}:
-            return [EXPERT_LIGHTWEIGHT] if self.predictor is not None else [EXPERT_RANDOM]
+            return [EXPERT_LIGHTWEIGHT] if self.predictor is not None else [EXPERT_LLM]
         if model_type in {"large", "large_model", "llm"}:
             return [EXPERT_LLM]
-        if model_type in {"random", "rand"}:
-            return [EXPERT_RANDOM]
         experts = []
         if self.predictor is not None:
             experts.append(EXPERT_LIGHTWEIGHT)
-        experts.extend([EXPERT_LLM, EXPERT_RANDOM])
+        experts.append(EXPERT_LLM)
         return experts
 
     def _ensure_nonempty_components(self, root_causes, confidence=None):
@@ -257,7 +267,7 @@ class Planner:
             return [max(CANONICAL_COMPONENTS, key=lambda label: confidence.get(label, 0.0))]
         return random_component_subset()
 
-    def _predict_with_random_expert(self, state):
+    def _predict_fallback_components(self, state):
         exclude_roots = state.get("root_tried", set())
         root_causes = random_component_subset(exclude_roots=exclude_roots)
         confidence = {component: (0.6 if component in root_causes else 0.0) for component in CANONICAL_COMPONENTS}
@@ -273,7 +283,20 @@ class Planner:
             state["last_runtime_metrics"] = runtime_metrics
             return active_decision.root_causes, state
 
-        expert, samples = self.localization_selector.select_expert(state, self._allowed_localization_experts())
+        context = None
+        try:
+            context = self.context_embedding(query_info)
+        except Exception as exc:
+            logger.warning(
+                "Unable to build contextual bandit embedding for SQL %s: %s; using zero context",
+                getattr(query_info, "query_id", "unknown"),
+                exc,
+            )
+        expert, samples = self.localization_selector.select_expert(
+            state,
+            self._allowed_localization_experts(),
+            context=context,
+        )
         state.setdefault("localization", {})["last_samples"] = samples
 
         if expert == EXPERT_LIGHTWEIGHT:
@@ -282,20 +305,26 @@ class Planner:
             result = self.llm_predict(
                 query_info,
                 tuning_history=build_tuning_history(state),
+                consecutive_no_improvement=state.get("query_consecutive_no_improvement", 0),
             )
         else:
-            result = self._predict_with_random_expert(state)
+            result = self._predict_fallback_components(state)
 
         runtime_metrics = merge_runtime_metrics(runtime_metrics, result.get("runtime_metrics"))
         confidence = normalize_component_confidence_map(result.get("confidence"))
         predicted_root = self._ensure_nonempty_components(result.get("root_causes"), confidence)
         predicted_key = frozenset(predicted_root)
-        if predicted_key in state.get("root_tried", set()) and expert != EXPERT_RANDOM:
-            result = self._predict_with_random_expert(state)
+        if predicted_key in state.get("root_tried", set()):
+            result = self._predict_fallback_components(state)
             confidence = normalize_component_confidence_map(result.get("confidence"))
             predicted_root = self._ensure_nonempty_components(result.get("root_causes"), confidence)
-            expert = EXPERT_RANDOM
-        decision = self.localization_selector.start_decision(state, expert, predicted_root, confidence)
+        decision = self.localization_selector.start_decision(
+            state,
+            expert,
+            predicted_root,
+            confidence,
+            context=context,
+        )
         state["localization_expert"] = decision.expert
         state["last_runtime_metrics"] = runtime_metrics
         logger.info(
@@ -308,5 +337,10 @@ class Planner:
 
         return predicted_root, state
 
-    def update_localization_feedback(self, state, success):
-        return self.localization_selector.record_feedback(state, success)
+    def update_localization_feedback(self, state, reward=None, reliable=None, success=None):
+        return self.localization_selector.record_feedback(
+            state,
+            reward=reward,
+            reliable=reliable,
+            success=success,
+        )

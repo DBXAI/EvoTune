@@ -62,8 +62,11 @@ class ActionManager:
 
         self.fix_model = self.agent_config.get("fix_agent_model")
         self.diagnostic_model = self.agent_config.get("diagnostic_agent_model")
-        # Get sql_timeout from DATABASE_CONFIG.query_timeout, fallback to AGENT_CONFIG.sql_execution_timeout
-        database_config = configs.get("DATABASE_CONFIG", {})
+        # Get sql_timeout from the active database section (TiDB uses
+        # TiDB_CONFIG rather than PostgreSQL's DATABASE_CONFIG).
+        database_config = configs.get(
+            "DATABASE_CONFIG", configs.get("TiDB_CONFIG", {})
+        )
         self.sql_timeout = database_config.get("query_timeout")
         self.fix_timeout = self.agent_config.get("fix_timeout")
 
@@ -150,7 +153,7 @@ class ActionManager:
             return raw_positives, raw_negatives, "None."
         return raw_positives, raw_negatives, raw_experiences
 
-    async def step(self, query_info, root_cause, mode="exploit"):
+    async def step(self, query_info, root_cause, mode="exploit", tuning_state=None):
         """Analyze slow query and generate fix action workflow"""
         if not self.agent:
             await self.initialize()
@@ -164,17 +167,31 @@ class ActionManager:
         # 4. action_generate
         # 5. evaluate_action
 
-        database_config = self.configs.get("DATABASE_CONFIG")
+        database_config = self.configs.get(
+            "DATABASE_CONFIG", self.configs.get("TiDB_CONFIG", {})
+        )
         base_info = base_information_collect(query_info, database_config)
+        state_counts = dict(tuning_state or {})
 
         # Retrieve cases based on enable_retrieval flag
         retrieval_start = time.perf_counter()
         if self.enable_retrieval:
-            retrieval = self.memory_manager.retrieve_cases(query_info, root_cause, mode=mode)
+            retrieval = self.memory_manager.retrieve_cases(
+                query_info,
+                root_cause,
+                mode=mode,
+                state_counts=state_counts,
+            )
         else:
             retrieval = {"positive": [], "negative": [], "experiences": "None."}
         positives, negatives, experiences = self._build_prompt_retrieval_context(retrieval)
         retrieved_cases = retrieval.get("positive", []) + retrieval.get("negative", [])
+        # Supervised utility retrieval explicitly returns its argmax case.
+        # Preserve that choice even when the historical label is negative or
+        # the configured positive/negative quota would otherwise hide it.
+        selected_case = retrieval.get("selected_case") or (
+            retrieved_cases[0] if retrieved_cases else None
+        )
         runtime_metrics["T_retrieval_infer"] = time.perf_counter() - retrieval_start
 
         action_space_start = time.perf_counter()
@@ -220,15 +237,17 @@ class ActionManager:
 
         # Use approve_time as reward (performance improvement: old_time - new_time)
         # approve_time represents the time saved, which is the actual reward signal
-        reward = evaluation_result.get("approve_time", 0.0)
+        old_time = float(evaluation_result.get("old_time") or query_info.execution_time or 0.0)
+        new_time = float(evaluation_result.get("new_time") or old_time)
+        reward = (old_time - new_time) / max(abs(old_time), 1e-8)
         case = retrieved_cases
 
         # Save experience (independent of retrieval mode, only based on enable_save_samples)
-        if self.memory_manager.enable_save_samples and case:
+        if self.memory_manager.enable_save_samples and selected_case:
             # Generate next_query_info_id: next round, same query_id
             next_query_info_id = self.memory_manager.generate_next_query_info_id(query_info.query_id)
             
-            for case_info in case:
+            for case_info in [selected_case]:
                 # root_causes should be extracted from case_info or use the root_cause parameter
                 case_root_causes = case_info.get("root_causes", [])
                 if not case_root_causes and root_cause:
@@ -239,16 +258,26 @@ class ActionManager:
                     case_root_causes,
                     reward,
                     next_query_info_id=next_query_info_id,
-                    done=False
+                    done=False,
+                    state_counts={
+                        **state_counts,
+                        "localized_components": list(root_cause or []),
+                    },
+                    candidate_cases=retrieval.get("candidate_cases", []),
+                    selected_case_id=selected_case.get("case_id"),
+                    retrieval_policy=retrieval.get("policy", self.memory_manager.retrieval_mode),
+                    exploration=bool(retrieval.get("exploration", False)),
                 )
 
-        # Only update experience pool and network in dynamic retrieval mode
+        # Only update the retriever online in dynamic retrieval mode.  The
+        # supervised/utility ablation uses a frozen checkpoint and must remain
+        # inference-only while still recording samples for later analysis.
         retriever_update_start = time.perf_counter()
-        if self.memory_manager.retrieval_mode == "dynamic" and case:
+        if self.memory_manager.retrieval_mode == "dynamic" and selected_case:
             # Generate next_query_info_id: next round, same query_id
             next_query_info_id = self.memory_manager.generate_next_query_info_id(query_info.query_id)
             
-            for case_info in case:
+            for case_info in [selected_case]:
                 case_root_causes = case_info.get("root_causes", [])
                 if not case_root_causes and root_cause:
                     case_root_causes = root_cause if isinstance(root_cause, list) else [root_cause]
@@ -258,7 +287,11 @@ class ActionManager:
                     case_root_causes,
                     reward,
                     next_query_info_id=next_query_info_id,
-                    done=False
+                    done=False,
+                    state_counts={
+                        **state_counts,
+                        "localized_components": list(root_cause or []),
+                    },
                 )
             self.memory_manager.retriever.update_network()
         runtime_metrics["T_retriever_update"] = time.perf_counter() - retriever_update_start
@@ -280,6 +313,13 @@ class ActionManager:
         return evaluation_result
 
     def rollback_action(self, index_names, knob_names):
+        if hasattr(self.db, "rollback_tuning"):
+            try:
+                self.db.rollback_tuning(index_names, knob_names)
+                return
+            except Exception as e:
+                logger.warning("TiDB rollback failed, continuing safely: %s", e)
+
         # undo all index settings
         for index_name in index_names:
             try:

@@ -145,45 +145,55 @@ class RCRankPredictor:
         self.timeseries_train_std = timeseries.std(dim=[0, 2])
         print("Statistics computation completed")
 
+    def _prepare_inputs(self, query, plan, timeseries, log):
+        sql = self.tokenizer(
+            query,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
+
+        plan = {
+            "x": plan["x"].to(self.device).to(torch.float32),
+            "attn_bias": plan["attn_bias"].to(self.device),
+            "rel_pos": plan["rel_pos"].to(self.device),
+            "heights": plan["heights"].to(self.device),
+        }
+
+        timeseries = torch.tensor(timeseries)
+        if len(timeseries.shape) == 2:
+            timeseries = timeseries.unsqueeze(0)
+        timeseries = (timeseries - self.timeseries_train_mean.unsqueeze(1)) / (
+            self.timeseries_train_std.unsqueeze(1) + 1e-6
+        )
+        timeseries = timeseries.to(self.device)
+
+        log = torch.tensor(log)
+        if len(log.shape) == 1:
+            log = log.unsqueeze(0)
+        log = (log - self.logs_train_mean) / (self.logs_train_std + 1e-6)
+        log = log.to(self.device)
+        return sql, plan, timeseries, log
+
     def predict(self, query, plan, timeseries, log):
         self.model.eval()
 
         with torch.no_grad():
-            sql = self.tokenizer(
-                query,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            ).to(self.device)
-
-            plan = {
-                "x": plan["x"].to(self.device).to(torch.float32),
-                "attn_bias": plan["attn_bias"].to(self.device),
-                "rel_pos": plan["rel_pos"].to(self.device),
-                "heights": plan["heights"].to(self.device),
-            }
-
-            timeseries = torch.tensor(timeseries)
-            if len(timeseries.shape) == 2:
-                timeseries = timeseries.unsqueeze(0)  # add batch dimension
-            # standardize
-            timeseries = (timeseries - self.timeseries_train_mean.unsqueeze(1)) / (
-                self.timeseries_train_std.unsqueeze(1) + 1e-6
-            )
-            timeseries = timeseries.to(self.device)
-
-            log = torch.tensor(log)
-            if len(log.shape) == 1:
-                log = log.unsqueeze(0)  # add batch dimension
-            # standardize
-            log = (log - self.logs_train_mean) / (self.logs_train_std + 1e-6)
-            log = log.to(self.device)
+            sql, plan, timeseries, log = self._prepare_inputs(query, plan, timeseries, log)
 
             pred_label_opt, _ = self.model(sql, plan, timeseries, log)
             pred_label = torch.where(pred_label_opt > self.opt_threshold, 1, 0)
 
             return pred_label_opt, pred_label
+
+    def get_context_embedding(self, query, plan, timeseries, log):
+        """Return the multimodal context vector used by the bandit and retriever."""
+        self.model.eval()
+        with torch.no_grad():
+            sql, plan, timeseries, log = self._prepare_inputs(query, plan, timeseries, log)
+            embedding = self.model.get_embedding(sql, plan, timeseries, log)
+        return embedding.squeeze(0).detach().cpu().numpy()
 
 
 def load_sample_data(data_path):

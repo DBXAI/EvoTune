@@ -35,7 +35,11 @@ class SimpleDBAgent:
             db_config = configs.get("DATABASE_CONFIG")
             self.db = PostgresDB(db_config)
         elif db_type.lower() == "tidb":
-            db_config = configs.get("TiDB_CONFIG")
+            # Keep SimpleDBAgent's TiDB sessions on the same configured
+            # baseline as DBAgent.  In particular, do not inherit mutable
+            # TiDB global knob values left by an earlier experiment.
+            db_config = dict(configs.get("TiDB_CONFIG") or {})
+            db_config["KNOB_CONFIG"] = configs.get("KNOB_CONFIG", {})
             self.db = TiDB(db_config)
         else:
             raise ValueError(f"Unsupported database type: {db_type}")
@@ -50,8 +54,20 @@ class SimpleDBAgent:
         self.api_settings = self.configs.get("API_SETTINGS")
         self.enable_action_define = self.agent_config.get("enable_action_define", True)
         self.enable_action_pruning = self.agent_config.get("enable_action_pruning", True)
-        self.simple_case_pos_n = self.agent_config.get("simple_case_pos_n", 2)
-        self.simple_case_neg_n = self.agent_config.get("simple_case_neg_n", 2)
+        # This experiment deliberately gives the direct LLM one historical
+        # case in total.  Prefer a positive case and never add a negative
+        # case when the configured values exceed that budget.
+        requested_pos = max(0, int(self.agent_config.get("simple_case_pos_n", 1)))
+        requested_neg = max(0, int(self.agent_config.get("simple_case_neg_n", 0)))
+        if requested_pos + requested_neg > 1:
+            requested_pos, requested_neg = 1, 0
+        self.simple_case_pos_n = requested_pos
+        self.simple_case_neg_n = requested_neg
+        logger.info(
+            "Simple static retrieval case budget: positive=%d negative=%d",
+            self.simple_case_pos_n,
+            self.simple_case_neg_n,
+        )
 
         if self.api_settings:
             configure_openai_agents(self.api_settings)

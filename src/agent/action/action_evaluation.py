@@ -171,6 +171,13 @@ def _inject_hint_into_sql(hint, sql):
 
 
 async def check_sql_rewrite(origin_sql, rewrite_sql, *, db, fix_agent):
+    # TiDB OSSInsight runs intentionally skip SQLSolver/QED: the solver is
+    # PostgreSQL-specific and dominates the tuning budget.  The rewritten
+    # statement is instead checked by TiDB execution with MAX_EXECUTION_TIME
+    # in evaluate_action; a failing/slow candidate is rejected there.
+    if getattr(db, "skip_equivalence_validation", False):
+        return rewrite_sql
+
     print("start QED check")
     qed_match = db.check_sql_equivalence(origin_sql, rewrite_sql)
     print(f"QED equivalence check: {qed_match}")

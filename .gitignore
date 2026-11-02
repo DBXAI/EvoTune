@@ -40,3 +40,22 @@ _drive_assets/**
 # test_sql_gen/data/index_normal/**
 # test_sql_gen/data/index+knob/**
 # test_sql_gen/data/knob/**
+
+# Local papers, experiments, test utilities, and generated run artifacts
+/EvoTune.pdf
+/EvoTune_ICDE.pdf
+/tests/
+/test_sql_gen/
+/scripts/
+/runs/
+/config/job_no_retriever_30h_v1.json
+/config/job_retriever_train_config_v1.json
+/config/job_retriever_train_config_v2.json
+/config/job_rl_30h_v1.json
+/config/job_similarity_collect_config_v1.json
+/config/job_similarity_collect_config_v2.json
+/config/job_similarity_collect_config.json
+/config/job_similarity_continue_config_v1.json
+/config/job_supervised_retriever_30h_v1.json
+/config/job_supervised_retriever_30h_v2.json
+/config/ossinsight_tidb_config.json

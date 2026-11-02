@@ -15,7 +15,7 @@ from datetime import datetime
 
 def setup_logging():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_dir = os.path.join(project_root, "logs")
+    log_dir = os.environ.get("DREAM_LOG_DIR", os.path.join(project_root, "logs"))
     os.makedirs(log_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument(
         "--workload",
         type=str,
-        help="Workload name: TPCH, JOB, or TPCDS",
+        help="Workload name: TPCH, JOB, TPCDS, or OSSInsight",
     )
     parser.add_argument(
         "--booster",
@@ -133,7 +133,7 @@ async def main():
 
     specified_workload = normalize_workload_name(args.workload)
     if args.workload and not specified_workload:
-        logger.error("Unsupported workload %s. Use TPCH, JOB, or TPCDS.", args.workload)
+        logger.error("Unsupported workload %s. Use TPCH, JOB, TPCDS, or OSSInsight.", args.workload)
         return
 
     workload_name = specified_workload or detect_workload_name(args.data_path, args.config)
@@ -141,6 +141,10 @@ async def main():
         logger.info("Resolved workload: %s", workload_name)
     else:
         logger.warning("Could not infer workload type from arguments/data path/config")
+
+    if args.booster and workload_name == "OSSINSIGHT":
+        logger.warning("The hardcoded booster has no OSSInsight targets; continuing with booster disabled")
+        args.booster = False
 
     if args.booster:
         workload_best_times = get_workload_best_sql_times(workload_name, booster=True)

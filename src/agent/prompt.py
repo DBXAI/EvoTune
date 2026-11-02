@@ -258,6 +258,8 @@ best_sql_times = {
 
 def normalize_workload_name(value):
     normalized = str(value or "").strip().upper()
+    if "OSSINSIGHT" in normalized:
+        return "OSSINSIGHT"
     if normalized in {"TPC-DS", "TPCDS"}:
         return "TPCDS"
     if normalized in {"TPC-H", "TPCH"}:
@@ -395,7 +397,13 @@ def build_rewrite_prompt(origin_sql, rewrite_sql):
     <paste only the revised SQL here, exactly as SQL, nothing else>"""
 
 
-def build_root_cause_diagnosis_prompt(query_info, tuning_history=None, database_info=None, timeout=300):
+def build_root_cause_diagnosis_prompt(
+    query_info,
+    tuning_history=None,
+    database_info=None,
+    timeout=300,
+    consecutive_no_improvement=0,
+):
     """Build prompt for the Detection Agent in tuning-space localization."""
 
     tuning_history = normalize_tuning_history(tuning_history)
@@ -418,6 +426,44 @@ def build_root_cause_diagnosis_prompt(query_info, tuning_history=None, database_
         history_text = "{" + history_text + "}"
     else:
         history_text = "No previous tuning attempts recorded."
+
+    # Make stagnation explicit to the LLM.  The contextual selector still
+    # chooses which localization expert to call, but once the trajectory has
+    # accumulated repeated failures the LLM must deliberately explore a less
+    # tried component instead of repeating the same diagnosis.
+    total_successes = sum(int(item.get("success_count", 0)) for item in tuning_history)
+    total_failures = sum(int(item.get("fail_count", 0)) for item in tuning_history)
+    max_component_failures = max(
+        (int(item.get("fail_count", 0)) for item in tuning_history),
+        default=0,
+    )
+    total_attempts = total_successes + total_failures
+    trajectory_stalled = (
+        (total_attempts >= 3 and total_successes == 0)
+        or max_component_failures >= 3
+        or (total_attempts >= 6 and total_successes / max(total_attempts, 1) < 0.2)
+        or int(consecutive_no_improvement) >= 3
+    )
+    if trajectory_stalled:
+        stagnation_guidance = f"""
+    • Trajectory status: STALLED (repeated previous attempts have not produced
+      reliable improvement; the current query has {consecutive_no_improvement}
+      consecutive non-improving attempts). Perform a randomized exploration
+      step now: choose
+      at least one low-attempt or previously untried component from [index,
+      knob, hint, query], and consider a new component combination. Do not
+      simply repeat the component or component combination with the highest
+      failure count. Use the plan and runtime evidence to reject implausible
+      choices, but keep the selection exploratory. This exploration applies to
+      root-cause localization only; the output must still follow the strict
+      JSON schema below.
+        """
+    else:
+        stagnation_guidance = """
+    • Trajectory status: no persistent stagnation detected. Use the historical
+      feedback together with the plan and runtime evidence; retain some
+      exploration of components with little or no prior feedback.
+        """
 
     return f"""You are a database performance diagnosis expert. Your task is to identify the most promising tuning component space(s) for the following slow SQL query. To do so, reason directly from the current query context, trajectory-level tuning feedback, and DBA-style knowledge, and determine which component space(s) are most likely to deliver substantial performance improvement.
     ## Candidate Tuning Components
@@ -448,7 +494,9 @@ def build_root_cause_diagnosis_prompt(query_info, tuning_history=None, database_
     • If success_count > 0 and fail_count = 0: prioritize the component since past interventions consistently validate it as a bottleneck.
     • If success_count = 0 and fail_count > 0: deprioritize the component and encourage exploration of alternative components, since previous interventions have not led to improvement.
     • If success_count > 0 and fail_count > 0: keep the component under consideration and make a more nuanced judgment based on DBA knowledge and the available evidence.
-    3. DBA Knowledge-Guided Reasoning
+    3. Stagnation-Aware Exploration
+    {stagnation_guidance}
+    4. DBA Knowledge-Guided Reasoning
     Use DBA-style knowledge to reason over the query context to identify target tuning components.
     • Plan suboptimality: A plan bottleneck typically arises from suboptimal access paths, join orders, or join strategies that introduce unnecessary overhead, such as redundant sorting, full table scans, or excessive intermediate results. Typical evidence includes cases where the optimizer prefers sequential scans despite the presence of indexes under high selectivity, incurs extra sorting due to unordered access paths, or exhibits hash join spill-to-disk behavior.
     • Index bottlenecks: Index bottlenecks are characterized by large-range scans on selective predicates. Typical evidence includes a large gap between scanned and returned rows, predicates that cannot be effectively exploited by indexes, and repeated heap/table access due to non-covering indexes.
@@ -469,12 +517,19 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
 
     # Build action space prompt based on root causes
     action_space_prompt = ""
+    is_tidb = str(getattr(db, "db_type", "")).lower() == "tidb"
 
     # Index related
     if "index" in root_causes:
         current_indexes = db.get_indexes() if db else []
+        index_syntax = (
+            "Use TiDB/MySQL syntax CREATE INDEX IF NOT EXISTS <name> ON <table> (<columns>) "
+            "or DROP INDEX <name> ON <table>."
+            if is_tidb else
+            "Use CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS."
+        )
         action_space_prompt += f"""• Index Space: 
-    - Use CREATE INDEX IF NOT EXISTS or DROP INDEX IF EXISTS, and name each newly created index using the pattern <table_name>_<col>_idx.
+    - {index_syntax} Name each newly created index using the pattern <table_name>_<col>_idx.
     - Derive query-specific index candidates from the database schema and current execution plan; consider composite indexes when supported by the query structure and execution plan.
     - Given the existing indexes in the DBMS ({current_indexes}), avoid creating duplicate or subsumed indexes, and do not drop primary keys, unique indexes, or any indexes that enforce constraints.
     """
@@ -493,8 +548,13 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
                 f"current: {current_val}"
             )
 
+        knob_statement = (
+            'Use SET SESSION <knob> = <value>; for query-local TiDB changes; do not use SET GLOBAL.'
+            if is_tidb else
+            'You MUST adjust database configuration parameters using SET knob = value.'
+        )
         action_space_prompt += f"""• Knob Space:  
-    - You MUST adjust database configuration parameters using "SET knob = value" and focus on parameters that can improve query performance.
+    - {knob_statement}
     - Knob Space is strictly limited to the following knobs, you must only use these knobs in your Tuning_Action, and any knob not explicitly listed here must not be used: 
     {knob_lines}
     - For each relevant knob, consider its allowed value range, default setting, and current configuration when making recommendations.
@@ -514,10 +574,18 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
                 f"current: {current_val}"
             )
 
+        hint_statement = (
+            "Use only TiDB optimizer hints such as /*+ HASH_JOIN(t1,t2) */, "
+            "/*+ INL_JOIN(t1,t2) */, /*+ MERGE_JOIN(t1,t2) */, "
+            "/*+ READ_FROM_STORAGE(TIKV[t]) */, or /*+ MAX_EXECUTION_TIME(N) */."
+            if is_tidb else
+            "Use PostgreSQL hints to guide query execution."
+        )
         action_space_prompt += f"""• Hint Space: 
+    - {hint_statement}
     - Hint Space is strictly limited to the following knobs, you must only use these knobs in your Tuning_Action, and any knob not explicitly listed here must not be used: 
     {knob_lines}
-    - **IMPORTANT**: When using Hint Space, output ONLY the hint block. Do NOT include the original SQL. Example: /*+ Set(enable_hashjoin on) Set(enable_sort on) */"""
+    - **IMPORTANT**: When using Hint Space, output ONLY the hint block. Do NOT include the original SQL."""
 
     # SQL readability/rewrite related
     if "query" in root_causes:

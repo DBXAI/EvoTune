@@ -39,7 +39,10 @@ def load_samples(samples_path):
                 continue
             try:
                 sample = json.loads(line)
-                if sample.get("next_query_info") is None or sample.get("next_root_causes") is None:
+                if (
+                    sample.get("next_query_info") is None
+                    and not sample.get("next_query_info_id")
+                ):
                     sample["done"] = True
                 samples.append(sample)
             except json.JSONDecodeError as e:
@@ -127,9 +130,15 @@ def train_retriever_from_samples(
                 next_query_info = sample.get("next_query_info")  # For backward compatibility
                 next_root_causes = sample.get("next_root_causes", [])  # For backward compatibility
                 done = sample.get("done", False)
+                state_counts = sample.get("state", {}) or {}
 
                 # Compute features for (s_t, o_t, B_t)
-                features = retriever._compute_features(query_info, case_info, root_causes)
+                features = retriever._compute_features(
+                    query_info,
+                    case_info,
+                    root_causes,
+                    state_counts=state_counts,
+                )
                 features_list.append(features)
                 
                 # Compute TD target: y_t = r_t + γ * α * log(Σ_{o' in M_{t+1}} exp(Q_θ(s_{t+1}, M_{t+1}, o')/α))
