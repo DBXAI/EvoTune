@@ -11,7 +11,7 @@ def build_component_labels(
     label_space: Sequence[str],
     modified_components: Iterable[str] = None,
 ):
-    """Build AAWS labels from the components actually modified by an action."""
+    """Build RAWS labels from the components actually modified by an action."""
     selected = set(modified_components if modified_components is not None else (root_causes or []))
     is_positive = str(case_label).lower() == "positive"
     return [1 if is_positive and component in selected else 0 for component in label_space]
@@ -39,6 +39,34 @@ def parse_attempt_vector(value, num_components: int):
     return [int(item) for item in parsed[:num_components]]
 
 
+def raws_supervision_weights(
+    labels,
+    selected_mask,
+    tuning_attempts,
+    eta,
+    modified_counts=None,
+    rho=0.8,
+):
+    """Return the RAWS weights from Eq. 9 for each component label."""
+    selected_mask = selected_mask.to(device=labels.device, dtype=torch.bool)
+    tuning_attempts = tuning_attempts.to(device=labels.device)
+
+    positive_mask = (labels > 0.5) & selected_mask
+    if modified_counts is None:
+        modified_counts = selected_mask.sum(dim=1, keepdim=True)
+    else:
+        modified_counts = modified_counts.to(device=labels.device).reshape(-1, 1)
+    # A failed multi-component action cannot identify which component failed.
+    verified_negative_mask = (
+        (labels <= 0.5) & selected_mask & (modified_counts == 1)
+        & (tuning_attempts >= eta)
+    )
+    weights = (positive_mask | verified_negative_mask).float()
+    multi_component = (modified_counts > 1) & positive_mask
+    weights = torch.where(multi_component, weights * float(rho), weights)
+    return weights
+
+
 def masked_bce_loss(
     pred_label,
     labels,
@@ -46,29 +74,16 @@ def masked_bce_loss(
     tuning_attempts,
     eta,
     modified_counts=None,
-    rho=0.5,
+    rho=0.8,
 ):
-    """Masked BCE for EvoTune localization refinement.
-
-    Positive labels are always supervised. Negative labels are supervised only for
-    selected components after sufficient exploration. Unselected components are
-    treated as unlabeled and never force-trained as negatives.
-    """
-    selected_mask = selected_mask.to(device=pred_label.device, dtype=torch.bool)
-    tuning_attempts = tuning_attempts.to(device=pred_label.device)
+    """Weighted BCE over reliable RAWS labels; unlabeled components get zero weight."""
     labels = labels.to(device=pred_label.device, dtype=pred_label.dtype)
-
-    positive_mask = labels > 0.5
-    verified_negative_mask = (labels <= 0.5) & selected_mask & (tuning_attempts >= eta)
-    supervision_mask = positive_mask | verified_negative_mask
-
-    if not supervision_mask.any():
+    weights = raws_supervision_weights(
+        labels, selected_mask, tuning_attempts, eta,
+        modified_counts=modified_counts, rho=rho,
+    )
+    if not weights.any():
         return pred_label.sum() * 0.0
 
     bce_per_element = -(labels * torch.log(pred_label + 1e-12) + (1 - labels) * torch.log(1 - pred_label + 1e-12))
-    weights = supervision_mask.float()
-    if modified_counts is not None:
-        modified_counts = modified_counts.to(device=pred_label.device).reshape(-1, 1)
-        multi_component = (modified_counts > 1) & positive_mask
-        weights = torch.where(multi_component, weights * float(rho), weights)
     return (bce_per_element * weights).sum() / weights.sum().clamp_min(1.0)

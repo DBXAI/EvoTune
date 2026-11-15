@@ -1,8 +1,10 @@
 import os
 import random
 import hashlib
+import json
+import copy
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict
 
 import torch
@@ -19,9 +21,12 @@ class Experience:
     case_info: Dict[str, Any]
     reward: float
     next_query_info_id: str  # Format: "round-query_id", e.g., "2-01" for round 2, query 01
+    query_id: str = ""
+    query_info_id: str = ""  # Current round and Query ID, e.g., "1-01"
     done: bool = False
     success_count: int = 0
     failure_count: int = 0
+    history_case_ids: list = field(default_factory=list)
 
 
 class SoftQRetriever:
@@ -30,9 +35,10 @@ class SoftQRetriever:
     def __init__(self, memory_manager=None):
         self.device = "cpu"
 
-        # query(32) + observation(32+64) + localized components(4) +
-        # candidate improvement(1) + current success/failure counts(2).
-        self.embedding_dim = 135
+        # [query(32), localized components(4), success/failure(2),
+        # history(101), case query/action(96), case components(4), reward(1)]
+        # matches the state and demonstration encoding in Section V-B.
+        self.embedding_dim = 240
         self.hidden_dim = 512
         self.output_dim = 1
         self.temperature = 1.0
@@ -40,6 +46,9 @@ class SoftQRetriever:
         # Soft Q-learning parameters
         self.gamma = 0.99  # Discount factor γ
         self.alpha = 1.0  # Temperature parameter α for entropy regularization
+        self.prior_beta = float(
+            getattr(memory_manager, "retrieval_prior_beta", 0.8)
+        )
 
         # Experience pool parameters
         self.batch_size = 64
@@ -75,13 +84,14 @@ class SoftQRetriever:
         # for the same query.
         self._query_embedding_cache = {}
         self._case_embedding_cache = {}
+        self._history_embedding_cache = {}
 
     def _init_networks(self):
         # Main network: two-layer MLP (outputs Q-value, not probability)
         # According to paper: Q^π(s_t, M_t, o_t) is a Q-value, not a probability
         # The softmax over Q-values is applied in select_cases, not in the network
         self.network = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.hidden_dim),  # query_emb(32) + case_emb(64+32) + root_causes(4) + approve_time(1) = 133
+            nn.Linear(self.embedding_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
@@ -93,7 +103,7 @@ class SoftQRetriever:
 
         # Target network (for stable training)
         self.target_network = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.hidden_dim),  # 133-dimensional input
+            nn.Linear(self.embedding_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
@@ -104,6 +114,7 @@ class SoftQRetriever:
         ).to(self.device)
 
         self.target_network.load_state_dict(self.network.state_dict())
+        self.target_network.eval()
 
     def _build_query_embedding(self, query_info) -> torch.Tensor:
         from utils.types import QueryInfo
@@ -116,8 +127,7 @@ class SoftQRetriever:
         query_obj = QueryInfo(**query_info)
         embedding_list = self.memory_manager.build_sql_embedding(query_obj)
 
-        embedding = torch.tensor(embedding_list, dtype=torch.float32)
-        embedding = embedding.to(self.device)
+        embedding = self._fixed_embedding(embedding_list, 32, "query")
         self._query_embedding_cache[cache_key] = embedding.detach().clone()
         return embedding
 
@@ -129,32 +139,48 @@ class SoftQRetriever:
         if cached is not None:
             return cached.clone()
 
-        case_query_info = case_info.get("query_info")
-        case_query_obj = QueryInfo(**case_query_info)
-        query_embedding = self.memory_manager.build_sql_embedding(case_query_obj)
+        memory_case = getattr(self.memory_manager, "cases", {}).get(case_info.get("case_id"))
+        if (memory_case is not None
+                and memory_case.sql_embedding is not None and len(memory_case.sql_embedding)
+                and memory_case.action_embedding is not None and len(memory_case.action_embedding)):
+            query_embedding = memory_case.sql_embedding
+            action_embedding = memory_case.action_embedding
+        else:
+            case_query_info = case_info.get("query_info")
+            case_query_obj = QueryInfo(**case_query_info)
+            query_embedding = self.memory_manager.build_sql_embedding(case_query_obj)
+            fix_action = case_info.get("fix_action", "")
+            action_embedding = self.memory_manager.build_action_embedding(fix_action)
 
-        fix_action = case_info.get("fix_action", "")
-        action_embedding = self.memory_manager.build_action_embedding(fix_action)
-
-        combined_embedding = query_embedding + action_embedding
-
-        embedding = torch.tensor(combined_embedding, dtype=torch.float32)
-        embedding = embedding.to(self.device)
+        query_features = self._fixed_embedding(query_embedding, 32, "case query")
+        action_features = self._fixed_embedding(action_embedding, 64, "case action")
+        embedding = torch.cat((query_features, action_features))
         self._case_embedding_cache[cache_key] = embedding.detach().clone()
         return embedding
+
+    def _fixed_embedding(self, values, width, name):
+        """Keep the retriever input width stable when a plan cannot be encoded."""
+        vector = torch.as_tensor(values, dtype=torch.float32, device=self.device).flatten()
+        vector = torch.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0)
+        if vector.numel() == 0:
+            # RCRank skips plans with more filter predicates than its encoder
+            # supports.  Retain the action and state features for this case.
+            return torch.zeros(width, dtype=torch.float32, device=self.device)
+        if vector.numel() < width:
+            return F.pad(vector, (0, width - vector.numel()))
+        return vector[:width]
 
     @staticmethod
     def _embedding_cache_key(info):
         """Return a stable key for query/case embedding memoization."""
         if not isinstance(info, dict):
             return str(info)
-        explicit_id = info.get("case_id") or info.get("query_id")
-        if explicit_id:
-            return str(explicit_id)
-        query_info = info.get("query_info") if isinstance(info.get("query_info"), dict) else info
-        query = str(query_info.get("query", ""))
-        action = str(info.get("fix_action", ""))
-        return hashlib.sha1(f"{query}\0{action}".encode("utf-8")).hexdigest()
+        if info.get("case_id"):
+            return f"case:{info['case_id']}"
+        # Query IDs persist across successful actions, while plans and metrics
+        # change. Cache by the complete execution state Q_t.
+        payload = json.dumps(info, sort_keys=True, default=str)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     def _encode_root_causes(self, root_causes) -> torch.Tensor:
         root_cause_types = list(CANONICAL_COMPONENTS)
@@ -173,8 +199,6 @@ class SoftQRetriever:
 
         root_cause_vector = self._encode_root_causes(root_causes)
 
-        approve_time = case_info.get("approve_time", 0.0)
-        approve_time_tensor = torch.tensor([approve_time], dtype=torch.float32).to(self.device)
         state_counts = state_counts or {}
         counts_tensor = torch.tensor(
             [
@@ -185,11 +209,43 @@ class SoftQRetriever:
             device=self.device,
         )
 
-        features = torch.cat(
-            [query_embedding, case_embedding, root_cause_vector, approve_time_tensor, counts_tensor]
+        relative_reward = self._case_relative_reward(case_info)
+        case_components = self._encode_root_causes(
+            case_info.get("localized_components", case_info.get("root_causes", []))
         )
+        history_embedding = self._build_history_embedding(state_counts.get("history_case_ids", []))
+        features = torch.cat([
+            query_embedding, root_cause_vector, counts_tensor, history_embedding,
+            case_embedding, case_components,
+            torch.tensor([relative_reward], dtype=torch.float32, device=self.device),
+        ])
 
         return features
+
+    def _build_history_embedding(self, case_ids):
+        """Mean-pool prior observation embeddings for this query's history."""
+        case_ids = tuple(case_ids or ())
+        cached = self._history_embedding_cache.get(case_ids)
+        if cached is not None:
+            return cached.clone()
+        embeddings = []
+        for case_id in case_ids:
+            case = getattr(self.memory_manager, "cases", {}).get(case_id)
+            if case is None:
+                continue
+            info = dict(case.case_info, case_id=case.id)
+            base = self._build_case_embedding(info)
+            components = self._encode_root_causes(
+                info.get("localized_components", info.get("root_causes", []))
+            )
+            reward = self._case_relative_reward(info)
+            embeddings.append(torch.cat([
+                base, components,
+                torch.tensor([reward], dtype=torch.float32, device=self.device),
+            ]))
+        pooled = torch.stack(embeddings).mean(dim=0) if embeddings else torch.zeros(101, device=self.device)
+        self._history_embedding_cache[case_ids] = pooled.detach().clone()
+        return pooled
 
     def predict_case_value(self, query_info, case_info, root_causes, state_counts=None):
         """
@@ -198,6 +254,8 @@ class SoftQRetriever:
         Returns:
             Q-value (raw output from network, can be any real number)
         """
+        was_training = self.network.training
+        self.network.eval()
         with torch.no_grad():
             features = self._compute_features(query_info, case_info, root_causes, state_counts)
             features = features.unsqueeze(0)
@@ -205,15 +263,31 @@ class SoftQRetriever:
             q_value = self.network(features)
             value = q_value.item()
 
-            return value
+        self.network.train(was_training)
+        return value
+
+    def predict_case_values(self, query_info, candidate_cases, root_causes, state_counts=None, batch_size=256):
+        """Score all candidates with batched Q-network forwards, preserving input order."""
+        if not candidate_cases:
+            return []
+        batch_size = max(1, int(batch_size))
+        was_training = self.network.training
+        self.network.eval()
+        try:
+            values = []
+            with torch.no_grad():
+                for start in range(0, len(candidate_cases), batch_size):
+                    features = torch.stack([
+                        self._compute_features(query_info, case_info, root_causes, state_counts)
+                        for case_info in candidate_cases[start:start + batch_size]
+                    ])
+                    values.extend(self.network(features).reshape(-1).tolist())
+            return values
+        finally:
+            self.network.train(was_training)
 
     def select_cases(self, query_info, candidate_cases, root_causes, top_k=4, state_counts=None):
-        """
-        Select k cases using softmax over Q-values according to paper:
-        μ*(o | s, M) = exp(Q*(s, M, o)/α) / Σ_{o' in M} exp(Q*(s, M, o')/α)
-        
-        Then sample k cases based on softmax probabilities (weighted sampling).
-        """
+        """Sample from the diagnosis-prior-guided Boltzmann policy (Eq. 15)."""
         if not candidate_cases:
             return []
 
@@ -221,26 +295,15 @@ class SoftQRetriever:
         if self.alpha <= 0:
             raise ValueError(f"alpha must be positive, got {self.alpha}")
 
-        # Calculate Q-value for each case
-        case_q_values = []
-        for case_info in candidate_cases:
-            q_value = self.predict_case_value(query_info, case_info, root_causes, state_counts)
-            case_q_values.append((case_info, q_value))
+        # Score the same full memory as before, but avoid one network call per case.
+        cases_list = candidate_cases
+        q_values_tensor = torch.tensor(
+            self.predict_case_values(query_info, cases_list, root_causes, state_counts),
+            dtype=torch.float32, device=self.device,
+        )
 
-        # Convert to tensors for softmax computation
-        cases_list = [case_info for case_info, _ in case_q_values]
-        q_values_list = [q_val for _, q_val in case_q_values]
-        q_values_tensor = torch.tensor(q_values_list, dtype=torch.float32, device=self.device)
-
-        # Apply softmax over Q-values with temperature α
-        # μ*(o | s, M) = exp(Q*(s, M, o)/α) / Σ_{o' in M} exp(Q*(s, M, o')/α)
-        # Use log-sum-exp trick for numerical stability
-        q_values_scaled = q_values_tensor / self.alpha
-        q_max = torch.max(q_values_scaled)
-        # Compute log-sum-exp: log(Σ exp(Q/α)) = max + log(Σ exp(Q/α - max))
-        log_sum_exp = q_max + torch.log(torch.sum(torch.exp(q_values_scaled - q_max)) + 1e-12)
-        # Compute softmax probabilities: exp(Q/α) / Σ exp(Q/α)
-        softmax_probs = torch.exp(q_values_scaled - log_sum_exp)
+        log_prior = self._diagnosis_log_prior(root_causes, cases_list)
+        softmax_probs = torch.softmax(log_prior + q_values_tensor / self.alpha, dim=0)
 
         k = min(top_k, len(cases_list))
         sampled_indices = torch.multinomial(softmax_probs, num_samples=k, replacement=False)
@@ -253,6 +316,17 @@ class SoftQRetriever:
 
         return result
 
+    def _diagnosis_log_prior(self, root_causes, cases):
+        """Normalized Jaccard prior over actual modified components (Eqs. 12-13)."""
+        localized = set(normalize_components(root_causes))
+        alignment = []
+        for case in cases:
+            modified = set(normalize_components(case.get("modified_components", [])))
+            union = localized | modified
+            alignment.append(len(localized & modified) / len(union) if union else 0.0)
+        scores = torch.tensor(alignment, dtype=torch.float32, device=self.device)
+        return torch.log_softmax(self.prior_beta * scores, dim=0)
+
     def add_experience(
         self,
         query_info,
@@ -262,6 +336,7 @@ class SoftQRetriever:
         next_query_info_id,
         done=False,
         state_counts=None,
+        query_info_id=None,
     ):
         """
         Add experience tuple (s_t, o_t, B_t, r_t, next_query_info_id, done)
@@ -282,16 +357,27 @@ class SoftQRetriever:
                                None or empty string if terminal
             done: Whether the episode is terminated
         """
+        # Identify the query by Query ID and the state by round plus Query ID.
+        # SQL text remains part of the model input, not the state identifier.
+        query_data = query_info.__dict__ if hasattr(query_info, '__dict__') else query_info
+        query_id = str(query_data.get("query_id", ""))
+
         # Create experience
+        # QueryInfo is updated later in the tuning loop when a rewrite is
+        # trialed.  A transition must retain the accepted, pre-action state
+        # even when that trial is rolled back.
         experience = Experience(
-            query_info=query_info.__dict__ if hasattr(query_info, '__dict__') else query_info,
-            case_info=case_info,
+            query_info=copy.deepcopy(query_data),
+            case_info=copy.deepcopy(case_info),
             root_causes=normalize_components(root_causes),
             reward=reward,
             next_query_info_id=next_query_info_id if next_query_info_id else "",
+            query_id=query_id,
+            query_info_id=str(query_info_id or query_id),
             done=done,
             success_count=int((state_counts or {}).get("success_count", 0)),
             failure_count=int((state_counts or {}).get("failure_count", 0)),
+            history_case_ids=list((state_counts or {}).get("history_case_ids", [])),
         )
 
         # Only add experience to pool if it's complete (terminal or next state exists)
@@ -331,6 +417,17 @@ class SoftQRetriever:
             # Remove from pending
             del self.pending_experiences[case_id]
 
+    def finalize_pending_experiences(self, next_query_info_id):
+        """Close transitions when a query meets an early-stop criterion."""
+        pending = self.pending_experiences.pop(next_query_info_id, [])
+        for experience in pending:
+            experience.done = True
+            experience.next_query_info_id = ""
+            self.experience_pool.append(experience)
+            self.total_experiences += 1
+        if pending:
+            self.update_network()
+
     def _get_next_memory_cases(self, next_query_info_id):
         """
         Get memory cases that were created before the next_query_info_id.
@@ -344,25 +441,42 @@ class SoftQRetriever:
         if self.memory_manager is None or not next_query_info_id:
             return []
         
-        # Parse next_query_info_id: "round-query_id"
-        # Since both case_id and next_query_info_id use fixed-length format (round-query_id with zfill),
-        # we can use direct string comparison
-        try:
-            candidate_cases = [case.case_info for case in self.memory_manager.cases.values() if case.id < next_query_info_id]
-        except Exception:
-            # If anything fails, return all cases
-            candidate_cases = [case.case_info for case in self.memory_manager.cases.values()]
-        
-        # Random uniform sampling if number of cases exceeds max_sample_cases
-        if len(candidate_cases) > self.max_sample_cases:
-            sampled_cases = random.sample(candidate_cases, self.max_sample_cases)
-            return sampled_cases
-        else:
-            return candidate_cases
+        # Case archives preserve insertion order. The next case is recorded
+        # after its retrieval decision, so it and later cases are excluded.
+        candidate_cases = []
+        for case in self.memory_manager.cases.values():
+            if case.id == next_query_info_id:
+                break
+            candidate_cases.append(dict(case.case_info, case_id=case.id))
+        return candidate_cases
 
-    def _compute_soft_bellman_target(self, next_query_info, next_root_causes, next_memory_cases, done):
+    @staticmethod
+    def _case_relative_reward(case_info):
+        """Normalize a demonstration's observed latency change by its old latency."""
+        try:
+            old_time = float(case_info.get("old_time") or 0.0)
+            trial_time = case_info.get("new_time")
+            new_time = old_time if trial_time is None else float(trial_time)
+        except (TypeError, ValueError):
+            return 0.0
+        return (old_time - new_time) / max(abs(old_time), 1e-8)
+
+    @staticmethod
+    def _case_improved(case_info):
+        """Count accepted improvements, including gains below the RAWS delta."""
+        if case_info.get("validation_status") == -1:
+            return False
+        try:
+            return float(case_info["new_time"]) < float(case_info["old_time"])
+        except (KeyError, TypeError, ValueError):
+            return case_info.get("label") == "positive"
+
+    def _compute_soft_bellman_target(
+        self, next_query_info, next_root_causes, next_memory_cases, done,
+        next_state_counts=None,
+    ):
         """
-        Compute soft Bellman target: y_t = r_t + γ * α * log(Σ_{o' in M_{t+1}} exp(Q_θ(s_{t+1}, M_{t+1}, o')/α))
+        Compute the prior-guided soft state value in Eq. 16.
         
         Args:
             next_query_info: s_{t+1} - next state
@@ -376,32 +490,35 @@ class SoftQRetriever:
         if done or len(next_memory_cases) == 0:
             return torch.tensor(0.0, device=self.device)
         
-        # Compute Q-values for all observations in next memory
-        q_values_next = []
-        for case_info in next_memory_cases:
-            with torch.no_grad():
-                features_next = self._compute_features(
-                    next_query_info,
-                    case_info,
-                    next_root_causes,
-                    {"success_count": 0, "failure_count": 0},
-                )
-                features_next = features_next.unsqueeze(0)
-                q_value = self.target_network(features_next).squeeze()
-                q_values_next.append(q_value)
+        query_id = str(next_query_info.get("query_id", ""))
+        history = [
+            case for case in next_memory_cases
+            if str((case.get("query_info") or {}).get("query_id", "")) == query_id
+        ]
+        if next_state_counts is None:
+            # Older case archives do not record the exact retrieval state.
+            next_state_counts = {
+                "success_count": sum(self._case_improved(case) for case in history),
+                "failure_count": sum(not self._case_improved(case) for case in history),
+                "history_case_ids": [case["case_id"] for case in history if case.get("case_id")],
+            }
+
+        # Chunk the Bellman target forwards as memory grows. No gradients flow
+        # through the target network, but the case prior still covers all cases.
+        q_value_chunks = []
+        with torch.no_grad():
+            for start in range(0, len(next_memory_cases), 256):
+                features = torch.stack([
+                    self._compute_features(next_query_info, case_info, next_root_causes, next_state_counts)
+                    for case_info in next_memory_cases[start:start + 256]
+                ])
+                q_value_chunks.append(self.target_network(features).reshape(-1))
+        q_values_tensor = torch.cat(q_value_chunks)
         
-        if len(q_values_next) == 0:
-            return torch.tensor(0.0, device=self.device)
-        
-        # Stack Q-values: [num_cases]
-        q_values_tensor = torch.stack(q_values_next)  # [num_cases]
-        
-        # Compute soft Bellman backup: α * log(Σ exp(Q/α))
-        # For numerical stability, use log-sum-exp trick
-        q_values_scaled = q_values_tensor / self.alpha
-        q_max = torch.max(q_values_scaled)
-        log_sum_exp = q_max + torch.log(torch.sum(torch.exp(q_values_scaled - q_max)) + 1e-12)
-        soft_value = self.alpha * log_sum_exp
+        log_prior = self._diagnosis_log_prior(next_root_causes, next_memory_cases)
+        soft_value = self.alpha * torch.logsumexp(
+            log_prior + q_values_tensor / self.alpha, dim=0
+        )
         
         return soft_value
 
@@ -424,6 +541,7 @@ class SoftQRetriever:
                 {
                     "success_count": experience.success_count,
                     "failure_count": experience.failure_count,
+                    "history_case_ids": experience.history_case_ids,
                 },
             )
             features_list.append(features)
@@ -448,7 +566,10 @@ class SoftQRetriever:
                         next_query_info,
                         next_root_causes,
                         next_memory_cases,
-                        False  # Not done since we have next state
+                        False,  # Not done since we have next state
+                        next_state_counts=self._get_next_state_counts_from_id(
+                            experience.next_query_info_id
+                        ),
                     )
                     
                     # TD target: y_t = r_t + γ * soft_value
@@ -490,14 +611,13 @@ class SoftQRetriever:
         if not next_query_info_id or self.memory_manager is None:
             return None, None
         
-        # Parse next_query_info_id: "round-query_id"
+        # Split only the round prefix; a Query ID may itself contain '-'.
         try:
-            parts = next_query_info_id.split("-")
-            if len(parts) != 2:
+            round_text, separator, target_query_id = next_query_info_id.partition("-")
+            if not separator or not target_query_id:
                 return None, None
             
-            target_round = int(parts[0])
-            target_query_id = parts[1]
+            target_round = int(round_text)
             
             # Find the case with matching round and query_id
             # Since case_id format is "round-query_id", there should be at most one matching case
@@ -514,6 +634,16 @@ class SoftQRetriever:
         
         return None, None
 
+    def _get_next_state_counts_from_id(self, next_query_info_id):
+        """Retrieve the exact history features captured at the next decision."""
+        if self.memory_manager is None:
+            return None
+        case = self.memory_manager.cases.get(next_query_info_id)
+        if case is None:
+            return None
+        counts = case.case_info.get("retrieval_state_counts")
+        return counts if isinstance(counts, dict) else None
+
     def save_model(self, save_path):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -523,7 +653,32 @@ class SoftQRetriever:
     def load_model(self, load_path):
         state_dict = torch.load(load_path, map_location=self.device)
 
+        # Legacy checkpoints order inputs as query, case, localized components,
+        # approve_time, then (in 241-wide checkpoints) counts, history, case
+        # components, and normalized reward. Reorder to [u_t; e(O)] and drop
+        # approve_time, which is absent from the paper's encoding.
+        old_first_layer = state_dict.get("0.weight")
+        if old_first_layer is not None and old_first_layer.shape[1] != self.embedding_dim:
+            expanded = torch.zeros(
+                old_first_layer.shape[0], self.embedding_dim,
+                dtype=old_first_layer.dtype,
+            )
+            if old_first_layer.shape[1] in (133, 241):
+                expanded[:, :32] = old_first_layer[:, :32]
+                expanded[:, 32:36] = old_first_layer[:, 128:132]
+                expanded[:, 139:235] = old_first_layer[:, 32:128]
+                if old_first_layer.shape[1] == 241:
+                    expanded[:, 36:38] = old_first_layer[:, 133:135]
+                    expanded[:, 38:139] = old_first_layer[:, 135:236]
+                    expanded[:, 235:239] = old_first_layer[:, 236:240]
+                    expanded[:, 239] = old_first_layer[:, 240]
+            else:
+                width = min(old_first_layer.shape[1], self.embedding_dim)
+                expanded[:, :width] = old_first_layer[:, :width]
+            state_dict["0.weight"] = expanded
+
         self.network.load_state_dict(state_dict)
         self.target_network.load_state_dict(state_dict)
+        self.target_network.eval()
 
         print(f"SoftQRetriever model loaded from: {load_path}")

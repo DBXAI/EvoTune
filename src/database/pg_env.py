@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from decimal import Decimal
 
 import psycopg
 from plumbum import local
+from plumbum.commands.processes import ProcessTimedOut
 from psycopg.rows import dict_row
 
 from .resource_monitor import ResourceMonitor
@@ -26,6 +28,8 @@ class PostgresDB:
         self.postgres_data = db_config.get("postgres_data")
         self.log_path = db_config.get("log_path")
         self.query_timeout = db_config.get("query_timeout")
+        self.qed_timeout = max(1, int(db_config.get("qed_timeout", 60)))
+        self._qed_positive_cache = set()
 
         self.conn_str = self._connect_str()
         self.connection = None
@@ -86,7 +90,7 @@ class PostgresDB:
             except Exception as e:
                 return False, None, self._round_metric_value(timeout), str(e)
 
-    def fetch_results(self, sql, as_json=False, timeout=None):
+    def fetch_results(self, sql, as_json=False, timeout=None, raise_on_error=False):
         if timeout is None:
             timeout = self.query_timeout
 
@@ -130,9 +134,13 @@ class PostgresDB:
                     return []
 
             except psycopg.errors.QueryCanceled as e:
+                if raise_on_error:
+                    raise
                 print(f"Query timeout (>{timeout}s): {str(e)}")
                 return []
             except Exception as e:
+                if raise_on_error:
+                    raise
                 print(f"Query execution failed: {str(e)}")
                 return []
 
@@ -346,20 +354,23 @@ class PostgresDB:
         pid = self.get_pid()
 
         monitor = ResourceMonitor(pid, interval, warmup, duration)
-        monitor.run()
-
-        self.execute(sql)
-
-        monitor.terminate()
-        (
-            cpu_usage,
-            read_io,
-            write_io,
-            virtual_memory,
-            physical_memory,
-            net_recv,
-            net_sent,
-        ) = monitor.get_monitor_data()
+        try:
+            monitor.run()
+            try:
+                self.execute(sql)
+            finally:
+                monitor.terminate()
+            (
+                cpu_usage,
+                read_io,
+                write_io,
+                virtual_memory,
+                physical_memory,
+                net_recv,
+                net_sent,
+            ) = monitor.get_monitor_data()
+        finally:
+            monitor.close()
         rounded_metrics = self._round_metric_matrix(
             [
                 cpu_usage,
@@ -556,39 +567,46 @@ class PostgresDB:
         if timeout is None:
             timeout = self.query_timeout
 
+        collect_start = time.perf_counter()
         conn = self.connect()
-
         log_before = self.collect_metrics(conn)
         plan = self.get_plan(sql)
         pid = self.get_pid()
-        monitor = ResourceMonitor(pid, interval, warmup, timeout)
-        monitor.run()
 
+        monitor_setup_start = time.perf_counter()
+        monitor = ResourceMonitor(pid, interval, warmup, timeout)
         try:
-            _, _, execution_time, _ = self.execute(sql, timeout=timeout)
+            monitor.run()
+            monitor_setup_time = time.perf_counter() - monitor_setup_start
+            try:
+                _, _, execution_time, _ = self.execute(sql, timeout=timeout)
+            finally:
+                monitor_collect_start = time.perf_counter()
+                monitor.terminate()
+
+            try:
+                (
+                    cpu_usage,
+                    read_io,
+                    write_io,
+                    virtual_memory,
+                    physical_memory,
+                    net_recv,
+                    net_sent,
+                ) = monitor.get_monitor_data(timeout=10)
+            except Exception as exc:
+                print(f"Warning: Failed to get monitor data: {exc}")
+                cpu_usage = [0.0] * 9
+                read_io = [0.0] * 9
+                write_io = [0.0] * 9
+                virtual_memory = [0.0] * 9
+                physical_memory = [0.0] * 9
+                net_recv = [0.0] * 9
+                net_sent = [0.0] * 9
         finally:
-            monitor.terminate()
-        
-        try:
-            (
-                cpu_usage,
-                read_io,
-                write_io,
-                virtual_memory,
-                physical_memory,
-                net_recv,
-                net_sent,
-            ) = monitor.get_monitor_data(timeout=10)
-        except Exception as e:
-            print(f"Warning: Failed to get monitor data: {e}")
-            cpu_usage = [0.0] * 9
-            read_io = [0.0] * 9
-            write_io = [0.0] * 9
-            virtual_memory = [0.0] * 9
-            physical_memory = [0.0] * 9
-            net_recv = [0.0] * 9
-            net_sent = [0.0] * 9
-        
+            monitor.close()
+        monitor_collect_time = time.perf_counter() - monitor_collect_start
+
         metrics = self._round_metric_matrix([
             cpu_usage,
             read_io,
@@ -598,9 +616,7 @@ class PostgresDB:
             net_recv,
             net_sent,
         ])
-
         log_after = self.collect_metrics(conn)
-
         diff = self.get_log_diff(log_before, log_after)
         log_list = self.get_metrics_list(diff, execution_time)
 
@@ -610,6 +626,11 @@ class PostgresDB:
             "internal_metrics": log_list,
             "external_metrics": metrics,
             "duration": execution_time,
+            "runtime_metrics": {
+                "T_monitor_setup": monitor_setup_time,
+                "T_monitor_collect": monitor_collect_time,
+                "T_baseline_collect": time.perf_counter() - collect_start,
+            },
         }
 
     def decimal_default(self, obj):
@@ -619,7 +640,20 @@ class PostgresDB:
 
     def check_sql_equivalence(self, sql1, sql2):
 
+        self.last_qed_cache_hit = False
         schema_info = self.fetch_schema_info()
+        # Cache only successful proofs. A negative result may mean timeout or
+        # unsupported syntax, and must be eligible for another attempt later.
+        schema_signature = hashlib.sha256(
+            json.dumps(schema_info, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        cache_key = (schema_signature, *sorted((self.clean_sql(sql1), self.clean_sql(sql2))))
+        positive_cache = getattr(self, "_qed_positive_cache", None)
+        if positive_cache is None:
+            positive_cache = self._qed_positive_cache = set()
+        if cache_key in positive_cache:
+            self.last_qed_cache_hit = True
+            return True
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False, dir="/tmp", encoding="utf-8") as temp_file:
             temp_sql_path = temp_file.name
@@ -667,7 +701,9 @@ class PostgresDB:
                 "qed-parser",
                 temp_sql_path,
             ]
-            parser_retcode, parser_stdout, parser_stderr = local["nix"][parser_cmd].run(retcode=None)
+            parser_retcode, parser_stdout, parser_stderr = local["nix"][parser_cmd].run(
+                retcode=None, timeout=self.qed_timeout
+            )
 
             if not os.path.exists(temp_json_path):
                 print("No JSON file generated by qed-parser")
@@ -682,7 +718,9 @@ class PostgresDB:
                 "qed-prover",
                 temp_json_path,
             ]
-            prover_retcode, prover_stdout, prover_stderr = local["nix"][prover_cmd].run(retcode=None)
+            prover_retcode, prover_stdout, prover_stderr = local["nix"][prover_cmd].run(
+                retcode=None, timeout=self.qed_timeout
+            )
 
             result_file_path = temp_result_path if os.path.exists(temp_result_path) else None
             if result_file_path:
@@ -690,6 +728,7 @@ class PostgresDB:
                     content = f.read().strip()
                     result_json = json.loads(content)
                     if result_json.get("provable", False):
+                        positive_cache.add(cache_key)
                         return True
                     if result_json.get("panicked", False):
                         if prover_retcode != 0:
@@ -704,6 +743,9 @@ class PostgresDB:
                 return False
 
             print("No result file generated by qed-prover")
+            return False
+        except ProcessTimedOut:
+            print(f"QED validation timed out after {self.qed_timeout}s")
             return False
         finally:
             if os.path.exists(temp_sql_path):
@@ -738,8 +780,8 @@ class PostgresDB:
             sql1 = self.clean_sql(sql1)
             sql2 = self.clean_sql(sql2)
 
-            result1 = self.fetch_results(sql1, timeout=20)
-            result2 = self.fetch_results(sql2, timeout=20)
+            result1 = self.fetch_results(sql1, timeout=20, raise_on_error=True)
+            result2 = self.fetch_results(sql2, timeout=20, raise_on_error=True)
 
             # print(f"result1: {result1}")
             # print(f"result2: {result2}")

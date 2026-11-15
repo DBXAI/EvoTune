@@ -45,6 +45,7 @@ _drive_assets/**
 /EvoTune.pdf
 /EvoTune_ICDE.pdf
 /tests/
+/benchmarks/
 /test_sql_gen/
 /scripts/
 /runs/
@@ -59,3 +60,6 @@ _drive_assets/**
 /config/job_supervised_retriever_30h_v1.json
 /config/job_supervised_retriever_30h_v2.json
 /config/ossinsight_tidb_config.json
+/config/job_heuristic_retriever_30h_v1.json
+/config/tpcds_rl_30h_v1.json
+/config/tpcds_rl_30h_v1_resume.json

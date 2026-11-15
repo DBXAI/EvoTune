@@ -18,6 +18,7 @@ if str(path) not in sys.path:
 
 from agent.memory.memory_manager import MemoryManager
 from agent.plan.online_predict import RCRankPredictor
+from config_paths import resolve_config_paths
 
 
 def load_samples(samples_path):
@@ -58,7 +59,7 @@ def train_retriever_from_samples(
     model_save_path,
     memory_manager_config,
     epochs=10,
-    batch_size=32,
+    batch_size=64,
     learning_rate=1e-4,
 ):
     """
@@ -109,12 +110,10 @@ def train_retriever_from_samples(
 
         # Batch training
         valid_batches = 0
+        total_batches = (len(samples) + batch_size - 1) // batch_size
         for i in range(0, len(samples), batch_size):
-            print(f"Processing batch {i // batch_size + 1}/{len(samples) // batch_size}")
+            print(f"Processing batch {i // batch_size + 1}/{total_batches}")
             batch_samples = samples[i : i + batch_size]
-
-            if len(batch_samples) < batch_size:
-                continue  # Skip incomplete batch (last incomplete batch)
 
             # Prepare training data
             features_list = []
@@ -162,7 +161,10 @@ def train_retriever_from_samples(
                                 next_query_info_from_id,
                                 next_root_causes_from_id,
                                 next_memory_cases,
-                                False
+                                False,
+                                next_state_counts=retriever._get_next_state_counts_from_id(
+                                    next_query_info_id
+                                ),
                             )
                             
                             # TD target: y_t = r_t + γ * soft_value
@@ -210,7 +212,7 @@ def train_retriever_from_samples(
             td_targets_tensor = torch.stack(td_targets)
 
             # Forward pass: Q_θ(s_t, M_t, o_t)
-            q_predictions = retriever.network(features_tensor).squeeze()
+            q_predictions = retriever.network(features_tensor).reshape(-1)
 
             # Compute TD loss: L_TD(θ) = E[(Q_θ(s_t, M_t, o_t) - y_t)^2]
             loss = F.mse_loss(q_predictions, td_targets_tensor)
@@ -223,6 +225,9 @@ def train_retriever_from_samples(
             torch.nn.utils.clip_grad_norm_(retriever.network.parameters(), max_norm=1.0)
 
             retriever.optimizer.step()
+            retriever.update_count += 1
+            if retriever.update_count % 10 == 0:
+                retriever.target_network.load_state_dict(retriever.network.state_dict())
 
             epoch_loss += loss.item()
             batch_count += 1
@@ -230,11 +235,6 @@ def train_retriever_from_samples(
 
         avg_loss = epoch_loss / max(batch_count, 1)
         print(f"Epoch {epoch + 1}/{epochs}, Average TD Loss: {avg_loss:.6f}, Valid Batches: {valid_batches}")
-
-        # # Update target network
-        # if (epoch + 1) % 5 == 0:
-        #     retriever.target_network.load_state_dict(retriever.network.state_dict())
-        #     print(f"Updated target network (Epoch {epoch + 1})")
 
     # Save model
     retriever.save_model(model_save_path)
@@ -258,7 +258,7 @@ def main():
     )
     parser.add_argument("--config_path", type=str, required=True, help="Path to configuration file")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
 
     args = parser.parse_args()
@@ -266,6 +266,7 @@ def main():
     # Load configuration (JSON format)
     with open(args.config_path, "r", encoding="utf-8") as f:
         configs = json.load(f)
+    resolve_config_paths(configs, args.config_path)
 
     memory_manager_config = configs.get("MEMORY_MANAGER_CONFIG")
 
@@ -294,7 +295,7 @@ def main():
 #     --model_save_path model/soft_q_retriever_tpch.pt \
 #     --config_path ../../../config/tpch_config.json \
 #     --epochs 10 \
-#     --batch_size 32 \
+#     --batch_size 64 \
 #     --learning_rate 0.0001
 
 if __name__ == "__main__":

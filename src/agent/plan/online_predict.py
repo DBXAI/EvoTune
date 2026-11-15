@@ -25,6 +25,8 @@ from transformers import BertModel, BertTokenizer
 
 
 class RCRankPredictor:
+    supports_precomputed_context = True
+
     def __init__(self, config=None, **kwargs):
         config = dict(config or {})
         config.update(kwargs)
@@ -32,6 +34,8 @@ class RCRankPredictor:
         self.num_classes = config.get("num_classes", 4)
         self.model_path = config.get("model_path")
         train_data_path = config.get("train_data_path")
+        self.allow_cold_start = bool(config.get("allow_cold_start", False))
+        self.is_pretrained = False
 
         # Get the absolute path to bert-base-uncased
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -116,12 +120,27 @@ class RCRankPredictor:
             rootcause_cross_model=rootcause_cross_model,
         ).to(self.device)
 
-        # load pre-trained model
-        print(f"Loading model from {self.model_path}")
-        self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+        # Task-specific offline pretraining is optional in the cold-start
+        # setting. A configured but missing checkpoint remains an error unless
+        # cold start is explicitly requested.
+        if self.model_path and os.path.exists(self.model_path):
+            print(f"Loading model from {self.model_path}")
+            self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+            self.is_pretrained = True
+        elif self.model_path and not self.allow_cold_start:
+            raise FileNotFoundError(self.model_path)
         self.model.eval()
 
     def _compute_statistics(self, train_data_path):
+        if not train_data_path or not os.path.exists(train_data_path):
+            if train_data_path and not self.allow_cold_start:
+                raise FileNotFoundError(train_data_path)
+            # Identity normalization until feedback data is collected.
+            self.logs_train_mean = torch.zeros(13)
+            self.logs_train_std = torch.ones(13)
+            self.timeseries_train_mean = torch.zeros(7)
+            self.timeseries_train_std = torch.ones(7)
+            return
         print(f"Computing statistics from training data: {train_data_path}")
         df = pd.read_csv(train_data_path)
 
@@ -176,24 +195,31 @@ class RCRankPredictor:
         log = log.to(self.device)
         return sql, plan, timeseries, log
 
-    def predict(self, query, plan, timeseries, log):
+    def predict(self, query=None, plan=None, timeseries=None, log=None, *, precomputed=None):
         self.model.eval()
 
         with torch.no_grad():
-            sql, plan, timeseries, log = self._prepare_inputs(query, plan, timeseries, log)
-
-            pred_label_opt, _ = self.model(sql, plan, timeseries, log)
+            if precomputed is None:
+                sql, plan, timeseries, log = self._prepare_inputs(query, plan, timeseries, log)
+                pred_label_opt, _ = self.model(sql, plan, timeseries, log)
+            else:
+                encoded, embedding = precomputed
+                pred_label_opt, _ = self.model.predict_from_encoded(encoded, embedding)
             pred_label = torch.where(pred_label_opt > self.opt_threshold, 1, 0)
 
             return pred_label_opt, pred_label
 
-    def get_context_embedding(self, query, plan, timeseries, log):
+    def get_context_embedding(self, query, plan, timeseries, log, *, return_precomputed=False):
         """Return the multimodal context vector used by the bandit and retriever."""
         self.model.eval()
         with torch.no_grad():
             sql, plan, timeseries, log = self._prepare_inputs(query, plan, timeseries, log)
-            embedding = self.model.get_embedding(sql, plan, timeseries, log)
-        return embedding.squeeze(0).detach().cpu().numpy()
+            encoded = self.model.encode_modalities(sql, plan, timeseries, log)
+            embedding = self.model.common_embedding(encoded)
+        vector = embedding.squeeze(0).detach().cpu().numpy()
+        if return_precomputed:
+            return vector, (encoded, embedding)
+        return vector
 
 
 def load_sample_data(data_path):
@@ -226,7 +252,7 @@ def load_sample_data(data_path):
 
 def online_predict(data_path, opt_threshold=0.5, num_classes=4):
     predictor = RCRankPredictor(
-        model_path="model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
+        model_path=os.path.join(current_dir, "model_res", "predictor.pt"),
         train_data_path=data_path,
         device="cpu",
         opt_threshold=opt_threshold,

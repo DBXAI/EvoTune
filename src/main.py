@@ -6,6 +6,7 @@ import os
 import sys
 from datetime import datetime
 from agent.db_agent import DBAgent
+from config_paths import resolve_config_paths
 
 def setup_logging():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,7 +50,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Slow Query Diagnosis Tool")
     parser.add_argument("--data_path", type=str, required=True, help="Slow query data file path")
     parser.add_argument("--order", type=str, required=True, help="Slow query execution order")
-    parser.add_argument("--duration", type=int, default=30, help="Optimization duration in hours")
+    parser.add_argument("--duration", type=float, default=30, help="Optimization duration in hours")
+    parser.add_argument("--max-rounds", type=int, default=None, help="Stop after this many completed tuning rounds")
     parser.add_argument("--config", type=str, required=True, help="Configuration file path")
     parser.add_argument(
         "--resume-state",
@@ -59,6 +61,24 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+
+def restore_online_predictor_config(configs, resume_state_path):
+    """Use the latest online predictor when continuing the same experiment."""
+    if not resume_state_path or not os.path.isfile(resume_state_path):
+        return False
+    output_dir = configs.get("MEMORY_MANAGER_CONFIG", {}).get("model_output_dir")
+    if not output_dir:
+        return False
+    checkpoint = os.path.join(output_dir, "best_model.pt")
+    if not os.path.isfile(checkpoint):
+        return False
+    planner_config = configs.setdefault("PLANNER_CONFIG", {})
+    planner_config["model_path"] = checkpoint
+    feedback_csv = os.path.join(output_dir, "memory_cases.csv")
+    if os.path.isfile(feedback_csv):
+        planner_config["train_data_path"] = feedback_csv
+    return True
 
 
 async def main():
@@ -78,12 +98,20 @@ async def main():
 
     with open(args.config, "r", encoding="utf-8") as f:
         configs = json.load(f)
+    resolve_config_paths(configs, args.config)
+
+    if restore_online_predictor_config(configs, args.resume_state):
+        logger.info(
+            "Resuming online predictor from %s",
+            configs["PLANNER_CONFIG"]["model_path"],
+        )
 
     async with DBAgent(configs=configs) as agent:
         await agent.run(
             slow_query_path=args.data_path,
             order=args.order,
             duration=args.duration,
+            max_rounds=args.max_rounds,
             no_improvement_threshold=configs["AGENT_CONFIG"]["no_improvement_threshold"],
             resume_state_path=args.resume_state,
         )

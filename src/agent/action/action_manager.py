@@ -5,7 +5,7 @@ import time
 import nest_asyncio
 from agents import Agent, Runner
 
-from agent.action.action_evaluation import evaluate_action
+from agent.action.action_evaluation import ValidationAgent
 from agent.action.action_space import action_space_collect
 from agent.action.action_utils import (
     base_information_collect,
@@ -76,7 +76,6 @@ class ActionManager:
             self.agent_config.get("retrieval_content", "all")
         )
         self.enable_action_define = self.agent_config.get("enable_action_define", True)
-        self.enable_action_pruning = self.agent_config.get("enable_action_pruning", True)
 
         self.api_settings = self.configs.get("API_SETTINGS")
 
@@ -87,6 +86,14 @@ class ActionManager:
             name="FixAgent",
             model=self.fix_model,
             instructions=get_fix_agent_instructions(),
+        )
+        self.validation_agent = ValidationAgent(
+            db=self.db,
+            fix_agent=self.fixAgent,
+            fix_timeout=self.fix_timeout,
+            sql_timeout=self.sql_timeout,
+            max_retries=self.agent_config.get("validation_retries", 3),
+            min_improvement=self.agent_config.get("localization_min_improvement", 0.1),
         )
 
     async def __aenter__(self):
@@ -153,7 +160,7 @@ class ActionManager:
             return raw_positives, raw_negatives, "None."
         return raw_positives, raw_negatives, raw_experiences
 
-    async def step(self, query_info, root_cause, mode="exploit", tuning_state=None):
+    async def step(self, query_info, root_cause, mode="exploit", tuning_state=None, initial_latency=None):
         """Analyze slow query and generate fix action workflow"""
         if not self.agent:
             await self.initialize()
@@ -171,7 +178,16 @@ class ActionManager:
             "DATABASE_CONFIG", self.configs.get("TiDB_CONFIG", {})
         )
         base_info = base_information_collect(query_info, database_config)
+        base_info["tuning_history"] = self.memory_manager.get_query_tuning_history(
+            getattr(query_info, "query_id", ""),
+            limit=self.agent_config.get("history_prompt_limit"),
+        )
         state_counts = dict(tuning_state or {})
+        state_counts["history_case_ids"] = [
+            case.id for case in self.memory_manager.cases.values()
+            if str((case.case_info.get("query_info") or {}).get("query_id"))
+            == str(getattr(query_info, "query_id", ""))
+        ]
 
         # Retrieve cases based on enable_retrieval flag
         retrieval_start = time.perf_counter()
@@ -193,16 +209,15 @@ class ActionManager:
             retrieved_cases[0] if retrieved_cases else None
         )
         runtime_metrics["T_retrieval_infer"] = time.perf_counter() - retrieval_start
+        runtime_metrics["retrieval_candidates"] = len(retrieval.get("candidate_cases", []))
 
         action_space_start = time.perf_counter()
         action_space = await action_space_collect(
             root_cause,
             query_info,
             enable_action_define=self.enable_action_define,
-            enable_action_pruning=self.enable_action_pruning,
             configs=self.configs,
             db=self.db,
-            memory_manager=self.memory_manager,
         )
         runtime_metrics["T_action_space"] = time.perf_counter() - action_space_start
 
@@ -220,14 +235,8 @@ class ActionManager:
 
         # Validate action
         action_eval_start = time.perf_counter()
-        evaluation_result = await evaluate_action(
-            fix_action,
-            rewrite_sql,
-            query_info,
-            db=self.db,
-            fix_timeout=self.fix_timeout,
-            sql_timeout=self.sql_timeout,
-            fix_agent=self.fixAgent,
+        evaluation_result = await self.validation_agent.evaluate(
+            fix_action, rewrite_sql, query_info
         )
         if evaluation_result.get("fix_action"):
             index_names = extract_index_names(evaluation_result.get("fix_action"))
@@ -235,28 +244,40 @@ class ActionManager:
             self.rollback_action(index_names, knob_names)
         runtime_metrics["T_action_eval"] = time.perf_counter() - action_eval_start
 
-        # Use approve_time as reward (performance improvement: old_time - new_time)
-        # approve_time represents the time saved, which is the actual reward signal
+        # Retrieval reward uses the fixed initial latency T0 of this query
+        # trajectory (Eq. 11), including the timeout penalty for invalid actions.
         old_time = float(evaluation_result.get("old_time") or query_info.execution_time or 0.0)
-        new_time = float(evaluation_result.get("new_time") or old_time)
-        reward = (old_time - new_time) / max(abs(old_time), 1e-8)
+        if evaluation_result.get("status") == -1:
+            new_time = float(database_config.get("query_timeout") or self.sql_timeout or old_time)
+        else:
+            measured_time = evaluation_result.get("new_time")
+            new_time = float(measured_time) if measured_time is not None else old_time
+        reward = (old_time - new_time) / max(abs(float(initial_latency or old_time)), 1e-8)
         case = retrieved_cases
+
+        if self.memory_manager.retrieval_mode == "heuristic" and selected_case:
+            self.memory_manager.record_heuristic_feedback(
+                getattr(query_info, "query_id", ""),
+                selected_case.get("case_id"),
+                evaluation_result.get("status") != -1 and new_time < old_time,
+            )
+
+        query_info_id = self.memory_manager.generate_next_query_info_id(
+            query_info.query_id, round_num=self.memory_manager.current_round
+        )
+        next_query_info_id = self.memory_manager.generate_next_query_info_id(
+            query_info.query_id
+        )
 
         # Save experience (independent of retrieval mode, only based on enable_save_samples)
         if self.memory_manager.enable_save_samples and selected_case:
-            # Generate next_query_info_id: next round, same query_id
-            next_query_info_id = self.memory_manager.generate_next_query_info_id(query_info.query_id)
-            
             for case_info in [selected_case]:
-                # root_causes should be extracted from case_info or use the root_cause parameter
-                case_root_causes = case_info.get("root_causes", [])
-                if not case_root_causes and root_cause:
-                    case_root_causes = root_cause if isinstance(root_cause, list) else [root_cause]
                 self.memory_manager.save_experience(
                     query_info, 
                     case_info, 
-                    case_root_causes,
+                    root_cause,
                     reward,
+                    query_info_id=query_info_id,
                     next_query_info_id=next_query_info_id,
                     done=False,
                     state_counts={
@@ -274,18 +295,13 @@ class ActionManager:
         # inference-only while still recording samples for later analysis.
         retriever_update_start = time.perf_counter()
         if self.memory_manager.retrieval_mode == "dynamic" and selected_case:
-            # Generate next_query_info_id: next round, same query_id
-            next_query_info_id = self.memory_manager.generate_next_query_info_id(query_info.query_id)
-            
             for case_info in [selected_case]:
-                case_root_causes = case_info.get("root_causes", [])
-                if not case_root_causes and root_cause:
-                    case_root_causes = root_cause if isinstance(root_cause, list) else [root_cause]
                 self.memory_manager.retriever.add_experience(
                     query_info,
                     case_info,
-                    case_root_causes,
+                    root_cause,
                     reward,
+                    query_info_id=query_info_id,
                     next_query_info_id=next_query_info_id,
                     done=False,
                     state_counts={
@@ -304,6 +320,7 @@ class ActionManager:
             "positive": retrieval.get("positive", []),
             "negative": retrieval.get("negative", []),
         }
+        evaluation_result["retrieval_state_counts"] = state_counts
         logger.info(
             "[Runtime][SQL %s] Action summary: %s",
             getattr(query_info, "query_id", "unknown"),
@@ -347,18 +364,18 @@ class ActionManager:
     async def action_generate(self, root_cause, base_info, action_space, mode, positives, negatives, experiences):
         prompt = build_action_prompt(root_cause, base_info, action_space, mode, positives, negatives, experiences)
         query_info = base_info.get("query_info")
-        # logger.info(
-        #     "[Prompt][Tuning][SQL %s]\n%s",
-        #     getattr(query_info, "query_id", "unknown"),
-        #     prompt,
-        # )
+        logger.info(
+            "[Prompt][Tuning][SQL %s]\n%s",
+            getattr(query_info, "query_id", "unknown"),
+            prompt,
+        )
         return await Runner.run(starting_agent=self.agent, input=prompt)
 
     def extract_fix_action(self, action_result):
         """Extract fix_action and rewrite_sql from action_result"""
         explanation, fix_action, is_rewrite = self.parse_action_result(action_result)
-        # print("Diagnosis output:")
-        # print("Explanation:", explanation)
+        print("Diagnosis output:")
+        print("Explanation:", explanation)
         print("Fix action:", fix_action)
         print("Is rewrite:", is_rewrite)
         if is_rewrite == "yes":

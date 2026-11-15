@@ -288,7 +288,8 @@ def fmt_cases(cases):
             f"\n    SQL: {query_info.get('query')}"
             f"\n    Execution Plan: {query_info.get('plan_json')}"
             f"\n    Origin Execution Runtime: {query_info.get('execution_time')}s"
-            f"\n    Components: {format_component_label(case.get('root_causes'))}"
+            f"\n    Localized Components: {format_component_label(case.get('root_causes'))}"
+            f"\n    Modified Components: {format_component_label(case.get('modified_components'))}"
             f"\n    Tuning_Action: {case.get('fix_action')}"
             f"\n    Improve Time: {case.get('approve_time')}s"
         )
@@ -308,20 +309,27 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     positives_text = fmt_cases(positives)
     negatives_text = fmt_cases(negatives)
     experiences_text = experiences or "None."
+    history = base_info.get("tuning_history") or []
+    history_text = "\n".join(
+        f"    Attempt {i}: components={item.get('modified_components', [])}; "
+        f"relative improvement={item.get('improvement', 0.0):.4f}; "
+        f"action={item.get('action', '')}"
+        for i, item in enumerate(history, 1)
+    ) or "None."
 
     # Mode prompt
     if mode == "exploit":
         mode_instruction = """You are now in EXPLOIT mode.
-    - Positive Observations come from historical fixes under the same predicted components.
+    - Positive Observations are historically effective demonstrations selected by the retrieval policy.
     - Negative Observations record ineffective directions and must be avoided.
     - Treat prior Tuning_Action entries as optimization patterns, not reusable output."""
     else:
         mode_instruction = """You are now in EXPLORE mode.
-    - Positive Observations come from historical fixes under different predicted components.
+    - Positive Observations are exploratory historical demonstrations selected by the retrieval policy.
     - Negative Observations capture ineffective directions and must be avoided.
-    - Use them only to inspire new actions inside the allowed action space for the current components."""
+    - Prefer the localized components, but consider other components when the current execution evidence supports them."""
 
-    return f"""You are an SQL optimization expert. The bottleneck-related tuning components have already been localized. Your job is to recommend executable tuning action(s) only within the localized tuning subspace, using the current query context, retrieved historical observations with experiences, and the refined action space.
+    return f"""You are an SQL optimization expert. Promising tuning components have already been localized. Use them as priorities when recommending executable tuning actions, while considering other components if the full query context supports them. Use the current query context, retrieved historical observations with experiences, and the refined action space.
     ## Context
     1. Query Information:
     • SQL: {query_info.query}
@@ -343,17 +351,19 @@ def build_action_prompt(root_cause, base_info, action_space, mode, positives, ne
     3. Localized Bottleneck Component(s): {components}
     4. Tuning Mode
     {mode_instruction}
-    5. Retrieved Historical Observations and Experiences
+    5. Retrieved Tuning Demonstration
     • Positive Observations (historically effective): {positives_text}
     • Negative Observations (historically ineffective): {negatives_text}
     • Experiences: {experiences_text}
-    6. Reflective Reasoning Guidance
-    Before proposing your optimization solution, analyze the historical observations and experiences to understand why certain approaches succeeded or failed. Adapt successful patterns to the current context while avoiding patterns that failed in similar situations.
-    7. Refined Tuning Subspace
+    6. Query Tuning History
+    {history_text}
+    7. Reflective Reasoning Guidance
+    Before proposing your optimization solution, analyze the query's own tuning history and the retrieved demonstration to understand why certain approaches succeeded or failed. Adapt successful patterns while avoiding ineffective ones.
+    8. Refined Tuning Subspace
     {action_space}
     ## Constraints
     • Tuning_Action must be executable directly in {db_info.get('db_type')}.
-    • The Tuning_Action must only operate on the component(s) listed in {components}.
+    • Prioritize the localized component(s) {components}; they guide the search but are not a hard restriction on the action.
     • The Tuning_Action should be safe and must not drop or delete data.
     ## Output Format
     You must output ONLY in the following format:
@@ -451,7 +461,7 @@ def build_root_cause_diagnosis_prompt(
       consecutive non-improving attempts). Perform a randomized exploration
       step now: choose
       at least one low-attempt or previously untried component from [index,
-      knob, hint, query], and consider a new component combination. Do not
+      knob, hint, rewrite], and consider a new component combination. Do not
       simply repeat the component or component combination with the highest
       failure count. Use the plan and runtime evidence to reject implausible
       choices, but keep the selection exploratory. This exploration applies to
@@ -467,7 +477,7 @@ def build_root_cause_diagnosis_prompt(
 
     return f"""You are a database performance diagnosis expert. Your task is to identify the most promising tuning component space(s) for the following slow SQL query. To do so, reason directly from the current query context, trajectory-level tuning feedback, and DBA-style knowledge, and determine which component space(s) are most likely to deliver substantial performance improvement.
     ## Candidate Tuning Components
-    The allowed components are exactly: [index, knob, hint, query]
+    The allowed components are exactly: [index, knob, hint, rewrite]
     ## Context
     1. Query Information
     • SQL Statement: {query_info.query}
@@ -588,7 +598,7 @@ def build_action_space_prompt(root_causes, db, knob_config, current_knob_values,
     - **IMPORTANT**: When using Hint Space, output ONLY the hint block. Do NOT include the original SQL."""
 
     # SQL readability/rewrite related
-    if "query" in root_causes:
+    if "rewrite" in root_causes:
         from agent.action.rule_matcher import SQLRuleMatcher
 
         matcher = SQLRuleMatcher()
@@ -651,51 +661,31 @@ def get_summary_agent_instructions():
     Summarize a cluster of historical tuning cases into a concise reusable experience."""
 
 
-def get_reflection_agent_instructions():
-    """Get instructions for the reflection generation agent."""
-    return """You are a database tuning reflection expert.
-    Convert a single tuning case into a concise reusable reflection."""
-
-
-def build_case_reflection_prompt(case_info):
-    """Build prompt for generating a reflection from a single case."""
-    query_info = case_info.get("query_info", {})
-    root_causes = case_info.get("root_causes", [])
-    label = case_info.get("label", "negative")
-    old_time = case_info.get("old_time", query_info.get("execution_time", 0.0))
-    new_time = case_info.get("new_time", query_info.get("execution_time", 0.0))
-    improvement = case_info.get("approve_time", 0.0)
-
-    return f"""Generate a reusable reflection for the following tuning case.
-    Query Context:
-    - SQL: {query_info.get('query')}
-    - Execution Plan: {query_info.get('plan_json')}
-    - Runtime Before: {old_time}
-    - Runtime After: {new_time}
-    - Improvement: {improvement}
-    Diagnosis Context:
-    - Predicted Components: {root_causes}
-    - Applied Tuning_Action: {case_info.get('fix_action')}
-    - Outcome Label: {label}
-    Requirements (Strict):
-    - The reflection should explain why the action succeeded or failed under the query context.
-    - Write it in a generalized form using: [Positive/Negative reflection:] Under [query conditions], applying [action pattern] tends to [help / fail], because [reason].
-    - Keep it concise and reusable, Avoid unnecessary case-specific details.
-    - Output only the reflection text."""
-
-
 def build_experience_summary_prompt(root_causes, cases, previous_summary=None):
     """Build prompt for summarizing a cluster of cases into one experience."""
     lines = []
     for idx, case in enumerate(cases, 1):
         case_info = case.case_info
-        lines.append(f"Case {idx}: " f"reflection={case_info.get('reflection', 'None.')}")
+        query_info = case_info.get("query_info", {}) or {}
+        old_time = case_info.get("old_time", query_info.get("execution_time"))
+        new_time = case_info.get("new_time")
+        lines.append(
+            f"Case {idx} (Query ID: {query_info.get('query_id', 'unknown')}):\n"
+            f"SQL: {query_info.get('query', '')}\n"
+            f"Execution plan: {query_info.get('plan_json', '')}\n"
+            f"Internal metrics: {query_info.get('internal_metrics', [])}\n"
+            f"Localized components: {case_info.get('localized_components', case_info.get('root_causes', []))}\n"
+            f"Tuning action: {case_info.get('fix_action', '')}\n"
+            f"Runtime before: {old_time}; runtime after: {new_time}; "
+            f"outcome: {case_info.get('label', '')}; "
+            f"validation: {case_info.get('validation_status', '')}"
+        )
 
     cases_text = "\n".join(lines) if lines else "None."
     return f"""Summarize the following cluster of tuning cases into one reusable cluster-level experience.
     Root Causes: {root_causes}
     Previous Experience Summary: {previous_summary or 'None'}
-    Cluster Case Reflections:
+    Cluster Observations:
     {cases_text}
     The experience should summarize, in a generalized and reusable form, what action patterns tend to succeed or fail under what query conditions, and why.
     When helpful, describe both the successful and unsuccessful action patterns within a single experience statement, rather than as separate case-by-case summaries.

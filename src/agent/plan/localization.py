@@ -1,4 +1,5 @@
 import random
+import copy
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -15,8 +16,8 @@ EXPERT_LLM = "llm"
 # LLM detector.  The random expert remains available only for explicit
 # exploration ablations; it is not part of the default hybrid policy.
 DEFAULT_EXPERT_PRIORS = {
-    EXPERT_LIGHTWEIGHT: {"intercept": 0.20},
-    EXPERT_LLM: {"intercept": 0.0},
+    EXPERT_LIGHTWEIGHT: {"intercept": 0.8},
+    EXPERT_LLM: {"intercept": 0.2},
 }
 
 
@@ -35,24 +36,41 @@ class LocalizationExpertSelector:
         self.agent_config = agent_config or {}
         self.rng = rng or random
         self.context_dim = max(1, int(self.agent_config.get("localization_context_dim", 32)))
-        self.prior_variance = float(self.agent_config.get("localization_prior_variance", 1.0))
-        self.reward_variance = float(self.agent_config.get("localization_reward_variance", 0.25))
+        self.prior_variance = float(self.agent_config.get("localization_prior_variance", 0.1))
+        self.reward_variance = float(self.agent_config.get("localization_reward_variance", 0.1))
         self.priors = self._load_priors(self.agent_config.get("localization_expert_priors"))
+        # Expert effectiveness is learned across queries, not independently
+        # for each query's trajectory.
+        self.experts = {}
+        self._initialize_experts()
+
+    def _initialize_experts(self):
+        for expert, prior in self.priors.items():
+            mean = np.zeros(self.context_dim + 1, dtype=float)
+            mean[0] = float(prior.get("intercept", 0.0))
+            self.experts[expert] = {
+                "mean": mean.tolist(),
+                "covariance": (np.eye(self.context_dim + 1) * self.prior_variance).tolist(),
+            }
+
+    def export_global_state(self):
+        return copy.deepcopy(self.experts)
+
+    def load_global_state(self, experts):
+        if not isinstance(experts, dict):
+            return
+        for expert in self.priors:
+            saved = experts.get(expert, {})
+            mean = np.asarray(saved.get("mean", []), dtype=float)
+            covariance = np.asarray(saved.get("covariance", []), dtype=float)
+            if mean.shape == (self.context_dim + 1,) and covariance.shape == (self.context_dim + 1, self.context_dim + 1):
+                self.experts[expert] = {"mean": mean.tolist(), "covariance": covariance.tolist()}
 
     def ensure_state(self, state):
         localization = state.setdefault("localization", {})
-        experts = localization.setdefault("experts", {})
-        for expert, prior in self.priors.items():
-            expert_state = experts.setdefault(expert, {})
-            # Discard the old Beta posterior format from pre-bandit checkpoints.
-            if "mean" not in expert_state or "covariance" not in expert_state:
-                mean = np.zeros(self.context_dim + 1, dtype=float)
-                mean[0] = float(prior.get("intercept", 0.0))
-                expert_state.clear()
-                expert_state["mean"] = mean.tolist()
-                expert_state["covariance"] = (
-                    np.eye(self.context_dim + 1, dtype=float) * self.prior_variance
-                ).tolist()
+        # Keep the legacy view for callers inspecting localization state while
+        # ensuring every query uses the same live posterior.
+        localization["experts"] = self.experts
         localization.setdefault("active_expert", None)
         localization.setdefault("active_root", None)
         localization.setdefault("active_confidence", {})
@@ -92,7 +110,7 @@ class LocalizationExpertSelector:
         x = self._context_vector(context)
         samples = {}
         for expert in allowed:
-            expert_state = localization["experts"].setdefault(expert, {})
+            expert_state = self.experts[expert]
             mean = np.asarray(expert_state["mean"], dtype=float)
             covariance = np.asarray(expert_state["covariance"], dtype=float)
             sampled_theta = np.random.multivariate_normal(mean, covariance)
@@ -130,7 +148,7 @@ class LocalizationExpertSelector:
             localization["active_context"] = None
             return None
 
-        expert_state = localization["experts"].setdefault(active_expert, {})
+        expert_state = self.experts[active_expert]
         x = np.asarray(localization.get("active_context"), dtype=float)
         mean = np.asarray(expert_state["mean"], dtype=float)
         covariance = np.asarray(expert_state["covariance"], dtype=float)

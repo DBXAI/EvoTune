@@ -11,7 +11,6 @@ class ResourceMonitor:
     def __init__(self, pid, interval, warmup, t):
         self.interval = interval
         self.t = t
-        self.process = psutil.Process(pid)
         self.warmup = warmup
         self.ticks = int(self.t / self.interval)
 
@@ -25,12 +24,12 @@ class ResourceMonitor:
             self.n_cpu = 1
             print(f"Warning: Process {pid} does not exist or cannot be accessed, using default values")
 
-        self.cpu_usage_seq = Manager().list()
-        self.mem_virtual_usage_seq = Manager().list()
-        self.mem_physical_usage_seq = Manager().list()
-        self.io_read_seq, self.io_write_seq = Manager().list(), Manager().list()
-        self.net_recv_seq, self.net_sent_seq = Manager().list(), Manager().list()
-        self.dirty_pages_pct_seq = Manager().list()
+        self._manager = Manager()
+        self.cpu_usage_seq = self._manager.list()
+        self.mem_virtual_usage_seq = self._manager.list()
+        self.mem_physical_usage_seq = self._manager.list()
+        self.io_read_seq, self.io_write_seq = self._manager.list(), self._manager.list()
+        self.net_recv_seq, self.net_sent_seq = self._manager.list(), self._manager.list()
         self.processes = []
         self.alive = mp.Value("b", False)
 
@@ -59,14 +58,15 @@ class ResourceMonitor:
 
     def _wait_for_processes(self, timeout=10):
         for proc in self.processes:
+            if proc.pid is None:
+                continue
+            proc.join(timeout=timeout)
             if proc.is_alive():
-                proc.join(timeout=timeout)
+                proc.terminate()
+                proc.join(timeout=2)
                 if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=2)
-                    if proc.is_alive():
-                        proc.kill()
-                        proc.join()
+                    proc.kill()
+                    proc.join()
 
     def _sleep_with_check(self, duration):
         """使用更短的sleep间隔，以便更快响应终止信号"""
@@ -220,3 +220,16 @@ class ResourceMonitor:
         for proc in self.processes:
             if proc.is_alive():
                 proc.terminate()
+
+    def close(self):
+        """Release workers and the shared-list server after samples are copied."""
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            return
+        self.alive.value = False
+        for proc in self.processes:
+            if proc.is_alive():
+                proc.terminate()
+        self._wait_for_processes(timeout=2)
+        self._manager = None
+        manager.shutdown()

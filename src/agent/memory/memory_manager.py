@@ -1,12 +1,11 @@
-import asyncio
 import itertools
+import hashlib
 import json
 import logging
 import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -18,16 +17,7 @@ from numpy.linalg import norm
 try:
     from sklearn.cluster import HDBSCAN
 except ImportError:  # scikit-learn versions before the built-in estimator
-    try:
-        from hdbscan import HDBSCAN
-    except ImportError:
-        from sklearn.cluster import DBSCAN
-
-        class HDBSCAN(DBSCAN):
-            """Small compatibility fallback for environments without HDBSCAN."""
-
-            def __init__(self, min_cluster_size=5, min_samples=5, metric="euclidean", allow_single_cluster=True):
-                super().__init__(eps=0.5, min_samples=min_samples, metric=metric)
+    from hdbscan import HDBSCAN
 
 from agent.contracts import (
     CANONICAL_COMPONENTS,
@@ -37,11 +27,11 @@ from agent.memory.localization_refinement import (
     build_component_labels,
     masked_bce_loss,
     parse_attempt_vector,
+    raws_supervision_weights,
 )
+from agent.memory.case_store import SQLiteCaseStore
 from agent.prompt import (
-    build_case_reflection_prompt,
     build_experience_summary_prompt,
-    get_reflection_agent_instructions,
     get_summary_agent_instructions,
 )
 
@@ -101,41 +91,6 @@ class SummaryAgent:
             model=summary_model,
             instructions=get_summary_agent_instructions(),
         )
-        self.reflectionAgent = Agent(
-            name="ReflectionAgent",
-            model=summary_model,
-            instructions=get_reflection_agent_instructions(),
-        )
-
-    def _run_agent_sync(self, agent, prompt):
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return Runner.run_sync(starting_agent=agent, input=prompt)
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(Runner.run_sync, starting_agent=agent, input=prompt)
-            return future.result()
-
-    def reflect_case(self, case_info):
-        prompt = build_case_reflection_prompt(case_info)
-        query_info = case_info.get("query_info", {}) or {}
-        # logger.info(
-        #     "[Prompt][Reflection][SQL %s]\n%s",
-        #     query_info.get("query_id", "unknown"),
-        #     prompt,
-        # )
-        try:
-            result = self._run_agent_sync(self.reflectionAgent, prompt)
-            return re.sub(r"\s+", " ", str(result.final_output or "")).strip()
-        except Exception as exc:
-            logger.warning(
-                "Case reflection failed for SQL %s: %s",
-                query_info.get("query_id", "unknown"),
-                exc,
-                exc_info=True,
-            )
-            return ""
 
     def summarize_cases(self, root_causes, cases, previous_summary=None):
         prompt = build_experience_summary_prompt(root_causes, cases, previous_summary)
@@ -145,7 +100,10 @@ class SummaryAgent:
         #     prompt,
         # )
         try:
-            result = self._run_agent_sync(self.summaryAgent, prompt)
+            result = Runner.run_sync(
+                starting_agent=self.summaryAgent,
+                input=prompt,
+            )
             return re.sub(r"\s+", " ", str(result.final_output or "")).strip()
         except Exception as exc:
             logger.warning(
@@ -160,10 +118,8 @@ class SummaryAgent:
 class MemoryManager:
     def __init__(self, config, predictor=None, planner_config=None, agent_config=None, api_settings=None):
         self.db_path = config.get("db_path")
-        self.archive_size = config.get("archive_size")
+        self.sqlite_path = config.get("sqlite_path") or f"{self.db_path}.sqlite3"
         self.cases = {}
-        self.archive = set()
-        self.best_case_id = None
         self.agent_config = agent_config or {}
         self.api_settings = api_settings or {}
 
@@ -176,7 +132,7 @@ class MemoryManager:
 
         # Exploration threshold for verified supervision
         self.eta = config.get("eta", 3)  # Minimum exploration threshold η
-        self.attribution_rho = float(config.get("attribution_rho", 0.5))
+        self.attribution_rho = float(config.get("attribution_rho", 0.8))
 
         self.bert_model_path = config.get("bert_model_path")
         self.experience_path = config.get("experience_path") or f"{self.db_path}_experiences.json"
@@ -208,8 +164,16 @@ class MemoryManager:
         # Retrieval mode configuration: static or dynamic
         self.retrieval_mode = config.get("retrieval_mode", "dynamic")
         self.retrieval_exploration_rate = float(
-            config.get("retrieval_exploration_rate", 0.0)
+            config.get(
+                "retrieval_exploration_rate",
+                0.2 if self.retrieval_mode == "bootstrap" else 0.0,
+            )
         )
+        self.retrieval_prior_beta = float(config.get("retrieval_prior_beta", 0.8))
+        self.heuristic_failure_threshold = max(
+            1, int(config.get("heuristic_failure_threshold", 3))
+        )
+        self._heuristic_retrieval_state = {}
 
         # Sample save configuration
         self.enable_save_samples = config.get("enable_save_samples", False)
@@ -249,6 +213,8 @@ class MemoryManager:
         self.next_experience_index = 1
         self._case_embedding_cache = {}
         self._sql_embedding_cache = {}
+        self._action_embedding_cache = {}
+        self._current_query_embedding = None
 
         # Load the saved retriever model
         if self.retriever_model_path and os.path.exists(self.retriever_model_path):
@@ -263,15 +229,11 @@ class MemoryManager:
 
         self._init_database()
         if self.require_empty_memory:
-            try:
-                with open(self.db_path, "r", encoding="utf-8") as handle:
-                    existing = json.load(handle)
-            except (FileNotFoundError, json.JSONDecodeError):
-                existing = {}
-            if existing:
+            existing_count = self._case_store.count()
+            if existing_count:
                 raise RuntimeError(
-                    f"Empty-memory run requested but {self.db_path} contains "
-                    f"{len(existing)} cases"
+                    f"Empty-memory run requested but {self.sqlite_path} contains "
+                    f"{existing_count} cases"
                 )
         self.load()
 
@@ -295,13 +257,17 @@ class MemoryManager:
             modified = self._normalize_root_causes_list(
                 info.get("modified_components", roots)
             )
+            old_time = float(info.get("old_time") or 0.0)
+            new_time = float(info.get("new_time") or old_time)
+            improvement = (old_time - new_time) / max(abs(old_time), 1e-8)
+            meaningful = improvement >= float(self.agent_config.get("localization_min_improvement", 0.1))
             label_vec = build_component_labels(
                 roots,
-                info.get("label", "positive"),
+                "positive" if meaningful else "negative",
                 label_space,
                 modified_components=modified,
             )
-            selected_vec = [1 if r in roots else 0 for r in label_space]
+            selected_vec = [1 if r in modified else 0 for r in label_space]
 
             duration = info.get("new_time", 0.0)
 
@@ -357,7 +323,7 @@ class MemoryManager:
         os.makedirs(output_dir, exist_ok=True)
 
         train_dataloader, _, _, train_len, _, _, _ = load_dataset_tensor_valid(
-            csv_path, batch_size=batch_size, device=device
+            csv_path, batch_size=batch_size, device=device, train_all=True
         )
 
         if not hasattr(self, "_rcrank_predictor") or self._rcrank_predictor is None:
@@ -392,6 +358,7 @@ class MemoryManager:
 
         # 3) Training loop
         print("Starting finetune")
+        optimizer_steps = 0
         for epoch_idx in range(epochs):
             epoch_total_loss = 0.0
             epoch_bce_loss = 0.0
@@ -425,6 +392,15 @@ class MemoryManager:
                 if modified_counts is not None:
                     modified_counts = modified_counts.to(device).float()
 
+                # Eq. 10 skips an update when the batch has no valid RAWS
+                # labels. This also avoids Adam moving on stale momentum.
+                weights = raws_supervision_weights(
+                    labels, selected_components, tuning_attempts, eta,
+                    modified_counts=modified_counts, rho=self.attribution_rho,
+                )
+                if not weights.any():
+                    continue
+
                 # Text encoding
                 sql = predictor.tokenizer(
                     sql_texts,
@@ -457,6 +433,7 @@ class MemoryManager:
 
                     total_loss.backward()
                     optimizer.step()
+                    optimizer_steps += 1
                     epoch_total_loss += total_loss.item()
 
             # Record training logs
@@ -468,6 +445,10 @@ class MemoryManager:
                 f"Masked-BCE finetune epoch {epoch_idx}: total_loss={avg_total_loss:.6f}, "
                 f"bce_loss={avg_bce_loss:.6f}, auxiliary_loss={avg_auxiliary_loss:.6f}"
             )
+
+        if optimizer_steps == 0:
+            logger.info("Skipping Predictor update: no reliable RAWS labels")
+            return None
 
         # 4) Save weights
         best_path = os.path.join(output_dir, "best_model.pt")
@@ -515,22 +496,19 @@ class MemoryManager:
         )
 
         # reload predictor
-        self._reload_predictor(best_model, csv_path, self.finetune_device)
+        if best_model is not None:
+            self._reload_predictor(best_model, csv_path, self.finetune_device)
+            self.invalidate_query_embedding()
         self._last_finetune_count = total
 
     def _init_database(self):
-        if not os.path.exists(self.db_path):
-            with open(self.db_path, "w") as f:
-                json.dump({}, f)
+        self._case_store = SQLiteCaseStore(self.sqlite_path, self.db_path)
 
     def _generate_island_keys(self, root_cause_types):
         keys = []
         for i in range(1, len(root_cause_types) + 1):
             keys.extend([frozenset(pair) for pair in itertools.combinations(root_cause_types, i)])
         return keys
-
-    def _build_case_reflection(self, case_info):
-        return self.summary_agent.reflect_case(case_info)
 
     def _get_case_cluster_embedding(self, case):
         if case.id in self._case_embedding_cache:
@@ -541,6 +519,14 @@ class MemoryManager:
             embedding = embedding.detach().cpu().numpy().tolist()
         else:
             embedding = list(embedding)
+        components = self._normalize_root_causes_list(
+            case.case_info.get("localized_components", case.case_info.get("root_causes"))
+        )
+        binary_components = [float(label in components) for label in self.root_cause_types]
+        old_time = float(case.case_info.get("old_time") or 0.0)
+        new_time = float(case.case_info.get("new_time") or old_time)
+        improvement = (old_time - new_time) / max(abs(old_time), 1e-8)
+        embedding = list(embedding) + binary_components + [improvement]
         self._case_embedding_cache[case.id] = embedding
         return embedding
 
@@ -711,9 +697,7 @@ class MemoryManager:
 
         if case.id not in nearest_experience.case_ids:
             nearest_experience.case_ids.append(case.id)
-        refreshed = self._refresh_experience(nearest_experience.id, experience=nearest_experience)
-        if refreshed is not None:
-            self._update_experience_summary(refreshed)
+        self._refresh_experience(nearest_experience.id, experience=nearest_experience)
         return True
 
     def _sync_case_to_experiences(self, case):
@@ -761,13 +745,30 @@ class MemoryManager:
             "summary": "".join(lines).strip() or "None.",
         }
 
+    def get_query_tuning_history(self, query_id, limit=None):
+        """Return actions and outcomes for the query's tuning trajectory."""
+        history = []
+        for case in self.cases.values():
+            info = case.case_info
+            if str((info.get("query_info") or {}).get("query_id")) != str(query_id):
+                continue
+            old_time = float(info.get("old_time") or 0.0)
+            new_time = float(info.get("new_time") or old_time)
+            history.append({
+                "action": info.get("fix_action", ""),
+                "modified_components": self._normalize_root_causes_list(
+                    info.get("modified_components", [])
+                ),
+                "improvement": (old_time - new_time) / max(abs(old_time), 1e-8),
+            })
+        if limit is None:
+            return history
+        limit = max(0, int(limit))
+        return history[-limit:] if limit else []
+
     def add_case(self, case):
         self._validate_and_route_root_causes(case)
         self.cases[case.id] = case
-        self._enforce_archive_limit()
-
-        self._update_archive(case)
-        self._update_best_case(case)
 
         root_causes_key = self._normalize_root_causes(case.case_info.get("root_causes"))
         if root_causes_key in self.islands:
@@ -812,23 +813,11 @@ class MemoryManager:
 
     def save_to_memory(self, new_case=None):
         if new_case is not None:
-            try:
-                with open(self.db_path, "r") as f:
-                    data_to_save = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                data_to_save = {}
-
-            data_to_save[new_case.id] = new_case.case_info
-
-            with open(self.db_path, "w") as f:
-                json.dump(data_to_save, f)
+            self._case_store.upsert(new_case.id, new_case.case_info)
         else:
-            # full save
-            with open(self.db_path, "w") as f:
-                data_to_save = {}
-                for cid, case in self.cases.items():
-                    data_to_save[cid] = case.case_info
-                json.dump(data_to_save, f)
+            self._case_store.replace_all(
+                {cid: case.case_info for cid, case in self.cases.items()}
+            )
 
     def save_case(
         self,
@@ -842,6 +831,8 @@ class MemoryManager:
         round_num=None,
         used_cases=None,
         modified_components=None,
+        validation_status=None,
+        retrieval_state_counts=None,
     ):
         """
         Save a case to memory
@@ -898,13 +889,12 @@ class MemoryManager:
             "old_time": old_time,
             "new_time": new_time,
             "label": label,
+            "validation_status": validation_status,
+            "retrieval_state_counts": retrieval_state_counts,
             "approve_time": approve_time,
             "tuning_attempts": tuning_attempts,
             "used_cases": self._normalize_used_cases(used_cases),
         }
-        case_info["reflection"] = self._build_case_reflection(case_info)
-        case_info["reflection_source"] = "summary_agent"
-
         sql_embedding = self.build_sql_embedding(query_info)
         action_embedding = self.build_action_embedding(str(fix_action))
 
@@ -955,36 +945,31 @@ class MemoryManager:
         return [self.cases[cid] for cid in ids]
 
     def load(self):
-        if os.path.exists(self.db_path):
-            with open(self.db_path, "r") as f:
-                data = json.load(f)
-                for cid, case_info in data.items():
-                    case = self._build_memory_case_from_info(cid, case_info)
-                    self.cases[cid] = case
+        for cid, case_info in self._case_store.iter_cases():
+            case = self._build_memory_case_from_info(cid, case_info)
+            self.cases[cid] = case
 
-                    root_causes = case.case_info.get("root_causes")
-                    if root_causes:
-                        island_key = self._normalize_root_causes(root_causes)
-                        self.islands[island_key].add(cid)
+            root_causes = case.case_info.get("root_causes")
+            if root_causes:
+                island_key = self._normalize_root_causes(root_causes)
+                self.islands[island_key].add(cid)
 
-                positive_cases = [c for c in self.cases.values() if c.case_info.get("label") == "positive"]
-                positive_cases.sort(key=lambda c: c.metrics.get("approve_time", 0.0), reverse=True)
-                self.archive = set([c.id for c in positive_cases[: self.archive_size]])
-            self._last_finetune_count = len(self.cases)
-            if not self.disable_experience_bootstrap:
-                self._bootstrap_experiences()
-            # self._last_finetune_count = 0
-            # self._maybe_finetune()
-        else:
-            self._last_finetune_count = 0
+        self._last_finetune_count = len(self.cases)
+        if not self.disable_experience_bootstrap:
+            self._bootstrap_experiences()
 
     def _build_memory_case_from_info(self, case_id, case_info):
         case_info = dict(case_info)
+        case_info.pop("reflection", None)
+        case_info.pop("reflection_source", None)
         case_info["root_causes"] = self._normalize_root_causes_list(case_info.get("root_causes"))
+        case_info["localized_components"] = self._normalize_root_causes_list(
+            case_info.get("localized_components", case_info["root_causes"])
+        )
+        case_info["modified_components"] = self._normalize_root_causes_list(
+            case_info.get("modified_components", case_info["root_causes"])
+        )
         case_info["tuning_attempts"] = self._normalize_tuning_attempts(case_info.get("tuning_attempts"))
-        if "reflection" not in case_info:
-            case_info["reflection"] = self._build_case_reflection(case_info)
-            case_info["reflection_source"] = "summary_agent"
         raw_info = case_info["query_info"]
 
         if "is_rewrite" not in raw_info:
@@ -1012,9 +997,6 @@ class MemoryManager:
     def _feature_coords_to_key(self, coords):
         return "-".join(str(c) for c in coords)
 
-    def _is_better(self, case1, case2):
-        return case1.metrics.get("approve_time", 0.0) > case2.metrics.get("approve_time", 0.0)
-
     # select the best case by approve_time
     def best_by_approve(self, cases):
         if not cases:
@@ -1023,42 +1005,6 @@ class MemoryManager:
             cases,
             key=lambda c: c.case_info.get("approve_time") or c.metrics.get("approve_time", 0.0),
         )
-
-    def _update_archive(self, case):
-        # only positive cases are allowed to enter archive
-        if case.case_info.get("label") != "positive":
-            return
-
-        if len(self.archive) < self.archive_size:
-            self.archive.add(case.id)
-            return
-        archive_cases = [self.cases[aid] for aid in self.archive]
-        worst_case = min(archive_cases, key=lambda c: c.metrics.get("approve_time", 0.0))
-        if self._is_better(case, worst_case):
-            self.archive.remove(worst_case.id)
-            self.archive.add(case.id)
-
-    def _update_best_case(self, case):
-        # only positive cases are allowed to become best_case
-        if case.case_info.get("label") != "positive":
-            return
-
-        if self.best_case_id is None or self._is_better(case, self.cases[self.best_case_id]):
-            self.best_case_id = case.id
-
-    def _enforce_archive_limit(self):
-        if len(self.archive) > self.archive_size:
-            # sort by approve_time
-            archive_cases = [self.cases[case_id] for case_id in self.archive if case_id in self.cases]
-            sorted_archive_cases = sorted(archive_cases, key=lambda c: c.metrics.get("approve_time"))
-
-            # remove the worst cases
-            to_remove_count = len(self.archive) - self.archive_size
-            to_remove_cases = sorted_archive_cases[:to_remove_count]
-
-            for case in to_remove_cases:
-                if case.id in self.archive:
-                    self.archive.remove(case.id)
 
     def retrieve_cases(
         self,
@@ -1078,8 +1024,10 @@ class MemoryManager:
             neg_n = self.retrieval_negative_cases
         if self.retrieval_mode == "static":
             retrieval = self.retrieve_static_cases(query_info, root_causes, pos_n, neg_n, mode)
-        elif self.retrieval_mode == "similarity":
+        elif self.retrieval_mode in {"similarity", "bootstrap"}:
             retrieval = self.retrieve_similarity_cases(query_info, root_causes, pos_n, neg_n, mode)
+        elif self.retrieval_mode == "heuristic":
+            retrieval = self.retrieve_heuristic_cases(query_info, root_causes, pos_n, neg_n, mode)
         elif self.retrieval_mode in {"supervised", "utility", "q_utility"}:
             retrieval = self.retrieve_supervised_cases(
                 query_info,
@@ -1089,10 +1037,12 @@ class MemoryManager:
                 mode,
                 state_counts=state_counts,
             )
-        else:
+        elif self.retrieval_mode in {"dynamic", "frozen_rl"}:
             retrieval = self.retrieve_dynamic_cases(
                 query_info, root_causes, pos_n, neg_n, mode, state_counts=state_counts
             )
+        else:
+            raise ValueError(f"Unknown retrieval_mode: {self.retrieval_mode}")
 
         retrieved_case_ids = []
         for case_info in retrieval.get("positive", []) + retrieval.get("negative", []):
@@ -1103,6 +1053,96 @@ class MemoryManager:
         experience_payload = self.retrieve_experiences(retrieved_case_ids)
         retrieval["experiences"] = experience_payload.get("summary", "None.")
         return retrieval
+
+    def retrieve_heuristic_cases(self, query_info, root_causes, pos_n=1, neg_n=0, mode="exploit"):
+        """Use similarity order, moving past a case after repeated failed actions."""
+        root_causes = self._normalize_root_causes_list(root_causes)
+        target = set(root_causes)
+        candidates = []
+        for case in self.cases.values():
+            case_roots = set(self._normalize_root_causes_list(case.case_info.get("root_causes")))
+            matches = bool(case_roots.intersection(target))
+            if matches == (mode == "exploit"):
+                candidates.append(case)
+
+        candidate_ids = [case.id for case in candidates]
+        ranked = self.retrieve_embedding(query_info, top_n=len(candidates), case_ids=candidate_ids) if candidates else []
+        if not ranked and candidates:
+            ranked = sorted(
+                candidates,
+                key=lambda case: case.case_info.get("approve_time", 0.0),
+                reverse=True,
+            )
+
+        eligible = [
+            case for case in ranked
+            if (case.case_info.get("label") == "positive" and pos_n > 0)
+            or (case.case_info.get("label") != "positive" and neg_n > 0)
+        ]
+        query_id = str(getattr(query_info, "query_id", ""))
+        state = self._heuristic_retrieval_state.setdefault(
+            query_id, {"last_case_id": None, "consecutive_failures": 0, "excluded_case_ids": set()}
+        )
+        excluded = state["excluded_case_ids"]
+        selected = next((case for case in eligible if case.id not in excluded), None)
+        if selected is None and eligible:
+            # All available alternatives have been tried; start a new cycle.
+            excluded.clear()
+            selected = eligible[0]
+
+        selected_info = None
+        if selected is not None:
+            selected_info = dict(selected.case_info, case_id=selected.id)
+        logger.info(
+            "[Retriever][heuristic] SQL %s candidates=%d selected_case=%s "
+            "skipped_cases=%s failure_threshold=%d",
+            query_id,
+            len(eligible),
+            selected.id if selected else None,
+            sorted(excluded),
+            self.heuristic_failure_threshold,
+        )
+        positive = [selected_info] if selected_info and selected_info.get("label") == "positive" else []
+        negative = [selected_info] if selected_info and selected_info.get("label") != "positive" else []
+        return {
+            "mode": "heuristic",
+            "policy": "similarity_failure_switch",
+            "exploration": False,
+            "candidate_cases": [dict(case.case_info, case_id=case.id) for case in candidates],
+            "selected_case_ids": [selected.id] if selected else [],
+            "selected_case": selected_info,
+            "positive": positive,
+            "negative": negative,
+        }
+
+    def record_heuristic_feedback(self, query_id, case_id, improved):
+        """Count consecutive failures for the selected case and skip it at the threshold."""
+        if self.retrieval_mode != "heuristic" or not case_id:
+            return
+        state = self._heuristic_retrieval_state.setdefault(
+            str(query_id), {"last_case_id": None, "consecutive_failures": 0, "excluded_case_ids": set()}
+        )
+        if improved:
+            state["last_case_id"] = case_id
+            state["consecutive_failures"] = 0
+            state["excluded_case_ids"].clear()
+            logger.info("[Retriever][heuristic] SQL %s case=%s improved; failure streak reset", query_id, case_id)
+            return
+        if state["last_case_id"] != case_id:
+            state["last_case_id"] = case_id
+            state["consecutive_failures"] = 0
+        state["consecutive_failures"] += 1
+        logger.info(
+            "[Retriever][heuristic] SQL %s case=%s no improvement (%d/%d)",
+            query_id, case_id, state["consecutive_failures"], self.heuristic_failure_threshold,
+        )
+        if state["consecutive_failures"] >= self.heuristic_failure_threshold:
+            state["excluded_case_ids"].add(case_id)
+            state["consecutive_failures"] = 0
+            logger.info(
+                "[Retriever][heuristic] SQL %s switching away from case %s on next retrieval",
+                query_id, case_id,
+            )
 
     def retrieve_supervised_cases(
         self,
@@ -1149,26 +1189,27 @@ class MemoryManager:
                 "selected_case": None,
             }
 
-        scored = []
         query_payload = query_info.__dict__ if hasattr(query_info, "__dict__") else query_info
-        for case_info in candidates:
-            try:
-                utility = float(
-                    self.retriever.predict_case_value(
-                        query_payload,
-                        case_info,
-                        root_causes,
-                        state_counts=state_counts,
+        try:
+            utilities = self.retriever.predict_case_values(
+                query_payload, candidates, root_causes, state_counts=state_counts,
+            )
+        except Exception as exc:
+            logger.warning("Batched frozen retriever scoring failed; retrying per case: %s", exc)
+            utilities = []
+            for case_info in candidates:
+                try:
+                    utility = float(self.retriever.predict_case_value(
+                        query_payload, case_info, root_causes, state_counts=state_counts,
+                    ))
+                except Exception as case_exc:
+                    logger.warning(
+                        "Frozen retriever utility prediction failed for case %s: %s",
+                        case_info.get("case_id"), case_exc,
                     )
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Frozen retriever utility prediction failed for case %s: %s",
-                    case_info.get("case_id"),
-                    exc,
-                )
-                utility = float("-inf")
-            scored.append((utility, case_info))
+                    utility = float("-inf")
+                utilities.append(utility)
+        scored = list(zip(utilities, candidates))
 
         scored.sort(key=lambda item: (item[0], str(item[1].get("case_id", ""))), reverse=True)
         utility, selected_case = scored[0]
@@ -1211,7 +1252,7 @@ class MemoryManager:
         candidates = []
         for case in self.cases.values():
             case_roots = set(self._normalize_root_causes_list(case.case_info.get("root_causes")))
-            if (mode == "exploit" and case_roots.intersection(target)) or (
+            if self.retrieval_mode == "bootstrap" or (mode == "exploit" and case_roots.intersection(target)) or (
                 mode == "explore" and not case_roots.intersection(target)
             ):
                 info = dict(case.case_info)
@@ -1246,6 +1287,20 @@ class MemoryManager:
                     key=lambda case: case.case_info.get("approve_time", 0.0),
                     reverse=True,
                 )
+
+        if self.retrieval_mode == "bootstrap":
+            selected = ranked[0]
+            info = dict(selected.case_info, case_id=selected.id)
+            return {
+                "mode": "bootstrap",
+                "policy": "epsilon_similarity_bootstrap",
+                "exploration": explore,
+                "candidate_cases": [dict(case.case_info, case_id=case.id) for case in candidates],
+                "selected_case_ids": [selected.id],
+                "selected_case": info,
+                "positive": [info] if info.get("label") == "positive" else [],
+                "negative": [info] if info.get("label") != "positive" else [],
+            }
 
         positives, negatives = [], []
         selected_ids = []
@@ -1286,25 +1341,9 @@ class MemoryManager:
         if not all_cases:
             return {"mode": mode, "positive": [], "negative": []}
 
-        # Filter candidate cases based on mode
-        if mode == "exploit":
-            # Exploit mode: select cases with same root cause
-            candidate_cases = []
-            for case in all_cases:
-                case_root_causes = self._normalize_root_causes_list(case.case_info.get("root_causes"))
-                if any(rc in case_root_causes for rc in root_causes):
-                    case_info = dict(case.case_info)
-                    case_info["case_id"] = case.id
-                    candidate_cases.append(case_info)
-        elif mode == "explore":
-            # Explore mode: select cases with different root causes
-            candidate_cases = []
-            for case in all_cases:
-                case_root_causes = self._normalize_root_causes_list(case.case_info.get("root_causes"))
-                if not any(rc in case_root_causes for rc in root_causes):
-                    case_info = dict(case.case_info)
-                    case_info["case_id"] = case.id
-                    candidate_cases.append(case_info)
+        # Eq. 13 gives every demonstration a nonzero prior. Keep the full
+        # memory as candidates; component alignment is scored by the retriever.
+        candidate_cases = [dict(case.case_info, case_id=case.id) for case in all_cases]
 
         # If no candidate cases, return empty result
         if not candidate_cases:
@@ -1354,12 +1393,16 @@ class MemoryManager:
             else:
                 negative_cases.append(case_info)
 
-        # Limit quantity
-        positive_cases = positive_cases[:pos_n]
-        negative_cases = negative_cases[:neg_n]
+        # The sampled demonstration must reach the prompt even when its
+        # historical outcome has the other label than the default quota.
+        selected_case = selected_cases[0][0] if selected_cases else None
 
         return {
             "mode": mode,
+            "policy": "diagnosis_prior_soft_q",
+            "candidate_cases": candidate_cases,
+            "selected_case": selected_case,
+            "selected_case_ids": [case.get("case_id") for case, _ in selected_cases],
             "positive": positive_cases,
             "negative": negative_cases,
         }
@@ -1643,16 +1686,42 @@ class MemoryManager:
         case_sims.sort(reverse=True, key=lambda x: x[0])
         return [c for _, c in case_sims[:top_n]]
 
+    @staticmethod
+    def _query_embedding_key(query_info):
+        state = query_info.__dict__ if hasattr(query_info, "__dict__") else query_info
+        payload = json.dumps(state, sort_keys=True, default=str)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def cache_query_embedding(self, query_info, embedding):
+        """Share one query-state encoding across the current tuning iteration."""
+        self._current_query_embedding = (
+            self._query_embedding_key(query_info),
+            [float(value) for value in embedding],
+        )
+
+    def invalidate_query_embedding(self):
+        """Discard query encodings after the Predictor weights change."""
+        self._current_query_embedding = None
+        if self.retriever is not None:
+            self.retriever._query_embedding_cache.clear()
+
     def build_sql_embedding(self, query_info):
+        cache_key = self._query_embedding_key(query_info)
+        cached = getattr(self, "_current_query_embedding", None)
+        if cached is not None and cached[0] == cache_key:
+            return list(cached[1])
         # use the RCRankPredictor
         if not hasattr(self, "_rcrank_predictor") or self._rcrank_predictor is None:
             from agent.plan.online_predict import RCRankPredictor
 
             if self._planner_config is None:
+                predictor_dir = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", "plan", "model_res")
+                )
                 self._planner_config = {
                     "device": "cpu",
-                    "model_path": "/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen eta0.07/best_model.pt",
-                    "train_data_path": "/root/DREAM/src/agent/plan/slow_sql_data_gen.csv",
+                    "model_path": os.path.join(predictor_dir, "predictor.pt"),
+                    "train_data_path": os.path.join(predictor_dir, "predictor_training.csv"),
                     "opt_threshold": 0.5,
                     "num_classes": 4,
                 }
@@ -1722,10 +1791,21 @@ class MemoryManager:
 
         # get the embedding
         emb = predictor.model.get_embedding(sql, plan, timeseries, log)
-        return emb.squeeze(0).cpu().numpy().tolist()
+        embedding = emb.squeeze(0).cpu().numpy().tolist()
+        self._current_query_embedding = (cache_key, embedding)
+        return list(embedding)
 
     def build_action_embedding(self, action):
         from transformers import BertModel, BertTokenizer
+
+        # Historical cases often repeat exactly the same tuning statement.
+        # Reuse its frozen BERT representation during archive loading.
+        cache = getattr(self, "_action_embedding_cache", None)
+        if cache is None:
+            cache = self._action_embedding_cache = {}
+        cached = cache.get(action)
+        if cached is not None:
+            return list(cached)
 
         if not hasattr(self, "_bert_tokenizer"):
             bert_path = self.bert_model_path
@@ -1741,7 +1821,9 @@ class MemoryManager:
             cls_emb = outputs.last_hidden_state[:, 0, :]  # [CLS] vector, 768 dimensions
             # Directly truncate to 64 dimensions (take first 64 dimensions)
             truncated_emb = cls_emb[:, :64]  # 768 -> 64
-        return truncated_emb.squeeze(0).cpu().numpy().tolist()
+        embedding = truncated_emb.squeeze(0).cpu().numpy().tolist()
+        cache[action] = embedding
+        return list(embedding)
 
     def _normalize_root_causes(self, root_causes):
         if root_causes is None:
@@ -1795,11 +1877,11 @@ class MemoryManager:
         if ("/*+" in query_text) or ("/*+" in rewrite_text):
             inferred.add("hint")
         if rewrite_text and re.sub(r"/\*\+[\s\S]*?\*/", "", rewrite_text).strip() != query_text:
-            inferred.add("query")
+            inferred.add("rewrite")
         return frozenset(inferred) if inferred else frozenset()
 
     def infer_modified_components(self, fix_action, query_info, rewrite_sql=""):
-        """Return components changed by an evaluated action for AAWS."""
+        """Return components changed by an evaluated action for RAWS."""
         return self._normalize_root_causes_list(
             self._infer_root_causes_from_action(fix_action, query_info, rewrite_sql)
         )
@@ -1808,7 +1890,7 @@ class MemoryManager:
         # root_causes is the localized space B_t.  The components actually
         # changed by an action are stored separately in modified_components;
         # inferring them here would destroy the attribution information used
-        # by AAWS and the retriever state.
+        # by RAWS and the retriever state.
         case.case_info["root_causes"] = self._normalize_root_causes_list(
             case.case_info.get("root_causes")
         )
@@ -1825,38 +1907,6 @@ class MemoryManager:
         if key not in self.islands:
             self.islands[key] = set()
 
-    def explore_root_from_archive(self, query_info, exclude_roots):
-        """
-        retrieve the most similar SQL root cause from archive
-        return the most similar SQL root cause, if not found, return None
-        """
-        if not self.archive:
-            return None
-
-        exclude_roots = exclude_roots
-
-        archive_cases = [self.cases[aid] for aid in self.archive]
-        if not archive_cases:
-            return None
-
-        try:
-            similar_cases = self.retrieve_embedding(query_info, top_n=len(archive_cases), case_ids=list(self.archive))
-        except Exception as exc:
-            logger.warning(
-                "Archive exploration failed for SQL %s: %s",
-                getattr(query_info, "query_id", "unknown"),
-                exc,
-                exc_info=True,
-            )
-            return None
-
-        for case in similar_cases:
-            case_root_str = str(self._normalize_root_causes(case.case_info.get("root_causes")))
-            if case_root_str not in exclude_roots:
-                return case.case_info.get("root_causes")
-
-        return None
-
     def save_experience(
         self,
         query_info,
@@ -1864,6 +1914,7 @@ class MemoryManager:
         root_causes,
         reward,
         next_query_info_id=None,
+        query_info_id=None,
         done=False,
         state_counts=None,
         candidate_cases=None,
@@ -1891,13 +1942,22 @@ class MemoryManager:
 
         os.makedirs(os.path.dirname(self.samples_save_path), exist_ok=True)
 
+        query_data = query_info.__dict__ if hasattr(query_info, "__dict__") else query_info
+        query_id = str(query_data.get("query_id", ""))
+        if query_info_id is None:
+            query_info_id = self.generate_next_query_info_id(
+                query_id, round_num=self.current_round
+            )
+
         # Generate next_query_info_id if not provided
         if next_query_info_id is None and not done:
-            next_query_info_id = self.generate_next_query_info_id(query_info.query_id)
+            next_query_info_id = self.generate_next_query_info_id(query_id)
 
         # Prepare current experience dict
         exp_dict = {
-            "query_info": query_info.__dict__ if hasattr(query_info, "__dict__") else query_info,
+            "query_id": query_id,
+            "query_info_id": str(query_info_id),
+            "query_info": query_data,
             "case_info": case_info,
             "root_causes": self._normalize_root_causes_list(root_causes),
             "reward": float(reward),
@@ -1906,6 +1966,7 @@ class MemoryManager:
             "state": {
                 "success_count": int((state_counts or {}).get("success_count", 0)),
                 "failure_count": int((state_counts or {}).get("failure_count", 0)),
+                "history_case_ids": list((state_counts or {}).get("history_case_ids", [])),
                 "localized_components": self._normalize_root_causes_list(
                     (state_counts or {}).get("localized_components", root_causes)
                 ),
@@ -1914,7 +1975,14 @@ class MemoryManager:
                 "query_info_id": next_query_info_id if next_query_info_id else None,
                 "available": False if next_query_info_id else True,
             },
-            "candidate_cases": candidate_cases or [],
+            # The offline trainer reconstructs the candidate set from the
+            # ordered memory archive. Full snapshots here made each JSONL row
+            # grow linearly with memory, even though no consumer reads them.
+            "candidate_case_ids": [
+                case.get("case_id") if isinstance(case, dict) else str(case)
+                for case in (candidate_cases or [])
+                if (case.get("case_id") if isinstance(case, dict) else case)
+            ],
             "selected_case_id": selected_case_id,
             "retrieval_policy": retrieval_policy,
             "exploration": bool(exploration),

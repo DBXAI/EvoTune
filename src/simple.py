@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from config_paths import resolve_config_paths
 
 
 def setup_logging():
@@ -124,6 +125,7 @@ async def main():
     try:
         with open(args.config, "r", encoding="utf-8") as f:
             configs = json.load(f)
+        resolve_config_paths(configs, args.config)
     except FileNotFoundError:
         logger.error(f"Configuration file {args.config} not found.")
         return

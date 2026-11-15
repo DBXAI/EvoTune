@@ -2,8 +2,8 @@ import json
 import re
 
 
-CANONICAL_COMPONENTS = ("index", "knob", "hint", "query")
-SMALL_MODEL_COMPONENTS = ("index", "hint", "knob", "query")
+CANONICAL_COMPONENTS = ("index", "knob", "hint", "rewrite")
+SMALL_MODEL_COMPONENTS = ("index", "hint", "knob", "rewrite")
 
 LEGACY_COMPONENT_LABELS = {
     "index": "index",
@@ -15,16 +15,17 @@ LEGACY_COMPONENT_LABELS = {
     "hint": "hint",
     "suboptimal plan optimizer": "hint",
     "plan optimizer": "hint",
-    "query": "query",
-    "poorly written queries": "query",
-    "poorly written query": "query",
+    "rewrite": "rewrite",
+    "query": "rewrite",  # Older case archives use this label.
+    "poorly written queries": "rewrite",
+    "poorly written query": "rewrite",
 }
 
 COMPONENT_ACTION_SPACE_NAMES = {
     "index": "Index Space",
     "knob": "Knob Space",
     "hint": "Hint Space",
-    "query": "Query Rewrite Space",
+    "rewrite": "Query Rewrite Space",
 }
 
 _COMPONENT_ORDER = {label: idx for idx, label in enumerate(CANONICAL_COMPONENTS)}

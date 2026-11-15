@@ -1,14 +1,10 @@
-import asyncio
 import os
 import sys
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 # Add RCRank to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.append(current_dir)
 rcrank_path = os.path.join(current_dir, "RCRank")
 if rcrank_path not in sys.path:
     sys.path.append(rcrank_path)
@@ -66,16 +62,6 @@ class Planner:
 
         self.root_cause_model = self.agent_config.get("root_cause_llm_model")
 
-    def _run_agent_sync(self, agent, prompt):
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return Runner.run_sync(starting_agent=agent, input=prompt)
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(Runner.run_sync, starting_agent=agent, input=prompt)
-            return future.result()
-
     def encode_plan(self, query_plan):
         df = pd.DataFrame(
             [{"plan_json": (json.dumps({"Plan": query_plan}) if isinstance(query_plan, dict) else query_plan)}]
@@ -86,13 +72,17 @@ class Planner:
 
         return encoded_df["json_plan_tensor"].iloc[0]
 
-    def model_predict(self, query_info):
+    def model_predict(self, query_info, precomputed=None):
         if self.predictor is None:
             raise RuntimeError("Lightweight localization model is not configured")
         start_time = time.perf_counter()
-        query, plan, timeseries, log = self._build_prediction_input(query_info)
-
-        pred_label_opt, pred_label = self.predictor.predict(query=query, plan=plan, timeseries=timeseries, log=log)
+        if precomputed is None:
+            query, plan, timeseries, log = self._build_prediction_input(query_info)
+            pred_label_opt, pred_label = self.predictor.predict(
+                query=query, plan=plan, timeseries=timeseries, log=log
+            )
+        else:
+            pred_label_opt, pred_label = self.predictor.predict(precomputed=precomputed)
 
         result = self._extract_top_root_cause(pred_label, pred_label_opt)
         result["pred_label_opt"] = pred_label_opt.cpu().numpy()
@@ -106,25 +96,33 @@ class Planner:
         )
         return result
 
-    def context_embedding(self, query_info):
+    def context_embedding(self, query_info, *, return_precomputed=False):
         """Encode the current query state for contextual expert selection."""
         if self.predictor is None:
-            return None
+            return (None, None) if return_precomputed else None
         query, plan, timeseries, log = self._build_prediction_input(query_info)
-        return self.predictor.get_context_embedding(
+        kwargs = dict(
             query=query,
             plan=plan,
             timeseries=timeseries,
             log=log,
         )
+        if return_precomputed and getattr(self.predictor, "supports_precomputed_context", False):
+            return self.predictor.get_context_embedding(
+                **kwargs, return_precomputed=True
+            )
+        context = self.predictor.get_context_embedding(**kwargs)
+        return (context, None) if return_precomputed else context
 
     def diagnosis_agent(self, prompt):
-        agent = Agent(
-            name="RootCauseLLM",
-            model=self.root_cause_model,
-            instructions=get_root_cause_llm_instructions(),
+        return Runner.run_sync(
+            starting_agent=Agent(
+                name="RootCauseLLM",
+                model=self.root_cause_model,
+                instructions=get_root_cause_llm_instructions(),
+            ),
+            input=prompt,
         )
-        return self._run_agent_sync(agent, prompt)
 
     def llm_predict(self, query_info, tuning_history=None, consecutive_no_improvement=0):
         start_time = time.perf_counter()
@@ -140,11 +138,11 @@ class Planner:
             database_info=self._build_database_info(),
             consecutive_no_improvement=consecutive_no_improvement,
         )
-        # logger.info(
-        #     "[Prompt][Detection][SQL %s]\n%s",
-        #     getattr(query_info, "query_id", "unknown"),
-        #     prompt,
-        # )
+        logger.info(
+            "[Prompt][Detection][SQL %s]\n%s",
+            getattr(query_info, "query_id", "unknown"),
+            prompt,
+        )
 
         run_result = self.diagnosis_agent(prompt)
         usage_metrics = extract_run_usage_metrics(run_result, "diag_llm")
@@ -222,9 +220,9 @@ class Planner:
         # issue type mapping
         issue_types = {
             0: "index",
-            1: "knob",
-            2: "hint",
-            3: "query",
+            1: "hint",
+            2: "knob",
+            3: "rewrite",
         }
 
         confidence_map = {
@@ -284,14 +282,21 @@ class Planner:
             return active_decision.root_causes, state
 
         context = None
+        precomputed = None
+        context_start = time.perf_counter()
         try:
-            context = self.context_embedding(query_info)
+            context, precomputed = self.context_embedding(
+                query_info, return_precomputed=True
+            )
+            if context is not None and hasattr(memory_manager, "cache_query_embedding"):
+                memory_manager.cache_query_embedding(query_info, context)
         except Exception as exc:
             logger.warning(
                 "Unable to build contextual bandit embedding for SQL %s: %s; using zero context",
                 getattr(query_info, "query_id", "unknown"),
                 exc,
             )
+        runtime_metrics["T_context_embedding"] = time.perf_counter() - context_start
         expert, samples = self.localization_selector.select_expert(
             state,
             self._allowed_localization_experts(),
@@ -300,7 +305,7 @@ class Planner:
         state.setdefault("localization", {})["last_samples"] = samples
 
         if expert == EXPERT_LIGHTWEIGHT:
-            result = self.model_predict(query_info)
+            result = self.model_predict(query_info, precomputed=precomputed)
         elif expert == EXPERT_LLM:
             result = self.llm_predict(
                 query_info,

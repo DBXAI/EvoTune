@@ -40,10 +40,8 @@ class TiDB:
         # Previous tuning runs may have left global/session variables changed;
         # every DREAM connection therefore reapplies the experiment defaults.
         self.knob_config = db_config.get("KNOB_CONFIG", {}) or {}
-        # DREAM's TiDB mode intentionally avoids the optional SQLSolver/QED
-        # equivalence check.  Candidate rewrites are still executed with the
-        # configured timeout below, which is the authoritative acceptance
-        # test for this experiment.
+        # SQLSolver/QED targets PostgreSQL. TiDB validates rewrites by
+        # comparing both query results with the configured timeout.
         self.skip_equivalence_validation = bool(
             db_config.get("skip_equivalence_validation", True)
         )
@@ -649,9 +647,8 @@ class TiDB:
             conn.commit()
 
     def check_sql_equivalence(self, sql1, sql2):
-        # Explicitly disabled for the OSSInsight DREAM run; SQL execution in
-        # evaluate_action remains the acceptance gate.
-        return True
+        # QED is unavailable for TiDB; the caller compares query results.
+        return None
 
     def compare_sql_results(self, sql1, sql2):
         sql1 = sql1.strip().rstrip(";")
@@ -660,6 +657,8 @@ class TiDB:
         conn = self.connect()
         with conn.cursor() as cursor:
             try:
+                cursor.execute(f"SET SESSION MAX_EXECUTION_TIME={self.query_timeout * 1000}")
+                cursor.execute(f"SET SESSION tidb_mem_quota_query={self.query_mem_quota_bytes}")
                 cursor.execute(sql1)
                 results1 = cursor.fetchall()
 

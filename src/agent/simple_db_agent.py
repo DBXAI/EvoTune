@@ -53,7 +53,6 @@ class SimpleDBAgent:
         self.diagnostic_model = self.agent_config.get("diagnostic_agent_model")
         self.api_settings = self.configs.get("API_SETTINGS")
         self.enable_action_define = self.agent_config.get("enable_action_define", True)
-        self.enable_action_pruning = self.agent_config.get("enable_action_pruning", True)
         # This experiment deliberately gives the direct LLM one historical
         # case in total.  Prefer a positive case and never add a negative
         # case when the configured values exceed that budget.

@@ -119,6 +119,36 @@ class DBAgent:
         return sql_without_hints.strip()
 
     @staticmethod
+    def _compose_actions(previous, candidate):
+        """Keep accepted configuration changes in execution order."""
+        previous = str(previous or "").strip()
+        candidate = str(candidate or "").strip()
+        if not candidate:
+            return previous
+        if not previous:
+            return candidate
+        separator = "\n" if previous.endswith(";") else ";\n"
+        return previous + separator + candidate
+
+    @classmethod
+    def _update_configuration(
+        cls, query_id, fix_action, query_text, old_time, trial_time, status,
+        pre_applied, current_actions, current_texts, best_actions, best_texts,
+        best_times,
+    ):
+        """Accept an improvement while preserving the best observed result."""
+        if status == -1 or trial_time >= old_time:
+            return False
+        previous = current_actions.get(query_id, "") if pre_applied else ""
+        current_actions[query_id] = cls._compose_actions(previous, fix_action)
+        current_texts[query_id] = query_text
+        if trial_time < best_times[query_id]:
+            best_times[query_id] = trial_time
+            best_actions[query_id] = current_actions[query_id]
+            best_texts[query_id] = query_text
+        return True
+
+    @staticmethod
     def _checkpoint_safe(value):
         if isinstance(value, dict):
             return {str(k): DBAgent._checkpoint_safe(v) for k, v in value.items()}
@@ -141,17 +171,31 @@ class DBAgent:
         next_round,
         consecutive_no_improvement=None,
         finished_queries=None,
+        next_query_index=0,
+        current_sql_actions=None,
+        current_sql_texts=None,
+        round_sql_times=None,
+        round_sql_actions=None,
     ):
         if not path:
             return
+        checkpoint_states = copy.deepcopy(sql_root_cause_states)
+        for state in checkpoint_states.values():
+            state.get("localization", {}).pop("experts", None)
         payload = {
             "best_sql_actions": best_sql_actions,
             "best_sql_times": best_sql_times,
             "best_sql_texts": best_sql_texts,
-            "sql_root_cause_states": sql_root_cause_states,
+            "current_sql_actions": current_sql_actions or {},
+            "current_sql_texts": current_sql_texts or {},
+            "sql_root_cause_states": checkpoint_states,
             "consecutive_no_improvement": consecutive_no_improvement or {},
             "finished_queries": sorted(finished_queries or []),
             "next_round": next_round,
+            "next_query_index": next_query_index,
+            "round_sql_times": round_sql_times or {},
+            "round_sql_actions": round_sql_actions or {},
+            "localization_expert_posteriors": self.planner.localization_selector.export_global_state(),
         }
         safe_payload = self._checkpoint_safe(payload)
         directory = os.path.dirname(os.path.abspath(path))
@@ -160,6 +204,11 @@ class DBAgent:
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(safe_payload, handle, ensure_ascii=False)
         os.replace(temporary, path)
+        model_path = self.memory_manager.retriever_model_path
+        if self.memory_manager.retrieval_mode == "dynamic" and model_path:
+            model_temporary = f"{model_path}.tmp"
+            self.memory_manager.retriever.save_model(model_temporary)
+            os.replace(model_temporary, model_path)
 
     async def run(
         self,
@@ -168,6 +217,7 @@ class DBAgent:
         duration,
         no_improvement_threshold=3,
         resume_state_path=None,
+        max_rounds=None,
     ):
         """
         Execute database optimization process
@@ -176,6 +226,7 @@ class DBAgent:
             slow_query_path: Path to slow query files
             order: Query order file
             duration: Timeout in hours, will continue optimization until timeout
+            max_rounds: Optional number of complete round-robin passes
             no_improvement_threshold: Threshold for no improvement attempts, switch root cause when reached
         """
         # Read workload
@@ -184,6 +235,10 @@ class DBAgent:
         best_sql_actions = {}
         best_sql_times = {}
         best_sql_texts = {}
+        resume_round_sql_times = {}
+        resume_round_sql_actions = {}
+        current_sql_actions = {}
+        current_sql_texts = {}
 
         # Track query-local localization state and feedback.
         sql_root_cause_states = {}
@@ -195,6 +250,7 @@ class DBAgent:
         # only in memory, so without this checkpoint a restart would silently
         # discard the previously discovered best actions.
         resume_round = 0
+        resume_query_index = 0
         if resume_state_path:
             try:
                 with open(resume_state_path, "r", encoding="utf-8") as handle:
@@ -204,7 +260,25 @@ class DBAgent:
                     {str(k): float(v) for k, v in resume_state.get("best_sql_times", {}).items()}
                 )
                 best_sql_texts.update(resume_state.get("best_sql_texts", {}))
+                resume_round_sql_times.update(
+                    {str(k): float(v) for k, v in resume_state.get("round_sql_times", {}).items()}
+                )
+                resume_round_sql_actions.update(resume_state.get("round_sql_actions", {}))
+                current_sql_actions.update(
+                    resume_state.get("current_sql_actions", best_sql_actions)
+                )
+                current_sql_texts.update(
+                    resume_state.get("current_sql_texts", best_sql_texts)
+                )
                 sql_root_cause_states.update(resume_state.get("sql_root_cause_states", {}))
+                for state in sql_root_cause_states.values():
+                    state["root_tried"] = {
+                        frozenset(self.memory_manager._normalize_root_causes_list(root))
+                        for root in state.get("root_tried", [])
+                    }
+                self.planner.localization_selector.load_global_state(
+                    resume_state.get("localization_expert_posteriors")
+                )
                 consecutive_no_improvement.update(
                     {
                         str(k): int(v)
@@ -213,6 +287,15 @@ class DBAgent:
                 )
                 finished_queries.update(resume_state.get("finished_queries", []))
                 resume_round = int(resume_state.get("next_round", 0)) - 1
+                resume_query_index = int(resume_state.get("next_query_index", 0))
+                if "next_query_index" not in resume_state and resume_round == 0:
+                    # Older checkpoints saved the first round after every
+                    # completed query without an explicit position.
+                    for query_path in queries_order:
+                        query_id = os.path.basename(query_path).removesuffix(".sql")
+                        if query_id not in best_sql_times:
+                            break
+                        resume_query_index += 1
                 if resume_round > 0:
                     logger.info(
                         "Loaded DREAM continuation state: next round %s, %d best query times",
@@ -225,8 +308,21 @@ class DBAgent:
         # Record start time
         start_time = time.time()
         round_idx = max(0, resume_round)
+        completed_rounds = 0
+        early_stop_patience = max(
+            1, int(self.agent_config.get("query_early_stop_patience", 10))
+        )
+        query_ids = {
+            os.path.basename(path).removesuffix(".sql") for path in queries_order
+        }
 
         while True:
+            if max_rounds is not None and completed_rounds >= max_rounds:
+                logger.info("Reached the requested maximum of %d rounds", max_rounds)
+                break
+            if query_ids and query_ids.issubset(finished_queries):
+                logger.info("All queries met an early-stopping criterion")
+                break
             current_time = time.time()
             elapsed_time = current_time - start_time
 
@@ -240,34 +336,58 @@ class DBAgent:
             # Set current round in memory_manager for generating next_query_info_id
             self.memory_manager.set_current_round(round_idx)
             round_start = time.time()
-            round_sql_times = {}
-            round_sql_actions = {}
+            continuing_partial_round = round_idx == resume_round + 1 and resume_query_index > 0
+            round_sql_times = dict(resume_round_sql_times) if continuing_partial_round else {}
+            round_sql_actions = dict(resume_round_sql_actions) if continuing_partial_round else {}
+            round_interrupted = False
+            next_query_index = 0
             for i, query_path in enumerate(queries_order):
+                if round_idx == resume_round + 1 and i < resume_query_index:
+                    continue
+                if time.time() - start_time >= duration * 3600:
+                    logger.info(
+                        "Reached timeout %sh before SQL %s/%s; ending the current round",
+                        duration,
+                        i + 1,
+                        len(queries_order),
+                    )
+                    round_interrupted = True
+                    next_query_index = i
+                    break
                 logger.info(f"Processing {i+1}/{len(queries_order)} SQL")
 
                 # Read slow SQL
                 query = open(query_path, "r", encoding="utf-8").read()
                 query_id = query_path.split("/")[-1].replace(".sql", "")
+                if query_id in finished_queries:
+                    continue
                 query = self.clean_query(query)
 
-                # Select SQL for diagnosis: prefer best SQL from history (with rewrite/hint), otherwise use original
+                # Reconstruct the currently accepted state for this query.
                 original_sql = query
-                collected_sql = best_sql_texts.get(query_id, original_sql)
+                collected_sql = current_sql_texts.get(query_id, original_sql)
 
                 # Apply previous best actions if they exist
                 pre_index_names = []
                 pre_knob_names = []
                 pre_applied = False
-                if query_id in best_sql_actions and best_sql_actions[query_id]:
-                    pre_fix_action = best_sql_actions[query_id]
+                had_pre_action = bool(current_sql_actions.get(query_id))
+                pre_apply_start = time.perf_counter()
+                if had_pre_action:
+                    pre_fix_action = current_sql_actions[query_id]
                     success, _, _, _ = self.db.execute(pre_fix_action)
                     if success:
                         pre_index_names = self.action_manager.extract_index_names(pre_fix_action)
                         pre_knob_names = self.action_manager.extract_knob_names(pre_fix_action)
                         pre_applied = True
+                    else:
+                        logger.warning("Unable to restore accepted actions for SQL %s", query_id)
+                        current_sql_actions[query_id] = ""
+                pre_apply_time = time.perf_counter() - pre_apply_start if had_pre_action else 0.0
 
                 # Collect query execution information
                 try:
+                    baseline_start = time.perf_counter()
                     result = self.db.run_sql_and_collect_all(collected_sql)
                 except Exception as e:
                     logger.error(f"SQL {query_id} error collecting SQL execution data: {e}", exc_info=True)
@@ -280,6 +400,18 @@ class DBAgent:
                     logger.info(f"SQL {query_id} skipping current SQL, continuing to next")
                     continue
 
+                baseline_metrics = merge_runtime_metrics(
+                    {
+                        "T_pre_apply": pre_apply_time,
+                        "T_baseline_collect": time.perf_counter() - baseline_start,
+                    },
+                    result.get("runtime_metrics"),
+                )
+                logger.info(
+                    "[Runtime][SQL %s] Baseline summary: %s",
+                    query_id,
+                    format_runtime_metrics(baseline_metrics),
+                )
                 logger.info(f"SQL {query_id} collected SQL execution time: {result['duration']}s")
 
                 # Build QueryInfo; if collected_sql differs from original_sql, treat as rewrite
@@ -298,6 +430,12 @@ class DBAgent:
                     best_sql_times[query_id] = query_info.execution_time
                     best_sql_actions[query_id] = ""
                     best_sql_texts[query_id] = collected_sql
+                current_sql_actions.setdefault(query_id, "")
+                current_sql_texts.setdefault(query_id, collected_sql)
+                if query_info.execution_time < best_sql_times[query_id]:
+                    best_sql_times[query_id] = query_info.execution_time
+                    best_sql_actions[query_id] = current_sql_actions[query_id]
+                    best_sql_texts[query_id] = current_sql_texts[query_id]
 
                 # Keep the ablation workload gate explicit and configurable.
                 # This is intentionally checked after the real baseline
@@ -314,6 +452,13 @@ class DBAgent:
                     )
                     round_sql_times[query_id] = query_info.execution_time
                     round_sql_actions[query_id] = ""
+                    finished_queries.add(query_id)
+                    if self.memory_manager.retrieval_mode == "dynamic":
+                        self.memory_manager.retriever.finalize_pending_experiences(
+                            self.memory_manager.generate_next_query_info_id(
+                                query_id, round_num=round_idx
+                            )
+                        )
                     if pre_applied:
                         self.action_manager.rollback_action(pre_index_names, pre_knob_names)
                     continue
@@ -330,9 +475,15 @@ class DBAgent:
                         "component_attempts": {},
                         "component_successes": {},
                         "component_failures": {},
+                        "component_state_attempts": {},
+                        "localization_failure_rewards": {},
+                        "query_success_count": 0,
+                        "query_failure_count": 0,
+                        "initial_latency": query_info.execution_time,
                     }
 
                 state = sql_root_cause_states[query_id]
+                state.setdefault("initial_latency", query_info.execution_time)
                 # Expose the query-level stagnation counter to the diagnosis
                 # prompt.  This lets the LLM switch to randomized component
                 # exploration after repeated non-improving attempts.
@@ -389,9 +540,10 @@ class DBAgent:
                         root_causes,
                         mode=state["mode"],
                         tuning_state={
-                            "success_count": sum(state.get("component_successes", {}).values()),
-                            "failure_count": sum(state.get("component_failures", {}).values()),
+                            "success_count": state.get("query_success_count", 0),
+                            "failure_count": state.get("query_failure_count", 0),
                         },
+                        initial_latency=state["initial_latency"],
                     )
                 except Exception as e:
                     logger.error(f"SQL {query_id} error during step execution: {e}", exc_info=True)
@@ -420,6 +572,9 @@ class DBAgent:
                     observation_query_info,
                     rewrite_sql,
                 )
+                state_attempts = state.setdefault("component_state_attempts", {})
+                for component in modified_components:
+                    state_attempts[component] = state_attempts.get(component, 0) + 1
                 if rewrite_sql != "":
                     # Check if SQL was actually rewritten (excluding hints)
                     original_sql = query_info.query.strip()
@@ -437,16 +592,21 @@ class DBAgent:
                 # Initialize variables
                 new_time = None
                 old_time = query_info.execution_time
+                database_config = self.configs.get(
+                    "DATABASE_CONFIG", self.configs.get("TiDB_CONFIG", {})
+                )
+                timeout_time = float(database_config.get("query_timeout") or old_time)
+                try:
+                    trial_time = float(evaluation_result.get("new_time"))
+                except (TypeError, ValueError):
+                    trial_time = timeout_time
 
                 # Process evaluation results and update root cause state
                 if evaluation_result.get("status") == -1:
                     error_msg = evaluation_result.get("msg", "Unknown error")
                     print(f"Error: {error_msg}")
                     logger.info(f"SQL {query_id} fix failed, moving to next SQL")
-                    database_config = self.configs.get(
-                        "DATABASE_CONFIG", self.configs.get("TiDB_CONFIG", {})
-                    )
-                    new_time = database_config.get("query_timeout") or old_time
+                    new_time = timeout_time
 
                     root_causes_list = modified_components
                     for rc in root_causes_list:
@@ -460,19 +620,22 @@ class DBAgent:
                         old_time,
                         new_time,
                         "negative",
-                        tuning_attempts=state["component_attempts"].copy(),
+                        tuning_attempts=state_attempts.copy(),
                         used_cases=evaluation_result.get("used_cases"),
                         modified_components=modified_components,
+                        validation_status=evaluation_result.get("status"),
+                        retrieval_state_counts=evaluation_result.get("retrieval_state_counts"),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)
                     root_causes = case.case_info.get("root_causes")
                     # Record one invalid attempt for this root cause
                     key = self.memory_manager._normalize_root_causes(root_causes)
-                    state["attempts"][key] = state["attempts"].get(key, 0) + 1
+                    attempt_key = ",".join(sorted(key))
+                    state["attempts"][attempt_key] = state["attempts"].get(attempt_key, 0) + 1
                 elif evaluation_result.get("status") == 1:
                     logger.info(f"SQL {query_id} fix successful")
-                    new_time = evaluation_result.get("new_time")
+                    new_time = trial_time
 
                     root_causes_list = modified_components
                     for rc in root_causes_list:
@@ -486,9 +649,11 @@ class DBAgent:
                         old_time,
                         new_time,
                         "positive",
-                        tuning_attempts=state["component_attempts"].copy(),
+                        tuning_attempts=state_attempts.copy(),
                         used_cases=evaluation_result.get("used_cases"),
                         modified_components=modified_components,
+                        validation_status=evaluation_result.get("status"),
+                        retrieval_state_counts=evaluation_result.get("retrieval_state_counts"),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)
@@ -496,17 +661,21 @@ class DBAgent:
 
                     # Success: accumulate success count
                     key = self.memory_manager._normalize_root_causes(root_causes)
-                    state["attempts"][key] = state["attempts"].get(key, 0) + 1
-                    state["successes"][key] = state["successes"].get(key, 0) + 1
+                    attempt_key = ",".join(sorted(key))
+                    state["attempts"][attempt_key] = state["attempts"].get(attempt_key, 0) + 1
+                    state["successes"][attempt_key] = state["successes"].get(attempt_key, 0) + 1
                 else:
-                    # Fix ineffective: record negative case and advance source (try again next round)
-                    logger.info(f"SQL {query_id} fix ineffective, recording negative case")
-                    new_time = evaluation_result.get("new_time", old_time)
+                    # An improvement below delta is accepted for the query
+                    # trajectory but remains a negative RAWS label.
+                    logger.info(f"SQL {query_id} fix below localization threshold, recording negative case")
+                    new_time = trial_time
+                    small_improvement = new_time < old_time
 
                     root_causes_list = modified_components
                     for rc in root_causes_list:
                         state["component_attempts"][rc] = state["component_attempts"].get(rc, 0) + 1
-                        state["component_failures"][rc] = state["component_failures"].get(rc, 0) + 1
+                        counter = "component_successes" if small_improvement else "component_failures"
+                        state[counter][rc] = state[counter].get(rc, 0) + 1
 
                     case_id = self.memory_manager.save_case(
                         observation_query_info,
@@ -515,16 +684,21 @@ class DBAgent:
                         old_time,
                         new_time,
                         "negative",
-                        tuning_attempts=state["component_attempts"].copy(),
+                        tuning_attempts=state_attempts.copy(),
                         used_cases=evaluation_result.get("used_cases"),
                         modified_components=modified_components,
+                        validation_status=evaluation_result.get("status"),
+                        retrieval_state_counts=evaluation_result.get("retrieval_state_counts"),
                     )
                     # Get corrected root cause
                     case = self.memory_manager.get_case(case_id)
                     root_causes = case.case_info.get("root_causes")
                     # Record one invalid attempt for this root cause
                     key = self.memory_manager._normalize_root_causes(root_causes)
-                    state["attempts"][key] = state["attempts"].get(key, 0) + 1
+                    attempt_key = ",".join(sorted(key))
+                    state["attempts"][attempt_key] = state["attempts"].get(attempt_key, 0) + 1
+                    if small_improvement:
+                        state["successes"][attempt_key] = state["successes"].get(attempt_key, 0) + 1
 
                 # Contextual-bandit feedback is the normalized performance
                 # change.  Positive feedback is immediately reliable; a
@@ -533,39 +707,67 @@ class DBAgent:
                     reward = (old_time - new_time) / max(abs(old_time), 1e-8)
                 except (TypeError, ValueError, ZeroDivisionError):
                     reward = 0.0
-                localization_attempts = int(state.get("localization_attempts", 0)) + 1
-                state["localization_attempts"] = localization_attempts
                 delta = float(self.agent_config.get("localization_min_improvement", 0.1))
                 eta = max(1, int(self.agent_config.get("localization_negative_eta", 3)))
-                reliable = reward >= delta or localization_attempts >= eta
+                bucket_key = ",".join(predicted_root)
+                failures = state.setdefault("localization_failure_rewards", {})
+                if reward >= delta:
+                    reliable = True
+                    failures.pop(bucket_key, None)
+                else:
+                    bucket = failures.setdefault(bucket_key, [])
+                    bucket.append(reward)
+                    reliable = len(bucket) >= eta
+                    if reliable:
+                        reward = sum(bucket) / len(bucket)
+                        failures[bucket_key] = []
                 self.planner.update_localization_feedback(
                     state,
                     reward=reward,
                     reliable=reliable,
                 )
+                if evaluation_result.get("status") != -1 and new_time < old_time:
+                    state["query_success_count"] = state.get("query_success_count", 0) + 1
+                    # A retained action changes Q_t; exploration counts for
+                    # the previous execution state no longer apply.
+                    state["component_state_attempts"] = {}
+                    state["localization_failure_rewards"] = {}
+                else:
+                    state["query_failure_count"] = state.get("query_failure_count", 0) + 1
 
                 # When invalid attempt count reaches threshold, mark root cause as tried and clear current_root
-                if state.get("attempts", {}).get(key, 0) >= no_improvement_threshold and not state.get(
+                if state.get("attempts", {}).get(attempt_key, 0) >= no_improvement_threshold and not state.get(
                     "successes", {}
-                ).get(key, 0):
+                ).get(attempt_key, 0):
                     state["root_tried"].add(key)
 
-                # Update best records only if the candidate is better.
-                improved = new_time < best_sql_times[query_id]
+                # Retain a valid action when it improves the current state.
+                # Keep the best observed configuration separately for reports.
+                improved = self._update_configuration(
+                    query_id, fix_action, query_info.query, old_time, new_time,
+                    evaluation_result.get("status"), pre_applied,
+                    current_sql_actions, current_sql_texts,
+                    best_sql_actions, best_sql_texts, best_sql_times,
+                )
                 if improved:
-                    best_sql_times[query_id] = new_time
-                    best_sql_actions[query_id] = fix_action
-                    best_sql_texts[query_id] = query_info.query
                     consecutive_no_improvement[query_id] = 0
                 else:
                     consecutive_no_improvement[query_id] = (
                         consecutive_no_improvement.get(query_id, 0) + 1
                     )
-                # A sub-one-second result only skips optimization for this
-                # round.  The query remains eligible for measurement in the
-                # next round so repeated executions can reveal a lower stable
-                # runtime.  No query-level early-stop state is recorded here.
-                round_sql_times[query_id] = new_time
+                if consecutive_no_improvement[query_id] >= early_stop_patience:
+                    finished_queries.add(query_id)
+                    logger.info(
+                        "SQL %s stopped after %d consecutive non-improving attempts",
+                        query_id, early_stop_patience,
+                    )
+                if self.skip_below_seconds > 0 and new_time < self.skip_below_seconds:
+                    finished_queries.add(query_id)
+                if query_id in finished_queries and self.memory_manager.retrieval_mode == "dynamic":
+                    self.memory_manager.retriever.finalize_pending_experiences(
+                        self.memory_manager.generate_next_query_info_id(query_id)
+                    )
+                round_sql_times[query_id] = new_time if improved else old_time
                 round_sql_actions[query_id] = fix_action
                 sql_root_cause_states[query_id] = state
 
@@ -588,12 +790,33 @@ class DBAgent:
                     round_idx,
                     consecutive_no_improvement,
                     finished_queries,
+                    next_query_index=i + 1,
+                    current_sql_actions=current_sql_actions,
+                    current_sql_texts=current_sql_texts,
+                    round_sql_times=round_sql_times,
+                    round_sql_actions=round_sql_actions,
                 )
 
             round_end = time.time()
             logger.info(f"Round {round_idx} optimization time: {round_end - round_start:.4f}s")
-            round_total_time = sum([t for t in round_sql_times.values()])
-            logger.info(f"Round {round_idx} workload total execution time: {round_total_time:.4f}s")
+            evaluated_total_time = sum(round_sql_times.values())
+            logger.info(
+                "Round %d evaluated SQL total execution time: %.4fs",
+                round_idx, evaluated_total_time,
+            )
+            estimated_workload_times = {
+                query_id: round_sql_times.get(query_id, best_sql_times.get(query_id))
+                for query_id in query_ids
+            }
+            estimated_workload_times = {
+                query_id: latency for query_id, latency in estimated_workload_times.items()
+                if latency is not None
+            }
+            logger.info(
+                "Round %d workload estimated total execution time: %.4fs (%d prior-best values reused)",
+                round_idx, sum(estimated_workload_times.values()),
+                len(estimated_workload_times) - len(round_sql_times),
+            )
             logger.info(f"Round {round_idx} SQL execution times: {round_sql_times}")
 
             logger.info(f"Up to round {round_idx}, best SQL execution times: {best_sql_times}")
@@ -605,10 +828,29 @@ class DBAgent:
                 best_sql_times,
                 best_sql_texts,
                 sql_root_cause_states,
-                round_idx + 1,
+                round_idx if round_interrupted else round_idx + 1,
                 consecutive_no_improvement,
                 finished_queries,
+                next_query_index=next_query_index if round_interrupted else 0,
+                current_sql_actions=current_sql_actions,
+                current_sql_texts=current_sql_texts,
+                round_sql_times=round_sql_times if round_interrupted else {},
+                round_sql_actions=round_sql_actions if round_interrupted else {},
             )
+            if not round_interrupted:
+                completed_rounds += 1
+
+        # A run ending at the time budget has no next query step. Close those
+        # retrieval transitions as terminal before saving the final model.
+        if self.memory_manager.retrieval_mode == "dynamic":
+            retriever = self.memory_manager.retriever
+            for next_id in list(retriever.pending_experiences):
+                retriever.finalize_pending_experiences(next_id)
+            model_path = self.memory_manager.retriever_model_path
+            if model_path:
+                temporary = f"{model_path}.tmp"
+                retriever.save_model(temporary)
+                os.replace(temporary, model_path)
 
         # Output final results
         final_time = time.time()
@@ -619,4 +861,6 @@ class DBAgent:
         logger.info(f"Best SQL execution times: {best_sql_times}")
         logger.info(f"Workload best total execution time: {sum(best_sql_times.values()):.4f}s")
         logger.info(f"Best SQL fix actions: {best_sql_actions}")
+        logger.info(f"Final accepted SQL actions: {current_sql_actions}")
+        logger.info(f"Final accepted SQL texts: {current_sql_texts}")
         logger.info("Diagnosis process ended")

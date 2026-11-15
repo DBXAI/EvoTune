@@ -63,32 +63,35 @@
   },
   "PLANNER_CONFIG": {
     "device": "cpu",
-    "model_path": "/root/DREAM/src/agent/plan/model_res/GateComDiffPretrainModel slow_sql_data_gen old_knob eta0.07/best_model.pt",
-    "train_data_path": "/root/DREAM/src/agent/plan/slow_sql_data_gen.csv",
+    "model_path": "../src/agent/plan/model_res/predictor_tidb.pt",
+    "train_data_path": "../src/agent/plan/model_res/predictor_training.csv",
     "opt_threshold": 0.5,
     "num_classes": 4
   },
   "MEMORY_MANAGER_CONFIG": {
-    "db_path": "/root/DREAM/src/memory_results_tpch_tidb",
-    "archive_size": 20,
+    "db_path": "../src/memory_results_tpch_tidb",
     "finetune_threshold": 220,
     "finetune_epochs": 10,
     "finetune_batch_size": 8,
     "finetune_device": "cpu",
-    "model_output_dir": "/root/DREAM/src/agent/plan/model_res",
+    "model_output_dir": "../src/agent/plan/model_res",
     "enable_finetune": true,
-    "retrieval_mode": "static",
+    "eta": 3,
+    "attribution_rho": 0.8,
+    "retrieval_mode": "dynamic",
+    "retrieval_prior_beta": 0.8,
     "enable_save_samples": false,
-    "samples_save_path": "/root/DREAM/src/agent/memory/experience/retriever_samples_tpch_tidb.jsonl",
-    "retriever_model_path": "/root/DREAM/src/agent/memory/model/soft_q_retriever_tpch_tidb.pt",
-    "bert_model_path": "/root/DREAM/src/agent/plan/RCRank/bert-base-uncased"
+    "samples_save_path": "../src/agent/memory/experience/retriever_samples_tpch_tidb.jsonl",
+    "retriever_model_path": "../src/agent/memory/model/soft_q_retriever_tpch_tidb.pt",
+    "bert_model_path": "../src/agent/plan/RCRank/bert-base-uncased"
   },
   "AGENT_CONFIG": {
     "no_improvement_threshold": 3,
+    "query_early_stop_patience": 10,
+    "validation_retries": 3,
     "fix_timeout": 600,
     "diagnostic_agent_model": "gpt-4.1",
     "fix_agent_model": "gpt-4.1",
     "root_cause_llm_model": "gpt-4.1"
   }
 }
-
