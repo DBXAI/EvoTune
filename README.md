@@ -58,9 +58,11 @@ cp config/job_config.json.example config/job_config.json
 
 5) Setup Retriever Model
 
-- For the case retriever, we provide a pre-trained Soft Q Retriever model that can be downloaded directly from the [Google Drive](https://drive.google.com/drive/folders/1mRkA_CJvKImJeHuaXm-W0h0riVmvB_2w?usp=sharing). After downloading, place the model file at the path specified by `MEMORY_MANAGER_CONFIG.retriever_model_path` (for TPC-H: `src/agent/memory/model/soft_q_retriever.pt` from the repository root).
+- The TPC-H offline-trained Retriever checkpoint (`retriever_all821.pt`) can be distributed as `soft_q_retriever.pt`. Place it at `src/agent/memory/model/soft_q_retriever.pt`, the path in `MEMORY_MANAGER_CONFIG.retriever_model_path`. This experimental checkpoint was trained with the old-knob Predictor (`predictor_tidb.pt` in these examples), so use that Predictor to reproduce its scores; its online tuning benefit has not been established.
 
-- Alternatively, you can retrain the retriever model using collected experience samples:
+- To train from the TPC-H offline samples, download the matching `retriever_samples.jsonl` and `memory.sqlite3` together. Place them at `src/agent/memory/experience/retriever_samples.jsonl` and `src/memory_results_tpch.sqlite3`, respectively. The JSONL stores case IDs for the next state and history; the trainer uses the SQLite cases to reconstruct their features and Bellman targets. With only the JSONL, missing next states are treated as terminal states.
+
+- Train the Retriever from those files:
   ```bash
   python src/agent/memory/train_retriever_offline.py \
       --samples_path src/agent/memory/experience/retriever_samples.jsonl \
@@ -70,6 +72,7 @@ cp config/job_config.json.example config/job_config.json
       --batch_size 64 \
       --learning_rate 0.0001
   ```
+  For a fresh training run, set `MEMORY_MANAGER_CONFIG.retriever_model_path` in the copied config to a file that does not yet exist; otherwise the trainer loads that checkpoint before training.
 
 - To collect new experience data from scratch, set `enable_save_samples` to `true` in the configuration file. The collected samples are saved to the path specified by `samples_save_path` (default: `src/agent/memory/experience/retriever_samples.jsonl` from the repository root).
 
@@ -82,7 +85,3 @@ python src/main.py \
   --duration 30 \
   --config config/tpch_config.json
 ```
-
-`--max-rounds 3` limits a run to three completed passes. `--resume-state PATH` resumes from the checkpoint's `next_round`; for example, `next_round: 20` logs rounds 20–22 when combined with `--max-rounds 3`. To start at Round 1, omit `--resume-state` and use a fresh empty `MEMORY_MANAGER_CONFIG.db_path` (and fresh sample/model output paths). If historical memory already contains IDs such as `1-01`, continue after its highest round to avoid overwriting cases.
-
-Memory cases are stored in SQLite at `<db_path>.sqlite3` by default. On first startup, existing cases in the JSON file at `db_path` are copied into SQLite in their original order; the JSON file is retained as a backup and is not updated afterward. SQLite is authoritative on later runs. Set `MEMORY_MANAGER_CONFIG.sqlite_path` to override the SQLite location. Retrieval still loads all cases into memory. A fresh run needs a new SQLite path as well as a fresh legacy JSON path.
